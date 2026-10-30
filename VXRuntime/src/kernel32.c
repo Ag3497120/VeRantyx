@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include "vx.h"
@@ -539,6 +540,16 @@ static WINAPI BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *m) {
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &count) == KERN_SUCCESS)
         avail = ((uint64_t)vs.free_count + vs.inactive_count + vs.purgeable_count) * vm_kernel_page_size;   // (the kernel's pages: 16 KB, also under Rosetta)
     if (avail > total) avail = total;                  // (purgeable pages are also counted as active or inactive)
+    // VXRT_DEVICE_MEMORY_MB: a smaller machine's memory (a Vision Pro's 16 GB, ...), so the program sizes itself for it;
+    // what is available is no more than that less the process's footprint.
+    const char *dm = getenv("VXRT_DEVICE_MEMORY_MB");
+    if (dm && atoll(dm) > 0 && (uint64_t)atoll(dm) << 20 < total) {
+        total = (uint64_t)atoll(dm) << 20;
+        task_vm_info_data_t vm = { 0 }; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+        uint64_t used = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) == KERN_SUCCESS ? vm.phys_footprint : 0;
+        uint64_t left = used < total ? total - used : 0;
+        if (avail > left) avail = left;
+    }
     m->load = total ? (DWORD)(100 - avail * 100 / total) : 0;
     m->total_phys = total; m->avail_phys = avail;
     m->total_page = total * 2; m->avail_page = avail + total;
@@ -741,11 +752,14 @@ void vx_code_freed(void *addr, size_t len);            // (its translations go: 
 #define MEM_DECOMMIT 0x4000
 #define MEM_RELEASE  0x8000
 #define MEM_FREE     0x10000
+#define MEM_RESET    0x80000
+#define MEM_RESET_UNDO 0x1000000
 #define MEM_PRIVATE  0x20000
 #define MEM_IMAGE    0x1000000
 #define GRANULARITY  0x10000
 
-typedef struct { uintptr_t base; size_t size; DWORD protect; } reservation;
+typedef struct { uintptr_t base; size_t size; DWORD protect, type; uint64_t foff; } reservation;   // (type: VirtualAlloc's, as
+                                                         // reserved; foff: 1 + its offset in VXRT_PAGEFILE's file, or 0)
 // A reservation maps whole 64 KB units, as Windows uses them up: with only its pages mapped, every small one leaves
 // a gap no aligned reservation fits in, and the kernel's search for room walks all of those (2 ms per call with
 // Half-Life: Alyx's 60000 small blocks).
@@ -760,12 +774,12 @@ static reservation *find_reservation(uintptr_t addr) {      // with g_vm_lock he
     while (lo < hi) { int mid = (lo + hi) / 2; if (g_res[mid].base + g_res[mid].size <= addr) lo = mid + 1; else hi = mid; }
     return lo < g_res_count && g_res[lo].base <= addr ? &g_res[lo] : NULL;
 }
-static void res_insert(uintptr_t base, size_t size, DWORD protect) {
+static void res_insert(uintptr_t base, size_t size, DWORD protect, DWORD type) {
     if (g_res_count == g_res_cap) { g_res_cap = g_res_cap ? g_res_cap * 2 : 256; g_res = realloc(g_res, g_res_cap * sizeof *g_res); }
     int lo = 0, hi = g_res_count;
     while (lo < hi) { int mid = (lo + hi) / 2; if (g_res[mid].base < base) lo = mid + 1; else hi = mid; }
     memmove(g_res + lo + 1, g_res + lo, (size_t)(g_res_count - lo) * sizeof *g_res);
-    g_res[lo] = (reservation){ base, size, protect };
+    g_res[lo] = (reservation){ base, size, protect, type };
     g_res_count++;
 }
 static void res_remove(reservation *r) {
@@ -828,6 +842,71 @@ static void prot_set(uintptr_t start, uintptr_t end, DWORD protect) {   // prote
     memcpy(g_prot + i, add, n * sizeof *add);
     g_nprot = g_nprot - (j - i) + n;
 }
+// VXRT_PAGEFILE=<dir> (ARM64): the program's large reservations (VXRT_PAGEFILE_MIN_MB and more, 64 by default) are
+// mapped shared from a file there instead of anonymous memory, as Windows backs committed memory with its page file:
+// their pages are the file's, out of the footprint a device's memory limit counts (measured: 1 GB written, footprint
+// 1 -> 1 MB), and the system writes them to the file when it needs the memory instead of ending the process. The file
+// is removed once open (VXRT_PAGEFILE_GB of offsets, 512 by default: sparse, its blocks come when written). Decommit,
+// MEM_RESET and release punch the range out of the file (its pages read as zeros again, its blocks freed); a
+// released range's offsets are used again by a reservation of the same size.
+static int g_pf_fd = -1, g_pf_on = -1;
+static uint64_t g_pf_size, g_pf_cursor, g_pf_min, g_pf_bytes;
+static struct { uint64_t off, size; } g_pf_free[256]; static int g_pf_nfree;
+static int pf_on(void) {
+#ifdef __aarch64__
+    if (g_pf_on >= 0) return g_pf_on;
+    g_pf_on = 0;
+    const char *dir = getenv("VXRT_PAGEFILE");
+    if (!dir || !*dir) return 0;
+    const char *gb = getenv("VXRT_PAGEFILE_GB"), *min = getenv("VXRT_PAGEFILE_MIN_MB");
+    g_pf_size = (gb && atoll(gb) > 0 ? (uint64_t)atoll(gb) : 512) << 30;
+    g_pf_min = (min && atoll(min) >= 0 && *min ? (uint64_t)atoll(min) : 64) << 20;
+    char path[4096];
+    snprintf(path, sizeof path, "%s/vxrt-pagefile-%d.bin", dir, (int)getpid());
+    mkdir(dir, 0755);
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) unlink(path);
+    if (fd < 0 || ftruncate(fd, (off_t)g_pf_size)) { vx_log("VXRT_PAGEFILE: cannot make %s: %s", path, strerror(errno)); if (fd >= 0) close(fd); return 0; }
+    g_pf_fd = fd;
+    vx_log("VXRT_PAGEFILE: reservations of %llu MB or more on the pages of a file in %s (%llu GB of offsets, removed)",
+           (unsigned long long)(g_pf_min >> 20), dir, (unsigned long long)(g_pf_size >> 30));
+    return g_pf_on = 1;
+#else
+    return 0;                                     // (x86: the program's code runs from its memory, which needs exec)
+#endif
+}
+static void pf_punch(uint64_t off, uint64_t len) {         // (whole 4 KB blocks; the file system's are that size)
+    uint64_t from = (off + 0xfff) & ~0xfffull, to = (off + len) & ~0xfffull;
+    if (to > from) { fpunchhole_t ph = { 0, 0, (off_t)from, (off_t)(to - from) }; fcntl(g_pf_fd, F_PUNCHHOLE, &ph); }
+}
+// Maps [a, a + n) from the file (with g_vm_lock held): 1 + the offset, or 0 (left anonymous)
+static uint64_t pf_map(uintptr_t a, uint64_t n) {
+    if (n < g_pf_min || !pf_on()) return 0;
+    uint64_t off = ~0ull;
+    for (int i = 0; i < g_pf_nfree; i++) if (g_pf_free[i].size == n) { off = g_pf_free[i].off; g_pf_free[i] = g_pf_free[--g_pf_nfree]; break; }
+    if (off == ~0ull) { if (g_pf_cursor + n > g_pf_size) return 0; off = g_pf_cursor; g_pf_cursor += n; }
+    if (mmap((void *)a, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, g_pf_fd, (off_t)off) != (void *)a) {
+        vx_log("VXRT_PAGEFILE: cannot map %#llx bytes at %#lx: %s (anonymous memory instead)", (unsigned long long)n, (unsigned long)a, strerror(errno));
+        mach_vm_address_t m = a;                  // (anonymous again; the offsets are not used again)
+        mach_vm_allocate(mach_task_self(), &m, n, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+        mach_vm_protect(mach_task_self(), m, n, 0, VX_PROT_RWX);
+        return 0;
+    }
+    g_pf_bytes += n;
+    return off + 1;
+}
+static void pf_release(uint64_t foff, uint64_t n) {
+    pf_punch(foff - 1, n);
+    g_pf_bytes -= n;
+    if (g_pf_nfree < 256) g_pf_free[g_pf_nfree++] = (typeof(g_pf_free[0])){ foff - 1, n };
+}
+uint64_t vx_pagefile_bytes(void) { return g_pf_bytes; }
+__attribute__((constructor)) static void pf_init(void) { if (getenv("VXRT_PAGEFILE")) pf_on(); }   // (made before the program runs)
+static size_t prot_first(uintptr_t a) {                    // the first range ending after a
+    size_t lo = 0, hi = g_nprot;
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_prot[mid].end <= a) lo = mid + 1; else hi = mid; }
+    return lo;
+}
 static DWORD prot_get(uintptr_t a) {
     size_t lo = 0, hi = g_nprot;
     while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_prot[mid].end <= a) lo = mid + 1; else hi = mid; }
@@ -847,10 +926,39 @@ static DWORD image_protect(const vx_image *m, uintptr_t a) {
     }
     return 0x02;
 }
+// MEM_RESET: the contents of the range are no longer of interest (they may stay, or not, Windows says): its whole host
+// pages become fresh zero pages, out of the footprint until written again. MEM_RESET_UNDO then fails as Windows' does
+// when the memory was taken: some of the data was replaced by zeros. (Counted for the memory report.)
+uint64_t vx_mem_reset_calls, vx_mem_reset_bytes;
+static void *reset_pages(reservation *r, void *addr, size_t size, DWORD type) {     // with g_vm_lock held
+    if (type & MEM_RESET_UNDO) { vx_set_last_error(87); return NULL; }
+    if (r->foff) {                                          // (VXRT_PAGEFILE: out of the file, reading as zeros)
+        __atomic_add_fetch(&vx_mem_reset_calls, 1, __ATOMIC_RELAXED);
+        uintptr_t from = ((uintptr_t)addr + 0xfff) & ~(uintptr_t)0xfff, to = ((uintptr_t)addr + size) & ~(uintptr_t)0xfff;
+        if (to > from) { VX_CODE_FREED((void *)from, to - from); pf_punch(r->foff - 1 + (from - r->base), to - from); __atomic_add_fetch(&vx_mem_reset_bytes, to - from, __ATOMIC_RELAXED); }
+        return addr;
+    }
+    uintptr_t page = vm_page_size, from = ((uintptr_t)addr + page - 1) & ~(page - 1), to = ((uintptr_t)addr + size) & ~(page - 1);
+    __atomic_add_fetch(&vx_mem_reset_calls, 1, __ATOMIC_RELAXED);
+    if (to > from) {
+        VX_CODE_FREED((void *)from, to - from);
+        mach_vm_address_t a = from;
+        if (mach_vm_allocate(mach_task_self(), &a, to - from, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS) {
+            mach_vm_protect(mach_task_self(), a, to - from, 0, VX_PROT_RWX);
+            __atomic_add_fetch(&vx_mem_reset_bytes, to - from, __ATOMIC_RELAXED);
+        }
+    }
+    return addr;
+}
 static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD protect) {
     if (!size) { vx_set_last_error(87); return NULL; }
     VX_NO_STOP_LOCK(&g_vm_lock);
     reservation *r = addr ? find_reservation((uintptr_t)addr) : NULL;
+    if (r && (type & (MEM_RESET | MEM_RESET_UNDO)) && !(type & (MEM_RESERVE | MEM_COMMIT))) {
+        void *p = reset_pages(r, addr, size, type);
+        VX_NO_STOP_UNLOCK(&g_vm_lock);
+        return p;
+    }
     if (r && !(type & MEM_RESERVE)) {                       // committing inside an existing reservation
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
         prot_set(start, ((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff, protect);
@@ -869,7 +977,7 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         g_spare[i] = g_spare[--g_nspare];
         if (mach_vm_allocate(mach_task_self(), &got, mapped_size(len), VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) break;
         mach_vm_protect(mach_task_self(), got, mapped_size(len), 0, VX_PROT_RWX);
-        res_insert((uintptr_t)got, (size_t)len, protect);
+        res_insert((uintptr_t)got, (size_t)len, protect, type);
         valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
         VX_NO_STOP_UNLOCK(&g_vm_lock);
         return (void *)got;
@@ -894,7 +1002,9 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         return NULL;
     }
     mach_vm_protect(mach_task_self(), a, mapped_size(len), 0, VX_PROT_RWX);
-    res_insert((uintptr_t)a, (size_t)len, protect);
+    uint64_t foff = pf_map((uintptr_t)a, mapped_size(len));
+    res_insert((uintptr_t)a, (size_t)len, protect, type);
+    if (foff) find_reservation((uintptr_t)a)->foff = foff;
     g_va_kind[2]++;
     static uint64_t made;
     uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
@@ -924,7 +1034,7 @@ static void *low_alloc(size_t size, uintptr_t limit, DWORD protect) {
             if (mach_vm_allocate(mach_task_self(), &host, n * GRANULARITY, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) break;
             mach_vm_protect(mach_task_self(), host, n * GRANULARITY, 0, VX_PROT_RWX);
             memset(vx_low_map + a / GRANULARITY, 1, n);
-            res_insert((uintptr_t)host, n * GRANULARITY, protect);
+            res_insert((uintptr_t)host, n * GRANULARITY, protect, MEM_RESERVE | MEM_COMMIT);
             cursor = a + n * GRANULARITY;
             VX_NO_STOP_UNLOCK(&g_vm_lock);
             return (void *)(uintptr_t)host;
@@ -954,7 +1064,7 @@ void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
                 mach_vm_address_t got = a;
                 if (mach_vm_allocate(mach_task_self(), &got, len, VM_FLAGS_FIXED) == KERN_SUCCESS) {
                     mach_vm_protect(mach_task_self(), got, len, 0, VX_PROT_RWX);
-                    res_insert((uintptr_t)got, (size_t)len, protect);
+                    res_insert((uintptr_t)got, (size_t)len, protect, MEM_RESERVE | MEM_COMMIT);
                     cursor = (uintptr_t)(got + len);
                     VX_NO_STOP_UNLOCK(&g_vm_lock);
                     return (void *)got;
@@ -984,6 +1094,9 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
 #ifdef __aarch64__
             memset(vx_low_map + (r->base - vx_low_base) / GRANULARITY, 0, n / GRANULARITY);
 #endif
+        } else if (r->foff) {                                             // (VXRT_PAGEFILE: out of the file)
+            mach_vm_deallocate(mach_task_self(), r->base, n);
+            pf_release(r->foff, n);
         } else if (n >= (1u << 20) && g_nspare < 32 && g_spare_bytes + n <= (512u << 20) && r->base >= (1ull << 32)) {
             g_spare[g_nspare++] = (spare_block){ r->base, n };              // (low-memory blocks are not reused)
             g_spare_bytes += n;
@@ -995,14 +1108,90 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
         size_t len = size ? (((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff) - start : r->base + r->size - start;
         VX_CODE_FREED((void *)start, len);
-        mach_vm_address_t a = start;                       // fresh zero pages over the range
-        ok = mach_vm_allocate(mach_task_self(), &a, len, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
+        // Fresh zero pages over the range's whole host pages (out of the footprint); the parts of a host page (16 KB
+        // on ARM64) that the range only covers in part are zeroed, as the rest of that page is not the range's.
+        uintptr_t page = vm_page_size, from = (start + page - 1) & ~(page - 1), to = (start + len) & ~(page - 1);
+        ok = 1;
+        if (r->foff) pf_punch(r->foff - 1 + (start - r->base), len);   // (VXRT_PAGEFILE: zeros, out of the file)
+        else if (to > from) {
+            mach_vm_address_t a = from;
+            ok = mach_vm_allocate(mach_task_self(), &a, to - from, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
+            if (ok) mach_vm_protect(mach_task_self(), a, to - from, 0, VX_PROT_RWX);
+            if (from > start) memset((void *)start, 0, from - start);
+            if (start + len > to) memset((void *)to, 0, start + len - to);
+        } else memset((void *)start, 0, len);
         prot_set(start, start + len, 0);
-        if (ok) mach_vm_protect(mach_task_self(), a, len, 0, VX_PROT_RWX);
     }
     VX_NO_STOP_UNLOCK(&g_vm_lock);
     if (!ok) vx_set_last_error(487);
     return ok;
+}
+// VXRT_MEM_LIMITS' memory report (d3d12.m): where the untagged anonymous memory (footprint's "VM_ALLOCATE") is. The
+// program's reservations (reserved, committed as VirtualAlloc was told, dirty and compressed as the kernel has it, the
+// largest by dirty), the kept released blocks, the program's small heap blocks (the ARM64 runtime's range), and the rest
+// (this runtime's own: stacks, TEBs, tables). Committed memory never written is not in the footprint (pages come when
+// touched), so committed minus dirty is what the program committed and left untouched.
+static void vm_dirty(uintptr_t start, uintptr_t end, uint64_t *dirty, uint64_t *swapped, int untagged_only) {
+    for (mach_vm_address_t a = start; a < end;) {
+        mach_vm_address_t at = a; mach_vm_size_t sz = 0;
+        vm_region_extended_info_data_t info; mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT; mach_port_t obj;
+        if (mach_vm_region(mach_task_self(), &at, &sz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS || at >= end) return;
+        // (a file's pages - VXRT_PAGEFILE, VXRT_D3D12_FILE_BUFFERS, VXRT_IMAGE_CACHE - are not in the footprint)
+        if ((!untagged_only || info.user_tag == 0) && !info.external_pager) {
+            // (a region partly inside counts in proportion)
+            uint64_t lo = at < start ? start : at, hi = at + sz > end ? end : at + sz, page = vm_kernel_page_size;
+            double part = sz ? (double)(hi - lo) / (double)sz : 0;
+            if (info.share_mode != SM_EMPTY) {
+                *dirty += (uint64_t)(info.pages_dirtied * page * part);
+                *swapped += (uint64_t)(info.pages_swapped_out * page * part);
+            }
+        }
+        a = at + sz;
+    }
+}
+int vx_vm_report(char *buf, size_t size) {
+    uint64_t reserved = 0, committed = 0, dirty = 0, swapped = 0, spare_dirty = 0, spare_sw = 0, heap_dirty = 0, heap_sw = 0;
+    uint64_t all_dirty = 0, all_sw = 0;
+    struct { uintptr_t base; size_t size; uint64_t dirty, committed; } top[6] = { { 0 } };
+    VX_NO_STOP_LOCK(&g_vm_lock);
+    int nres = g_res_count;
+    for (int i = 0; i < g_res_count; i++) {
+        reservation *r = &g_res[i];
+        reserved += r->size;
+        uint64_t c = 0;
+        if (r->type & MEM_COMMIT) c = r->size;                 // (committed as reserved; else the commits made since)
+        else for (size_t k = prot_first(r->base); k < g_nprot && g_prot[k].start < r->base + r->size; k++) {
+            uintptr_t lo = g_prot[k].start > r->base ? g_prot[k].start : r->base, hi = g_prot[k].end < r->base + r->size ? g_prot[k].end : r->base + r->size;
+            if (hi > lo) c += hi - lo;
+        }
+        committed += c;
+        uint64_t d = 0, s = 0;
+        vm_dirty(r->base, r->base + mapped_size(r->size), &d, &s, 0);
+        dirty += d; swapped += s;
+        for (int t = 0; t < 6; t++) if (d + s > top[t].dirty) {
+            memmove(top + t + 1, top + t, (5 - t) * sizeof *top);
+            top[t].base = r->base; top[t].size = r->size; top[t].dirty = d + s; top[t].committed = c;
+            break;
+        }
+    }
+    for (int i = 0; i < g_nspare; i++) vm_dirty(g_spare[i].base, g_spare[i].base + g_spare[i].size, &spare_dirty, &spare_sw, 0);
+    VX_NO_STOP_UNLOCK(&g_vm_lock);
+    typedef struct { uint64_t head[24]; uint64_t cursor, limit, base; } xh_range;
+    xh_range *(*heap)(void) = (xh_range *(*)(void))dlsym(RTLD_DEFAULT, "vxvm_heap");
+    xh_range *h = heap ? heap() : NULL;
+    if (h) vm_dirty(h->base, h->cursor, &heap_dirty, &heap_sw, 0);
+    vm_dirty(0, (uintptr_t)1 << 47, &all_dirty, &all_sw, 1);
+    size_t o = (size_t)snprintf(buf, size, "untagged anonymous %.0f MB dirty + %.0f MB compressed; the program's %d reservations "
+        "%.0f MB reserved, %.0f MB committed, %.0f MB dirty + %.0f MB compressed (committed and never written: %.0f MB); kept released "
+        "blocks %.0f MB; small heap blocks %.0f MB carved, %.0f MB dirty; the rest (ours) %.0f MB; largest by dirty:",
+        all_dirty / 1048576.0, all_sw / 1048576.0, nres, reserved / 1048576.0, committed / 1048576.0, dirty / 1048576.0,
+        swapped / 1048576.0, committed > dirty + swapped ? (committed - dirty - swapped) / 1048576.0 : 0.0,
+        (spare_dirty + spare_sw) / 1048576.0, h ? (h->cursor - h->base) / 1048576.0 : 0.0, (heap_dirty + heap_sw) / 1048576.0,
+        ((double)all_dirty + all_sw - dirty - swapped - spare_dirty - spare_sw - heap_dirty - heap_sw) / 1048576.0);
+    for (int t = 0; t < 6 && top[t].size && o < size; t++)
+        o += (size_t)snprintf(buf + o, size - o, " %#llx %.0f MB (committed %.0f, dirty %.0f)", (unsigned long long)top[t].base,
+                              top[t].size / 1048576.0, top[t].committed / 1048576.0, top[t].dirty / 1048576.0);
+    return 1;
 }
 // Memory that is neither the program's (a reservation, a PE image) nor writable at all: macOS code, this runtime's own
 // functions (GetProcAddress of a built-in DLL gives their addresses). Hooking libraries (the Steam overlay's) make a

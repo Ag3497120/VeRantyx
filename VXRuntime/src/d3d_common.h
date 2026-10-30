@@ -201,6 +201,9 @@ d3d_object  *dxgi_output_create(void);                                   // the 
 HRESULT      dxgi_check_hdr_metadata(uint32_t type, uint32_t size, const void *data);
 // Swap chains on Direct3D 12 command queues (d3d12.m): DXGI's factory hands a queue there.
 int     d3d12_is_queue(void *p);
+// What the program evicted that is purgeable now (VXRT_D3D12_EVICT_VOLATILE: out of the footprint, d3d12.m): DXGI's
+// current usage leaves it out, as Windows' leaves out evicted memory, so a program evicting to its budget sees it work.
+uint64_t d3d12_volatile_bytes(void);
 // D3D11On12 (d3d11on12.m) on D3D12's objects (d3d12.m): a queue's Metal queue (id<MTLCommandQueue>, not retained),
 // the device a queue or device pointer is (NULL if neither), a resource's description and Metal object, and its
 // tracked state set to one state for every subresource (what a wrapped resource is in after D3D11 used it).

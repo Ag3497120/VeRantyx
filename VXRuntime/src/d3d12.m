@@ -42,6 +42,8 @@ static void vr_release_waitable12(void *w) { vx_release_semaphore(w, 1); }
 #include <float.h>
 #include <malloc/malloc.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -2152,6 +2154,84 @@ static int tex_sub12(const res12 *r, uint32_t sub, uint32_t *metal) {
     return 1;
 }
 
+// A new committed Metal buffer reads as zeros (fresh pages from the kernel, made when first touched: measured for
+// 20000 buffers of 16 bytes to 128 KB and larger ones); zeroing it on the CPU made every page of it count in the
+// footprint at once, also the parts the program never uses. VXRT_D3D12_ZERO_BUFFERS=1 zeroes them still.
+static int zero_new_buffers12(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_D3D12_ZERO_BUFFERS") && atoi(getenv("VXRT_D3D12_ZERO_BUFFERS")) != 0;
+    return on;
+}
+// VXRT_D3D12_FILE_BUFFERS=<dir>: committed buffers (all CPU-visible here: shared storage) of 64 KB or more are made on
+// pages of a file there, mapped shared (a Metal buffer without a copy, newBufferWithBytesNoCopy): the pages are the
+// file's, out of the footprint a device's memory limit counts (measured: a written 512 MB buffer, read by the GPU, 4 ->
+// 21 MB, the 16 MB being the copy's destination), and the system writes them to the file when it needs the memory,
+// as Windows pages a resource out, instead of ending the process. Their contents are kept (purgeable memory is not
+// kept: VXRT_D3D12_EVICT_VOLATILE lost 4000 evicted buffers in one session). The file is removed once open (no name
+// left behind); VXRT_D3D12_FILE_BUFFERS_GB its size (8: virtual, its blocks come when written). Pages of a freed
+// buffer go back to the file's free lists by size (powers of two) and are zeroed when used again for a buffer that
+// starts zeroed (default, readback heaps).
+static struct {
+    pthread_mutex_t lock;
+    uint8_t *base; uint64_t size, cursor;
+    void *free_list[40];                     // (by size class: 64 KB << k; the next is stored in the block)
+    uint64_t used, made, reused, failed;
+    int on;
+} g_fb12 = { .lock = PTHREAD_MUTEX_INITIALIZER, .on = -1 };
+static int fb_class12(uint64_t n, uint64_t *rounded) {
+    int k = 0; uint64_t c = 64 << 10;
+    while (c < n) { c <<= 1; k++; }
+    *rounded = c;
+    return k < 40 ? k : -1;
+}
+static int fb_init12(void) {
+    if (g_fb12.on >= 0) return g_fb12.on;
+    g_fb12.on = 0;
+    const char *dir = getenv("VXRT_D3D12_FILE_BUFFERS");
+    if (!dir || !*dir) return 0;
+    uint64_t gb = getenv("VXRT_D3D12_FILE_BUFFERS_GB") && atoll(getenv("VXRT_D3D12_FILE_BUFFERS_GB")) > 0 ? (uint64_t)atoll(getenv("VXRT_D3D12_FILE_BUFFERS_GB")) : 8;
+    char path[4096];
+    snprintf(path, sizeof path, "%s/vxrt-buffers-%d.bin", dir, (int)getpid());
+    mkdir(dir, 0755);
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) { vx_log("D3D12: VXRT_D3D12_FILE_BUFFERS: cannot make %s: %s", path, strerror(errno)); return 0; }
+    unlink(path);
+    void *m = ftruncate(fd, (off_t)(gb << 30)) ? MAP_FAILED : mmap(NULL, gb << 30, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);                                   // (the mapping keeps the file)
+    if (m == MAP_FAILED) { vx_log("D3D12: VXRT_D3D12_FILE_BUFFERS: cannot map %llu GB of %s: %s", (unsigned long long)gb, path, strerror(errno)); return 0; }
+    g_fb12.base = m; g_fb12.size = gb << 30;
+    vx_log("D3D12: committed buffers of 64 KB or more on the pages of a file in %s (%llu GB, removed)", dir, (unsigned long long)gb);
+    return g_fb12.on = 1;
+}
+static void fb_free12(void *p, uint64_t n) {
+    uint64_t rounded; int k = fb_class12(n, &rounded);
+    pthread_mutex_lock(&g_fb12.lock);
+    *(void **)p = g_fb12.free_list[k];
+    g_fb12.free_list[k] = p;
+    g_fb12.used -= rounded;
+    pthread_mutex_unlock(&g_fb12.lock);
+}
+// A Metal buffer of len bytes on the file's pages, or nil (not on, too small, the file full: the caller makes one as usual)
+static id<MTLBuffer> fb_buffer12(id<MTLDevice> mtl, uint64_t len, int zeroed) {
+    if (len < (64 << 10) || !fb_init12()) return nil;
+    uint64_t rounded; int k = fb_class12(len, &rounded);
+    if (k < 0) return nil;
+    pthread_mutex_lock(&g_fb12.lock);
+    uint8_t *p = g_fb12.free_list[k];
+    int reused = p != NULL;
+    if (p) g_fb12.free_list[k] = *(void **)p;
+    else if (g_fb12.cursor + rounded <= g_fb12.size) { p = g_fb12.base + g_fb12.cursor; g_fb12.cursor += rounded; }
+    if (p) { g_fb12.used += rounded; g_fb12.made++; g_fb12.reused += reused; } else g_fb12.failed++;
+    pthread_mutex_unlock(&g_fb12.lock);
+    if (!p) return nil;
+    if (reused) { if (zeroed) memset(p, 0, len); else *(void **)p = NULL; }   // (the free list's link is not left in it)
+    // (the buffer's length is the program's rounded up to whole pages, as Metal needs: its class is the same)
+    uint64_t pages = (len + vm_page_size - 1) & ~(uint64_t)(vm_page_size - 1);
+    id<MTLBuffer> b = [mtl newBufferWithBytesNoCopy:p length:pages options:MTLResourceStorageModeShared
+                                        deallocator:^(void *q, NSUInteger n) { fb_free12(q, n); }];
+    if (!b) fb_free12(p, pages);
+    return b;
+}
 // A committed resource (heap nil) or one placed in a heap at an offset.
 static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t initial_state,
                                const void *clear, memheap12 *in, uint64_t offset, int reserved, const GUID *iid, void **out) {
@@ -2187,7 +2267,8 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
                                                 options:MTLResourceStorageModePrivate placementSparsePageSize:MTLSparsePageSize64];
 #endif
         } else if (in) r->buffer = [in->heap newBufferWithLength:len options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked offset:offset];
-        else r->buffer = [d->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
+        else if (!(r->buffer = fb_buffer12(d->mtl, len, hp->Type != 2 || zero_new_buffers12())))
+            r->buffer = [d->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
         if (!r->buffer) { d3d_release(&r->base); return in ? E_INVALIDARG : E_OUTOFMEMORY; }
         if (getenv("VXRT_D3D12_TRACE_UPLOAD") && hp->Type == 2) {
             static volatile int n;
@@ -2204,8 +2285,8 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
         }
         if (r->buffer.contents) {                                  // (reserved buffers are GPU-only)
             vx_guest_forget(r->buffer.contents, r->buffer.length);
-            if (!in && hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);
-        }   // (default and readback heaps start zeroed)
+            if (!in && hp->Type != 2 && zero_new_buffers12()) memset(r->buffer.contents, 0, r->buffer.length);
+        }   // (default and readback heaps start zeroed: a new Metal buffer is, its pages coming when touched)
     } else {
         uint32_t logical_mips = 0;
         int drop = tex_drop_levels12(hp, desc, in, reserved, &logical_mips);
@@ -6623,17 +6704,61 @@ static uint64_t graphics_desc_hash12(const GFX_PSO_DESC *d) {
     return fnv1a12(h, &d->flags, sizeof d->flags);
 }
 
+static uint64_t g_gfx_psos12, g_cs_psos12;                 // (pipelines made, all time: the memory report)
+static uint64_t g_resident_calls12[2], g_resident_objects12[2];   // (Evict, MakeResident: for the memory report)
+// VXRT_D3D12_EVICT_VOLATILE=1: what the program evicts, when it is CPU-visible memory (a committed resource or a heap
+// in shared storage), becomes purgeable (volatile) until it is made resident again: out of the footprint (measured:
+// a written 512 MB shared buffer, 516 -> 4 MB), contents kept unless the system runs short and takes them (then they
+// are lost, counted, where Windows would have paged them out). Private storage counts either way (measured), so it is
+// left as it is.
+static uint64_t g_volatile_bytes12, g_volatile_lost12;
+uint64_t d3d12_volatile_bytes(void) { return __atomic_load_n(&g_volatile_bytes12, __ATOMIC_RELAXED); }
+static id<MTLResource> evict_target12(void *object, int *is_heap, id<MTLHeap> *heap) {
+    d3d_object *base = object;
+    *is_heap = 0; *heap = nil;
+    if (base->kind == K12_MEMHEAP) {
+        id<MTLHeap> h = ((memheap12 *)base)->heap;
+        if (h.storageMode == MTLStorageModeShared) { *is_heap = 1; *heap = h; }
+        return nil;
+    }
+    if (base->kind != K12_RESOURCE) return nil;
+    res12 *r = (res12 *)base;
+    if (r->owner_heap || r->reserved) return nil;
+    id<MTLResource> m = r->buffer ? (id<MTLResource>)r->buffer : (id<MTLResource>)r->texture;
+    return m.storageMode == MTLStorageModeShared ? m : nil;
+}
+static void evict_volatile12(void *object, int make_resident) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_D3D12_EVICT_VOLATILE") && atoi(getenv("VXRT_D3D12_EVICT_VOLATILE")) != 0;
+    if (!on) return;
+    int is_heap; id<MTLHeap> heap;
+    id<MTLResource> m = evict_target12(object, &is_heap, &heap);
+    if (!m && !is_heap) return;
+    MTLPurgeableState was = is_heap ? [heap setPurgeableState:make_resident ? MTLPurgeableStateNonVolatile : MTLPurgeableStateVolatile]
+                                    : [m setPurgeableState:make_resident ? MTLPurgeableStateNonVolatile : MTLPurgeableStateVolatile];
+    uint64_t size = is_heap ? heap.size : m.allocatedSize;
+    if (make_resident) {
+        __atomic_sub_fetch(&g_volatile_bytes12, size, __ATOMIC_RELAXED);
+        if (was == MTLPurgeableStateEmpty) {
+            uint64_t n = __atomic_add_fetch(&g_volatile_lost12, 1, __ATOMIC_RELAXED);
+            if (n <= 20) vx_log("D3D12: an evicted %s of %llu KB was taken by the system while evicted: its contents are lost",
+                                is_heap ? "heap" : "resource", (unsigned long long)(size >> 10));
+        }
+    } else __atomic_add_fetch(&g_volatile_bytes12, size, __ATOMIC_RELAXED);
+}
 // (CachedPSO in a description is accepted and not needed: the pipeline is made from the description.)
 static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
     if (!desc) return E_INVALIDARG;
     HRESULT hr = create_compute_pso12(this, desc, iid, out);
     if (hr >= 0 && out && *out) ((pso12 *)*out)->desc_hash = compute_desc_hash12(desc);
+    if (hr >= 0) __atomic_add_fetch(&g_cs_psos12, 1, __ATOMIC_RELAXED);
     return hr;
 }
 static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
     if (!desc) return E_INVALIDARG;
     HRESULT hr = create_graphics_pso12(this, desc, iid, out);
     if (hr >= 0 && out && *out) ((pso12 *)*out)->desc_hash = graphics_desc_hash12(desc);
+    if (hr >= 0) __atomic_add_fetch(&g_gfx_psos12, 1, __ATOMIC_RELAXED);
     return hr;
 }
 
@@ -14074,6 +14199,13 @@ static void mem_report12(dev12 *d) {
         vx_log("D3D12: memory: committed buffers: default %.0f MB (%llu), upload %.0f MB (%llu), readback %.0f MB (%llu), custom %.0f MB (%llu)",
                hb[1] / 1048576.0, (unsigned long long)hn[1], hb[2] / 1048576.0, (unsigned long long)hn[2],
                hb[3] / 1048576.0, (unsigned long long)hn[3], hb[4] / 1048576.0, (unsigned long long)hn[4]);
+        if (g_fb12.on > 0) {
+            pthread_mutex_lock(&g_fb12.lock);
+            vx_log("D3D12: memory: VXRT_D3D12_FILE_BUFFERS: %.0f MB of the file's pages in buffers now (%.0f MB of the file used), "
+                   "%llu buffers made (%llu on freed pages), %llu not (the file full)", g_fb12.used / 1048576.0, g_fb12.cursor / 1048576.0,
+                   (unsigned long long)g_fb12.made, (unsigned long long)g_fb12.reused, (unsigned long long)g_fb12.failed);
+            pthread_mutex_unlock(&g_fb12.lock);
+        }
     }
     if (__atomic_load_n(&g_tex_drop_count12, __ATOMIC_RELAXED))
         vx_log("D3D12: memory: VXRT_D3D12_TEX_DOWNSCALE made %llu textures (%.0f MB as made, all time), %llu copies to or from "
@@ -14102,6 +14234,59 @@ static void mem_report12(dev12 *d) {
            __atomic_load_n(&g_replay_copy_peak12, __ATOMIC_RELAXED) / 1048576.0,
            __atomic_load_n(&gpu_ir_stream_bytes, __ATOMIC_RELAXED) / 1048576.0, gpu_ir_command_size());
     if (vx_heap_report(heap, sizeof heap)) vx_log("D3D12: memory: the game's heap blocks (HeapAlloc, malloc, new): %s", heap);
+    char vm_text[900];
+    extern uint64_t vx_mem_reset_calls, vx_mem_reset_bytes;
+    extern uint64_t vx_image_cache_bytes(void), vx_pagefile_bytes(void);
+    if (vx_vm_report(vm_text, sizeof vm_text)) vx_log("D3D12: memory: %s; MEM_RESET and DiscardVirtualMemory %llu calls, %.0f MB given back; "
+        "images mapped from VXRT_IMAGE_CACHE files %.0f MB; reservations on VXRT_PAGEFILE's file %.0f MB (their dirty pages are the file's)",
+        vm_text, (unsigned long long)vx_mem_reset_calls, vx_mem_reset_bytes / 1048576.0, vx_image_cache_bytes() / 1048576.0,
+        vx_pagefile_bytes() / 1048576.0);
+    {   // (residency: what the program evicted, as it has it now; Metal keeps everything resident)
+        uint64_t evicted = 0, nev = 0;
+        pthread_rwlock_rdlock(&d->bufs_lock);
+        for (uint32_t i = 0; i < d->nbufs; i++) {
+            res12 *b = d->bufs[i];
+            if (!b->owner_heap && !b->reserved && !b->residency_refs) { evicted += b->buffer.allocatedSize; nev++; }
+        }
+        pthread_rwlock_unlock(&d->bufs_lock);
+        vx_log("D3D12: memory: residency: Evict %llu calls (%llu objects), MakeResident %llu calls (%llu objects); committed buffers "
+               "evicted now %.0f MB (%llu); purgeable while evicted %.0f MB (%llu taken); graphics pipelines made %llu, compute %llu", (unsigned long long)g_resident_calls12[0],
+               (unsigned long long)g_resident_objects12[0], (unsigned long long)g_resident_calls12[1], (unsigned long long)g_resident_objects12[1],
+               evicted / 1048576.0, (unsigned long long)nev, g_volatile_bytes12 / 1048576.0, (unsigned long long)g_volatile_lost12,
+               (unsigned long long)g_gfx_psos12, (unsigned long long)g_cs_psos12);
+    }
+}
+// VXRT_MEM_LIMITS=<MB>[,<MB>...]: a device's footprint limit (jetsam's), watched from the presents. When the
+// footprint (or its peak, which counts the spikes between presents) first goes over one, the present, the time since
+// the first present and the memory report are logged: where the process would have been ended. Nothing is refused.
+static void mem_limits_present12(dev12 *d, uint32_t presents) {
+    static int n = -1; static uint64_t lim[8]; static int hit[8]; static uint64_t t0, peak_seen;
+    if (n < 0) {
+        n = 0;
+        const char *e = getenv("VXRT_MEM_LIMITS");
+        for (const char *p = e; p && *p && n < 8; ) { long long v = atoll(p); if (v > 0) lim[n++] = (uint64_t)v << 20; p = strchr(p, ','); if (p) p++; }
+        if (n) vx_log("D3D12: VXRT_MEM_LIMITS: %d footprint limits watched from the presents", n);
+        t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    }
+    if (!n || (presents % 10 && presents > 2)) return;
+    task_vm_info_data_t vm = { 0 };
+    mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &c) != KERN_SUCCESS) return;
+    double secs = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9;
+    uint64_t peak = vm.ledger_phys_footprint_peak > vm.phys_footprint ? vm.ledger_phys_footprint_peak : vm.phys_footprint;
+    if (presents % 600 == 0 || peak > peak_seen + (256ull << 20)) {
+        vx_log("D3D12: memory limits: present %u, %.0f s: footprint %.0f MB (peak %.0f), Metal allocated %.0f MB", presents, secs,
+               vm.phys_footprint / 1048576.0, peak / 1048576.0, d->mtl.currentAllocatedSize / 1048576.0);
+        if (peak > peak_seen) peak_seen = peak;
+    }
+    for (int k = 0; k < n; k++) {
+        if (hit[k] || peak <= lim[k]) continue;
+        hit[k] = 1;
+        vx_log("D3D12: memory limit %.0f MB crossed: present %u, %.0f s after the first, footprint %.0f MB (peak %.0f), Metal "
+               "allocated %.0f MB: a device with this limit ends the process here", lim[k] / 1048576.0, presents, secs,
+               vm.phys_footprint / 1048576.0, peak / 1048576.0, d->mtl.currentAllocatedSize / 1048576.0);
+        mem_report12(d);
+    }
 }
 // malloc keeps the pages of freed blocks (most in its medium size class, 1.3 GB of dirty pages for 0.5 GB in use in
 // Cyberpunk) until memory runs short. VXRT_MALLOC_RELIEF=1: every 300 presents malloc_zone_pressure_relief, off the
@@ -14157,6 +14342,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     cb_trace_poll12();
     if (g_mem_report12) { g_mem_report12 = 0; mem_report12(sc->dev); }
     malloc_relief12(sc->presents);
+    mem_limits_present12(sc->dev, sc->presents);
     skip_poll12();
     mfx_poll12();
     census_present12();
@@ -14307,6 +14493,8 @@ static uint32_t *residency_priority12(dev12 *device, void *object) {
 
 static WINAPI HRESULT dev_update_residency(void *this, uint32_t count, void *const *objects, int make_resident) {
     dev12 *device = this;
+    __atomic_add_fetch(&g_resident_calls12[make_resident != 0], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_resident_objects12[make_resident != 0], count, __ATOMIC_RELAXED);
     if (count && !objects) return E_INVALIDARG;
     pthread_mutex_lock(&device->lock);
     HRESULT result = S_OK;
@@ -14327,8 +14515,8 @@ static WINAPI HRESULT dev_update_residency(void *this, uint32_t count, void *con
     if (result >= 0) {
         for (uint32_t i = 0; i < count; i++) {
             uint32_t *refs = residency_counter12(device, objects[i]);
-            if (make_resident) __atomic_add_fetch(refs, 1, __ATOMIC_RELAXED);
-            else __atomic_sub_fetch(refs, 1, __ATOMIC_RELAXED);
+            uint32_t now = make_resident ? __atomic_add_fetch(refs, 1, __ATOMIC_RELAXED) : __atomic_sub_fetch(refs, 1, __ATOMIC_RELAXED);
+            if (now == (make_resident ? 1u : 0u)) evict_volatile12(objects[i], make_resident);
         }
     }
     pthread_mutex_unlock(&device->lock);
