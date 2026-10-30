@@ -758,7 +758,8 @@ void vx_code_freed(void *addr, size_t len);            // (its translations go: 
 #define MEM_IMAGE    0x1000000
 #define GRANULARITY  0x10000
 
-typedef struct { uintptr_t base; size_t size; DWORD protect, type; uint64_t foff; } reservation;   // (type: VirtualAlloc's, as
+typedef struct { uintptr_t base; size_t size; DWORD protect, type; uint64_t foff; size_t hw; } reservation;   // (hw: the
+                                                         // highest committed end, for VXRT_VA_HIGHWATER)   // (type: VirtualAlloc's, as
                                                          // reserved; foff: 1 + its offset in VXRT_PAGEFILE's file, or 0)
 // A reservation maps whole 64 KB units, as Windows uses them up: with only its pages mapped, every small one leaves
 // a gap no aligned reservation fits in, and the kernel's search for room walks all of those (2 ms per call with
@@ -973,6 +974,35 @@ static int xr_on(void) {
 #endif
     return on;
 }
+// VXRT_VA_THIN=<GB>[:<divisor>] (off by default; a test): a reservation anywhere of <GB> or more gets only a part of
+// its size as address space (size / divisor, at least 1 GB), followed by a 64 KB guard. Cyberpunk 2077 reserves 135 GB
+// at its start (pools of 64, 32, 16 and 4 x 4 GB) and commits each from its start up, as a bump allocator (measured
+// on the Mac to the main menu: 1024, 524, 512 and at most 24 MB; at El Coyote 1.5 GB, 736, 610): the rest of its range
+// is never touched. A commit that reaches the guard fails (ERROR_NOT_ENOUGH_MEMORY) and is logged: the part was too
+// small. The program believes the whole size is its own; what lies past the guard is other memory. Measured
+// (2026-10-30, Mac and headset): Cyberpunk 2077 then fails within a second whenever another pool lands inside a pool's
+// believed range (the 32 GB pool inside the 64 GB one's: a null read at exe+0x27564b) - it finds a pointer's pool by
+// address - so the ranges must not overlap, and 131 GB of them do not fit in the headset's 63 GB.
+#define VX_GUARD_TYPE 0x7fff0000u
+static uint64_t g_thin_min, g_thin_div;
+static int thin_on(void) {
+    static int on = -1;
+    if (on >= 0) return on;
+    const char *e = getenv("VXRT_VA_THIN");
+    if (!e) e = "0";                              // (off: Cyberpunk 2077 tells its pools apart by address range, see above)
+    unsigned long long gb = 0, div = 4;
+    sscanf(e, "%llu:%llu", &gb, &div);
+    g_thin_min = (uint64_t)gb << 30; g_thin_div = div > 1 ? div : 4;
+    on = gb > 0;
+    if (on) vx_log("VirtualAlloc: reservations of %llu GB or more get 1/%llu of their size (at least 1 GB) and a guard (VXRT_VA_THIN)", gb, (unsigned long long)g_thin_div);
+    return on;
+}
+static uint64_t thin_size(uint64_t len) {
+    if (!thin_on() || len < g_thin_min) return 0;
+    uint64_t r = len / g_thin_div;
+    if (r < (1ull << 30)) r = 1ull << 30;
+    return r < len ? (r + GRANULARITY - 1) & ~(uint64_t)(GRANULARITY - 1) : 0;
+}
 // A free stretch of len bytes in the range (with g_vm_lock held), from the cursor on, then from the start.
 static kern_return_t xr_alloc(mach_vm_address_t *out, mach_vm_size_t len) {
     for (int pass = 0; pass < 2; pass++) {
@@ -993,6 +1023,9 @@ static kern_return_t xr_alloc(mach_vm_address_t *out, mach_vm_size_t len) {
                 *out = got; g_xr_cursor = got + len;
                 return KERN_SUCCESS;
             }
+            static int shown;
+            if (shown < 24 && len >= (1ull << 30)) { shown++; vx_log("VirtualAlloc: %#llx bytes: the app's range has %#llx-%#llx (prot %d, tag %u) at %#llx",
+                (unsigned long long)len, (unsigned long long)region, (unsigned long long)(region + region_size), info.protection, 0u, (unsigned long long)a); }
             a = (region + region_size + GRANULARITY - 1) & ~(mach_vm_address_t)(GRANULARITY - 1);
         }
     }
@@ -1007,10 +1040,29 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         VX_NO_STOP_UNLOCK(&g_vm_lock);
         return p;
     }
+    if (r && r->type == VX_GUARD_TYPE) {                    // (VXRT_VA_THIN: past the part given)
+        static int said;
+        if (said++ < 16) vx_log("VirtualAlloc(%p, %#zx, %#x): the guard after a thin reservation: the part was too small (VXRT_VA_THIN), from %p",
+                                addr, size, type, VX_RETURN_ADDRESS());
+        VX_NO_STOP_UNLOCK(&g_vm_lock);
+        vx_set_last_error(8);
+        return NULL;
+    }
     if (r && !(type & MEM_RESERVE)) {                       // committing inside an existing reservation
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
         prot_set(start, ((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff, protect);
         g_va_kind[0]++; valloc_stats(0);
+        // VXRT_VA_HIGHWATER (on visionOS by default): how far into each reservation of 1 GB or more the program
+        // commits, logged at every new power of two of MB (the address space a smaller reservation would need)
+        static int hwon = -1;
+        if (hwon < 0) hwon = getenv("VXRT_VA_HIGHWATER") ? atoi(getenv("VXRT_VA_HIGHWATER")) : VX_XROS;
+        size_t end = (uintptr_t)addr + size - r->base;
+        if (hwon && r->size >= (1ull << 30) && end > r->hw) {
+            size_t was = r->hw >> 20, now = end >> 20;
+            r->hw = end;
+            if (!was || (64 - __builtin_clzll(now | 1)) != (64 - __builtin_clzll(was | 1)))
+                vx_log("VirtualAlloc: reservation %#lx (%zu MB) committed up to %zu MB (from %p)", (unsigned long)r->base, r->size >> 20, now, VX_RETURN_ADDRESS());
+        }
         VX_NO_STOP_UNLOCK(&g_vm_lock);
         return (void *)((uintptr_t)addr & ~(uintptr_t)0xfff);
     }
@@ -1037,6 +1089,42 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         g_spare[i] = g_spare[--g_nspare];
     }
     kern_return_t kr = KERN_NO_SPACE;
+    // VXRT_VA_MAX_MB: reservations anywhere larger than that fail at once, as on a machine without the address space
+    // (the program's allocators then take smaller ones: Cyberpunk 2077's 64 GB pool falls back to 4 GB)
+    static uint64_t va_max = ~0ull;
+    if (va_max == ~0ull) { const char *e = getenv("VXRT_VA_MAX_MB"); va_max = e && atoll(e) > 0 ? (uint64_t)atoll(e) << 20 : ~1ull; }
+    // VXRT_VA_REFUSE=<GB>[,<GB>...]: reservations anywhere of exactly those sizes fail (the program's fallbacks)
+    int refuse = 0;
+    for (const char *e = getenv("VXRT_VA_REFUSE"); !addr && e && *e; e = strchr(e, ',') ? strchr(e, ',') + 1 : NULL)
+        if (atoll(e) > 0 && (uint64_t)len == (uint64_t)atoll(e) << 30) refuse = 1;
+    if (!addr && ((uint64_t)len > va_max || refuse)) {
+        static int said;
+        if (said++ < 32) vx_log("VirtualAlloc(0, %#zx): VXRT_VA_MAX_MB / VXRT_VA_REFUSE: refused, from %p", size, VX_RETURN_ADDRESS());
+        VX_NO_STOP_UNLOCK(&g_vm_lock);
+        vx_set_last_error(8);
+        return NULL;
+    }
+    uint64_t thin = addr ? 0 : thin_size(mapped_size(len));
+    if (thin) {                                             // (VXRT_VA_THIN: the part, then the guard)
+        mach_vm_size_t want = len;
+        len = thin;
+        if ((xr_on() && xr_alloc(&a, thin + GRANULARITY) == KERN_SUCCESS) ||
+            mach_vm_map(mach_task_self(), &a, thin + GRANULARITY, GRANULARITY - 1, VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, 0,
+                        VX_PROT_RWX, VX_PROT_RWX, VM_INHERIT_COPY) == KERN_SUCCESS) {
+            mach_vm_protect(mach_task_self(), a, thin, 0, VX_PROT_RWX);
+            mach_vm_protect(mach_task_self(), a + thin, GRANULARITY, 0, VM_PROT_NONE);
+            uint64_t foff = pf_map((uintptr_t)a, thin);
+            res_insert((uintptr_t)a, (size_t)thin, protect, type);
+            if (foff) find_reservation((uintptr_t)a)->foff = foff;
+            res_insert((uintptr_t)(a + thin), GRANULARITY, 0, VX_GUARD_TYPE);
+            vx_log("VirtualAlloc(0, %#llx) = %#llx: %llu MB of it mapped, then a guard (VXRT_VA_THIN; from %p)", (unsigned long long)want,
+                   (unsigned long long)a, (unsigned long long)(thin >> 20), VX_RETURN_ADDRESS());
+            g_va_kind[2]++;
+            VX_NO_STOP_UNLOCK(&g_vm_lock);
+            return (void *)a;
+        }
+        len = want;
+    }
     int in_range = !addr && xr_on() && mapped_size(len) >= g_xr_min && (kr = xr_alloc(&a, mapped_size(len))) == KERN_SUCCESS;
     if (!in_range) kr = addr
         ? mach_vm_allocate(mach_task_self(), &a, mapped_size(len), VM_FLAGS_FIXED)
@@ -1052,10 +1140,23 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         vx_set_last_error(addr ? 487 : 8 /* ERROR_NOT_ENOUGH_MEMORY */);
         return NULL;
     }
+    // (VXRT_VA_SKEW=1, a test: reservations of 4 GB or more 64 KB past an aligned start, to see whether a program
+    // relies on the alignment the Mac's kernel happens to give large ones)
+    if (!addr && len >= (4ull << 30) && getenv("VXRT_VA_SKEW") && mach_vm_deallocate(mach_task_self(), a, mapped_size(len)) == KERN_SUCCESS) {
+        mach_vm_address_t b = a;
+        if (mach_vm_map(mach_task_self(), &b, mapped_size(len) + GRANULARITY, GRANULARITY - 1, VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, 0,
+                        VX_PROT_RWX, VX_PROT_RWX, VM_INHERIT_COPY) == KERN_SUCCESS) {
+            if (!(b & 0xffffffffull)) { mach_vm_deallocate(mach_task_self(), b, GRANULARITY); a = b + GRANULARITY; }
+            else { mach_vm_deallocate(mach_task_self(), b + mapped_size(len), GRANULARITY); a = b; }
+        }
+        vx_log("VXRT_VA_SKEW: %#llx bytes at %#llx", (unsigned long long)len, (unsigned long long)a);
+    }
     mach_vm_protect(mach_task_self(), a, mapped_size(len), 0, VX_PROT_RWX);
     uint64_t foff = pf_map((uintptr_t)a, mapped_size(len));
     res_insert((uintptr_t)a, (size_t)len, protect, type);
     if (foff) find_reservation((uintptr_t)a)->foff = foff;
+    if (len >= (1ull << 30) && (getenv("VXRT_VA_HIGHWATER") ? atoi(getenv("VXRT_VA_HIGHWATER")) : VX_XROS))
+        vx_log("VirtualAlloc(%p, %#zx, %#x) = %#llx (from %p)", addr, size, type, (unsigned long long)a, VX_RETURN_ADDRESS());
     g_va_kind[2]++;
     static uint64_t made;
     uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
@@ -1153,7 +1254,10 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
             g_spare_bytes += n;
             mach_vm_behavior_set(mach_task_self(), r->base, n, VM_BEHAVIOR_REUSABLE);   // its pages can go meanwhile
         } else mach_vm_deallocate(mach_task_self(), r->base, n);
+        uintptr_t end = r->base + n;
         res_remove(r);
+        reservation *g = find_reservation(end);              // (VXRT_VA_THIN: its guard goes with it)
+        if (g && g->base == end && g->type == VX_GUARD_TYPE) { mach_vm_deallocate(mach_task_self(), g->base, g->size); res_remove(g); }
         ok = 1;
     } else if (r && (type & MEM_DECOMMIT)) {
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;

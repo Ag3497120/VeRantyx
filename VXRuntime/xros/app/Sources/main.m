@@ -136,10 +136,42 @@ static void va_range_make(void) {
              (unsigned long long)cand[i][0], (unsigned long long)cand[i][1], kr, ka, wrote);
         if (kr == KERN_SUCCESS) {
             char v[64]; snprintf(v, sizeof v, "%llx-%llx", (unsigned long long)cand[i][0], (unsigned long long)cand[i][1]);
-            if (ka == KERN_SUCCESS) setenv("VXRT_VA_RANGE", v, 1);
-            return;
+            if (ka == KERN_SUCCESS) { setenv("VXRT_VA_RANGE", v, 1); return; }
+            break;
         }
     }
+    // (refused on visionOS 27: KERN_NOT_SUPPORTED, 2026-10-30.) The guard itself: is it an ordinary entry that the
+    // process may take out (vm_deallocate) and map in its place? 1 GB first, written; then the whole void.
+    {
+        vm_address_t g = 0x2000000000ull;
+        kern_return_t kd = vm_deallocate(mach_task_self(), g, 1ull << 30);
+        kern_return_t ka = vm_allocate(mach_task_self(), &g, 1ull << 30, VM_FLAGS_FIXED);
+        jlog("va_guard_1gb", "\"dealloc_kr\":%d,\"alloc_kr\":%d", kd, ka);
+        if (ka == KERN_SUCCESS) {
+            ((volatile char *)g)[0] = 1; ((volatile char *)g)[(1ull << 30) - 1] = 2;
+            jlog("va_guard_1gb_written", NULL);
+            vm_deallocate(mach_task_self(), g, 1ull << 30);
+            uint64_t lo = 0x1000000000ull, hi = 0x6f00000000ull;
+            kd = vm_deallocate(mach_task_self(), lo, hi - lo);
+            vm_address_t t = 0x6000000000ull;
+            ka = vm_allocate(mach_task_self(), &t, 64ull << 30, VM_FLAGS_FIXED);
+            if (ka == KERN_SUCCESS) { ((volatile char *)t)[(64ull << 30) - 1] = 3; vm_deallocate(mach_task_self(), t, 64ull << 30); }
+            jlog("va_guard_void", "\"dealloc_kr\":%d,\"fixed_64gb_kr\":%d", kd, ka);
+            if (kd == KERN_SUCCESS && ka == KERN_SUCCESS) {
+                char v[64]; snprintf(v, sizeof v, "%llx-%llx", (unsigned long long)lo, (unsigned long long)hi);
+                setenv("VXRT_VA_RANGE", v, 1);
+                return;
+            }
+        }
+    }
+    // Then the extended range above the arena, where the
+    // system serves only requests of 8 GB or more by itself: smaller reservations (the game's 4 GB pools) would fail
+    // in the crowded default range, so the runtime places them there with fixed allocations.
+    uint64_t lo = xa_arena_base() + xa_arena_size();
+    if (lo < 0x7000000000ull || lo >= 0x8000000000ull) lo = 0x7000000000ull;
+    char v[64]; snprintf(v, sizeof v, "%llx-%llx", (unsigned long long)lo, 0x8000000000ull);
+    setenv("VXRT_VA_RANGE", v, 1);
+    jlog("va_range_extended", "\"range\":\"%s\"", v);
 }
 
 // Before anything else maps memory (a constructor, before main): the modules' arena, then what the address space and

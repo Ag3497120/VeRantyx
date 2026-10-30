@@ -310,6 +310,7 @@ const char *vx_special_folder_path(int csidl);   // shell folder map shared with
 const char *vx_root(void);
 int   vx_full_path(const char *win, char *out, size_t cap);     // canonical absolute Windows path
 int   vx_unix_path(const char *win, char *out, size_t cap);     // 0 (last error set) if unmapped
+void  vx_ci_path(char *path, size_t cap);                         // visionOS: the names as the case-sensitive disk has them
 int   vx_unix_path_write(const char *win, char *out, size_t cap, int keep_contents);   // writes: through VXRT_OVERLAY
 void  vx_windows_path(const char *unix_path, char *out, size_t cap);
 void  vx_get_cwd(char *out, size_t cap);

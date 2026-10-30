@@ -545,6 +545,7 @@ static int search_dll(const char *name, char *out, size_t cap) {
         }
         if (!dirs[i][0]) continue;
         snprintf(out, cap, "%s/%s", dirs[i], file);
+        vx_ci_path(out, cap);                                    // (visionOS: a case-sensitive file system)
         char shadow[4096];
         if (vx_overlay_file(out, shadow, sizeof shadow)) { snprintf(out, cap, "%s", shadow); return 1; }   // (VXRT_OVERLAY's copy first)
         struct stat st;
@@ -557,6 +558,7 @@ static int search_dll(const char *name, char *out, size_t cap) {
         const char *colon = strchr(extra, ':');
         size_t n = colon ? (size_t)(colon - extra) : strlen(extra);
         snprintf(out, cap, "%.*s/%s", (int)n, extra, file);
+        vx_ci_path(out, cap);
         struct stat st;
         if (n && !stat(out, &st) && S_ISREG(st.st_mode) && !wine_builtin(out)) return 1;
         extra = colon ? colon + 1 : NULL;

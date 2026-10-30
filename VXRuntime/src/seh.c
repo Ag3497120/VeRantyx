@@ -487,7 +487,10 @@ static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *c
         }
         if (g_unhandled_filter(&ep) == -1) resume(ctx);
     }
-    vx_log("unhandled exception %#x at %p", rec->code, rec->address);
+    vx_log("unhandled exception %#x at %p%s%#llx (rax %#llx rcx %#llx rdx %#llx rbx %#llx rsi %#llx rdi %#llx r8 %#llx)", rec->code, rec->address,
+           rec->nparams > 1 ? (rec->info[0] ? ", writing " : ", reading ") : ", ", rec->nparams > 1 ? (unsigned long long)rec->info[1] : 0ull,
+           (unsigned long long)ctx->gpr[0], (unsigned long long)ctx->gpr[1], (unsigned long long)ctx->gpr[2], (unsigned long long)ctx->gpr[3],
+           (unsigned long long)ctx->gpr[6], (unsigned long long)ctx->gpr[7], (unsigned long long)ctx->gpr[8]);
     CONTEXT walk = *ctx;                          // the program's frames, unwound
     vx_entry *at = self.next;
     for (int depth = 0; depth < 20; depth++) {

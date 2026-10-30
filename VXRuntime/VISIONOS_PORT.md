@@ -241,6 +241,61 @@ reservation 64 GB, ANE 16 cores, rasterization rate maps for 2 layers.
 the modules' generation; then the commands (modules as frameworks, app install, `devicectl device copy to` of the
 install into `Documents/root/drive_c/...`, UserSettings.json). No Steam client is copied or imitated.
 
+## Round 3 (2026-10-30, 11:50-12:55): Cyberpunk 2077 launched on the headset
+
+avp-mem and avp-preflight merged (Mac `make check`: 591 "ok" lines before and after). Logs:
+`~/Verantyx_VR_Drive/wt/runs/avp-port/cp1..cp9` (device), `runs/avp-port/mac/hw1..hw7` (Mac, same game, Steam-less).
+
+**Launch path.** `-game cyberpunk` (main.m `game_start`): the install already in `Documents/root/drive_c/Program Files
+(x86)/Steam/steamapps/common/Cyberpunk 2077` (checked before and after every `devicectl device install app`; never
+uninstalled), no Steam variables or keys, no steamclient anywhere (`steamclient_found:0`), `VXRT_OVERLAY` into
+`Documents/root/overlay_game`, cwd `bin/x64`, `--launcher-skip -skipStartScreen`, `UserSettings.json` = avp-mem's
+lowest settings in the root's AppData (no saves), `VXRT_PAGEFILE` / `VXRT_D3D12_FILE_BUFFERS` / `VXRT_IMAGE_CACHE` in
+`Documents/vxrt_mem`, GPU budget 4096, `TEX_DOWNSCALE=2` (512), NPU race on, `VXRT_AOT_MISSES=Documents/aot.misses`.
+The two Visual C++ DLLs the game loads from the Mac's redist (msvcp140, mfc140u) and a read-only shader cache go into
+the app's `bundle/` from `build/xros/game_bundle` (local, not in git); `VXRT_D3D12_SHADER_CACHE_RO` is that folder.
+
+**Modules.** `XROS_AOT_GAME=1 XROS_AOT_LIST=build/xros/game_pe.list tools/xros_aot.sh`: the exe and the 26 DLLs the
+Steam-less Mac run loaded, packed from 0x7000000000 (301 MB of images; exe 4 parts), the splits profile rebased to
+those bases (3143 of 3271), as 30 signed frameworks (1.0 GB) in `build/xros/game_fw`, which the app's build embeds:
+71 s on the Mac (assembly 4 at a time), app 1.1 GB, `devicectl device install app` 16 s. On the headset every
+framework opened in under 8 ms, every image landed at its module's base, AOT strict, **0 fallbacks** once the DLLs
+were found.
+
+**Walls hit and fixed on the way:**
+- The app's file system is case-sensitive (NTFS and a Mac's APFS are not): `MSVCP140.dll` was not found as
+  `msvcp140.dll`, and the first call through its import stub stopped strict AOT at a stub address. `vx_ci_path`
+  (files.c, used by `vx_unix_path` and the DLL search): a path not there as written is matched one component at a
+  time, case-insensitively.
+- Reservations under 8 GB fail in the default range (crowded; the system serves only 8 GB and more from the extended
+  64 GB itself): the game's 4 GB pools failed. The runtime now places reservations of 64 MB or more itself in the
+  extended range above the arena (`VXRT_VA_RANGE`, fixed allocations, next fit; main.m sets it).
+- `mach_vm_range_create` (a `MACH_VM_RANGE_FIXED` range in the void 0xfc0000000-0x7000000000) is refused:
+  `KERN_NOT_SUPPORTED`; `vm_deallocate` of the void "succeeds" but nothing can be mapped there (`KERN_NO_SPACE`).
+
+**The wall: address space.** Cyberpunk 2077 reserves its memory pools at start: 16 GB, 64 GB, 32 GB, 2 x 1 GB,
+4 x 4 GB, 1 GB (135 GB before the main menu; the Mac's memory report counted 139 GB). The headset gives the app 63 GB
+above the arena (`va_probe`, `va_fixed_1gb`): on the device the 16 + 32 GB pools and the first 4 GB ones fill it,
+the 64 GB pool fails, then a 4 GB one, and the game stops in its own OOM handler (`Out of Memory! Failed to allocate
+4294967296 bytes`, systemOOMHandlerBreak.cpp, 1-4 s after launch, footprint under 400 MB, no frame, no video).
+Tried (all logged):
+- Each pool commits from its start up, as a bump allocator (`VXRT_VA_HIGHWATER`, Mac to the main menu: 64 GB pool
+  1024 MB, 32 GB 524 MB, 16 GB 512 MB, 4 GB ones at most 24 MB). So `VXRT_VA_THIN` gave each pool of 4 GB or more a
+  quarter of its range followed by a guard: everything fits (35 GB), but the game fails within a second (null read at
+  exe+0x272d0d on the headset, exe+0x27564b on the Mac) whenever a pool lies inside another pool's believed range
+  (Mac: only the 64 GB pool thin, the 32 GB pool after it: the same failure). It finds a pointer's pool by address,
+  so the ranges must not overlap, and 131 GB of non-overlapping ranges do not fit in 63 GB.
+- Not alignment: all large reservations 64 KB off their aligned start (`VXRT_VA_SKEW=1`) run normally on the Mac.
+- No fallback sizes: refusing the 32 and 64 GB pools (`VXRT_VA_REFUSE`), or the 16 GB one, stops the game at once.
+- The pool sizes are not in a config file (engine/config, r6/config) and do not follow the memory reported (avp-mem).
+
+What would get past it (not done: decisions for the user): (a) smaller pool ranges in the game itself, i.e. changing
+the sizes the exe passes to its reservation function (a change to the game's code or data, as memory mods do; not
+DRM); (b) more address space for the app (an entitlement or OS behaviour we do not have; only Apple); (c) finding how
+the game maps pointers to pools and serving that differently (reverse engineering of the allocator). Everything
+before the pools (loading 27 images from frameworks, imports, strict AOT, the immersive space at 90 Hz with no frame
+yet, memory 8.1 GB available) works.
+
 ## Walls ahead for Cyberpunk 2077, and the plan for each
 
 0. **Branches into x86 code** (fixed above). Keep `tools/xros_x86calls.py` in the build; a call through an ms_abi

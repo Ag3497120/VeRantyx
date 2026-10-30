@@ -29,6 +29,44 @@ static pthread_mutex_t g_cwd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 const char *vx_root(void) { return g_root; }
 
+// visionOS: the app's file system is case-sensitive (a Mac's APFS is not, nor is NTFS). A path that is not there as
+// written is looked up again one component at a time, each missing one matched case-insensitively against its parent
+// directory's names, and rewritten with the names found (a part found nowhere and the rest are left as written: a new
+// file keeps its name, in a folder whose names were corrected). Elsewhere a no-op.
+void vx_ci_path(char *p, size_t cap) {
+#if VX_XROS
+    struct stat st;
+    if (!p[0] || !lstat(p, &st)) return;
+    char buf[MAX_PATH_LEN];
+    snprintf(buf, sizeof buf, "%s", p);
+    char *c = buf[0] == '/' ? buf + 1 : buf;
+    while (*c) {
+        char *slash = strchr(c, '/');
+        if (slash) *slash = 0;
+        if (*c && lstat(buf, &st)) {
+            char parent[MAX_PATH_LEN];
+            size_t plen = (size_t)(c - buf);
+            if (plen <= 1) snprintf(parent, sizeof parent, "%s", plen ? "/" : ".");
+            else snprintf(parent, sizeof parent, "%.*s", (int)(plen - 1), buf);
+            int found = 0;
+            DIR *d = opendir(parent);
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d))) if (!strcasecmp(e->d_name, c)) { memcpy(c, e->d_name, strlen(c)); found = 1; break; }
+                closedir(d);
+            }
+            if (!found) { if (slash) *slash = '/'; break; }
+        }
+        if (!slash) break;
+        *slash = '/';
+        c = slash + 1;
+    }
+    snprintf(p, cap, "%s", buf);
+#else
+    (void)p; (void)cap;
+#endif
+}
+
 // Windows error codes for errno values.
 DWORD vx_error_from_errno(int e) {
     switch (e) {
@@ -191,6 +229,7 @@ int vx_unix_path(const char *win, char *out, size_t cap) {
     else { vx_set_last_error(3 /* ERROR_PATH_NOT_FOUND */); return 0; }
     if (n < 0 || (size_t)n >= cap) { vx_set_last_error(206); return 0; }
     for (char *c = out; *c; c++) if (*c == '\\') *c = '/';
+    vx_ci_path(out, cap);
     char shadow[MAX_PATH_LEN];
     struct stat ss, os;
     if (overlay_shadow(out, shadow, sizeof shadow) && !stat(shadow, &ss) && (!S_ISDIR(ss.st_mode) || stat(out, &os)))
