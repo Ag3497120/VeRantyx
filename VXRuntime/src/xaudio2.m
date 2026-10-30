@@ -41,7 +41,7 @@ typedef struct {
     void (WINAPI *pass_end)(void *);
     void (WINAPI *critical_error)(void *, HRESULT);
 } engine_callback;
-#define CALL(obj, fn, ...) ((*(voice_callback **)(obj))->fn((obj), ##__VA_ARGS__))
+#define CALL(obj, fn, ...) (VX_X86FN((*(voice_callback **)(obj))->fn)((obj), ##__VA_ARGS__))
 
 enum { V_SOURCE, V_SUBMIX, V_MASTER };
 typedef struct engine engine;

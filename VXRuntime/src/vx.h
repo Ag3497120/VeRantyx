@@ -12,6 +12,14 @@
 #ifndef VX_XROS_SIM
 #define VX_XROS_SIM 0                // (1: its simulator)
 #endif
+// A call through an ms_abi function pointer (code that may be x86): on visionOS sent to the x86 runner without
+// branching there (tools/xros_x86calls.py wraps every such callee in the build's copies of the sources).
+#if VX_XROS && defined(__aarch64__)
+void *vx_x86_fn(void *fn);
+#define VX_X86FN(x) ({ __typeof__(&*(x)) vx_f_ = &*(x); (__typeof__(vx_f_))vx_x86_fn((void *)vx_f_); })
+#else
+#define VX_X86FN(x) (x)
+#endif
 #include <stddef.h>
 #include <stdint.h>
 

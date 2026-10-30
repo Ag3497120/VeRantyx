@@ -78,21 +78,50 @@ Each from the bundle, `VXRT_AOT_STRICT=1`, no JIT, modules linked into the app. 
 So the runtime's CPU side is sound on visionOS frameworks: loading, imports, the thunks, the AOT runner, faults as
 signals, x86 SEH and unwinding, threads and TLS, SIMD. The GPU side has to be judged on the headset.
 
-## On the headset
+## On the headset (Vision Pro M2, visionOS 27.0, 08:49-09:10)
 
-The app installs (`xcrun devicectl device install app`, done twice today). Launching needs the headset worn and
-unlocked: `devicectl device process launch` waited at "Acquired usage assertion" and timed out three times with
-`passcodeRequired: true`. Run, with the headset on:
+Run with `tools/xros_device_run.sh` once the headset was worn; logs and crash reports in
+`~/Verantyx_VR_Drive/wt/runs/avp-port/device/`.
 
-    cd VXRuntime && tools/xros_device_run.sh            # none xros_clear hello_crt seh_try unwind suite cxx_exceptions d3d12
+**First run: every program died at its first instruction.** Crash reports: `EXC_BAD_ACCESS (SIGKILL)
+KERN_PROTECTION_FAILURE at 0x1400020e0`, termination `CODESIGNING / Invalid Page`, from `program_thread`. The ARM64
+runtime calls x86 code (entry points, DllMain, callbacks, COM methods) by branching to the x86 address and letting the
+fault handler send the call to the engine (arm64.c). The Mac raises SIGBUS for that; visionOS kills the process
+outright for an instruction fetch from a page without signed code, catchable by nothing, even with the image's
+maximum protection lowered to RW (tried: same kill).
 
-It prints each test's last lines and leaves `host_log.jsonl` and `<test>.vxrt.log` in
-`~/Verantyx_VR_Drive/wt/runs/avp-port/device/`. What to read there: `va_probe` and `exe_base` (does the Windows
-layout fit with extended-virtual-addressing: VX Proto's probe the same morning saw 64 GB reservable and 8188 MB
-available of 15744 MB), `metal` (BC compression, Metal 3, argument-buffer tier, Metal 4 queue, placement sparse),
-`mem` (available memory while D3D12 runs), and how far `d3d12.exe` gets (105 "ok" lines on the Mac).
+**Fix (wall 0, done):** no branch into x86 code. `tools/xros_x86calls.py` takes every call through an ms_abi pointer
+that `tools/vx_abi_scan.py` finds (496 sites in 49 files; the scanner now also gives the callee's text range) and
+writes the build's copies of the sources (`build/xros/src`, `#line` to the originals) with the callee wrapped in
+`VX_X86FN()`; two macros (`RELEASE` in com.c, `CALL` in xaudio2.m) carry it in their definitions. `VX_X86FN` is the
+identity on the Mac; on visionOS `vx_x86_fn` returns native targets as they are and puts x86 ones on a per-thread
+stack for `vx_cb_tramp_tls` (context_arm64.S), which joins the existing `vx_cb_tramp`. The sources stay as they were.
+
+**Second run, all as on the Mac:**
+
+| Program | On the headset |
+| --- | --- |
+| probes | arena at 0xf00000000 **taken** (0x2e4000000-0xfc0000000 is mapped by the system); 0x140000000 free; largest reservation 64 GB; 8189 MB available at launch of 15744 MB; GPU "Apple M2 GPU", Apple8, Metal 3, BC textures yes, **argument buffers tier 1** (the Mac's are tier 2), working set 10922 MB, max buffer 8192 MB, Metal 4 queue yes, placement sparse yes (16 KB tiles), raytracing yes |
+| hello_crt.exe | its line |
+| seh_try.exe | `__except reached -> ok` |
+| unwind.exe | `62 cases, 0 failed -> ok` |
+| suite.exe | all ok including D3D11 (`clear=0xffff8000 inside=0xff0000ff -> ok`), `suite: 0 failures`, 8167 module entries, 0 fallbacks |
+| cxx_exceptions.exe | stops as designed at 0x14000182b (no module block) |
+| xros_clear.exe | `11411 frames in 10.0 s, 11411 presents -> ok`, seen in the window; 1141 presents a second: not paced (wall 11) |
+| d3d12.exe | **105 "ok" lines, the same as the Mac**: compute, graphics PSOs from DXIL, root signatures, bindless, heaps, placed and reserved resources, queries, fences, ExecuteIndirect, the swap chain; footprint at most 52 MB; the NPU race came on (`display link on (Vision Pro, 90 Hz)`) on the game's-motion-vectors path |
+
+Memory while D3D12 ran: at least 8021 MB still available.
 
 ## Walls ahead for Cyberpunk 2077, and the plan for each
+
+0. **Branches into x86 code** (fixed above). Keep `tools/xros_x86calls.py` in the build; a call through an ms_abi
+   pointer the scanner cannot see (a cast through `void *` to a native type) would still be fatal there: the crash
+   report's `CODESIGNING / Invalid Page` at an x86 address is the sign.
+1a. **The arena.** 0xf00000000 is inside a region the system maps on the headset (0x2e4000000-0xfc0000000). The
+   DLL modules made for the arena must be made for a range free there: below 0x2e4000000 (the exe at 0x140000000 is
+   free), chosen by a probe on the device and passed as `VXRT_AOT_ARENA` to `vxrt-aot` and the app.
+1b. **Argument buffers tier 1** on the headset's GPU (tier 2 on the Mac). d3d12.exe's bindless tests pass, but
+   Cyberpunk's descriptor heaps have to be checked against tier-1 limits (the first in-game run will say).
 
 1. **No JIT.** Every address must be in a module. Today 18 addresses still fall back on the Mac (exe 7, PhysX 4,
    REDGalaxy 4, tier0 2, overlay 1; RECOMP.md). Plan: keep running the Mac with `VXRT_AOT_STRICT=1` and the

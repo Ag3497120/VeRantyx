@@ -44,7 +44,7 @@ typedef struct {
     HRESULT (WINAPI *CreateInstance)(void *, void *, const GUID *, void **);
     HRESULT (WINAPI *LockServer)(void *, int);
 } class_factory_vtbl;
-#define RELEASE(p) (((unknown *)(p))->vtbl->Release(p))
+#define RELEASE(p) (VX_X86FN(((unknown *)(p))->vtbl->Release)(p))
 
 // ---- GUID text ------------------------------------------------------------------------------------------------------
 static void guid_text(const GUID *g, char *out) {

@@ -679,6 +679,11 @@ static vx_image *load_pe(const char *path, int is_main) {
     uint8_t *base = reuse >= 0 ? mmap(g_images[reuse]->base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0)
                                : mmap((void *)want, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | (want != pref_base || in_arena(want, image_size) ? MAP_FIXED : 0), -1, 0);
     if (base == MAP_FAILED) { vx_log("cannot map %u bytes", image_size); free(file); return NULL; }
+#if VX_XROS
+    // visionOS kills a process that fetches an instruction from a page it could make executable but whose code is not
+    // signed ("CODESIGNING, Invalid Page"), where the Mac raises SIGBUS: the image's pages may never be executable
+    (void)mach_vm_protect(mach_task_self(), (mach_vm_address_t)(uintptr_t)base, image_size, TRUE, VM_PROT_READ | VM_PROT_WRITE);
+#endif
     memcpy(base, file, headers_size);
     const pe_section *sec = (const pe_section *)(file + section_table_offset);
     for (uint16_t i = 0; i < nsections; i++) {

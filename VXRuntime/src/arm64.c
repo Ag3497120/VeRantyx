@@ -20,6 +20,8 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <execinfo.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -211,6 +213,27 @@ uint64_t vx_x86_invoke(uint64_t fn, const uint64_t *regs, const uint64_t *stack)
     return vx_x86_call(fn, 12, args);
 }
 void vx_cb_tramp(void);
+// The visionOS build's calls into x86 code (VX_X86FN, src/vx.h; tools/xros_x86calls.py): x86 targets wait on this
+// thread's list for vx_cb_tramp_tls, and the call goes there instead (a branch to x86 code would end the app there).
+// The list is a stack: a call made while the arguments of another are evaluated takes its own target first.
+void vx_cb_tramp_tls(void);
+static __thread uint64_t t_x86_fn[64];
+static __thread int t_x86_n;
+void *vx_x86_fn(void *fn) {
+    static uint64_t text_lo, text_hi;
+    if (!text_hi) {
+        extern const struct mach_header_64 _mh_execute_header;
+        unsigned long size = 0;
+        uint8_t *t = getsegmentdata(&_mh_execute_header, "__TEXT", &size);
+        text_lo = (uint64_t)(uintptr_t)t; text_hi = text_lo + size;
+    }
+    uint64_t a = (uint64_t)(uintptr_t)fn;
+    if (!a || (a >= text_lo && a < text_hi)) return fn;             // (the runtime's own function, or a NULL to fault on)
+    if (t_x86_n == 64) { vx_log("arm64: more than 64 calls into x86 code waiting for their arguments"); _exit(3); }
+    t_x86_fn[t_x86_n++] = a;
+    return (void *)vx_cb_tramp_tls;
+}
+uint64_t vx_x86_fn_take(void) { return t_x86_n ? t_x86_fn[--t_x86_n] : 0; }
 
 // ---- functions that work on the x86 state itself ---------------------------------------------------------------------
 // __chkstk: the stacks are mapped whole; the probe returns with every register as it was.

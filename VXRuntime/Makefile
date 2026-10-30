@@ -77,9 +77,15 @@ XROS_OUT = src/cocoa.m src/menus.m src/tray.m src/clipboard.m src/opengl.c src/d
 XROS_OUT += $(if $(filter xrsimulator,$(XROS_SDK)),src/upscale_core.m)
 XROS_SRC = $(filter-out $(XROS_OUT),$(ARM64_SRC)) src/xros_ui.m src/xros_stubs.c translator/engine_nojit.c
 XROS_OBJ = $(patsubst %,$(XROS_DIR)/obj/%.o,$(XROS_SRC))
-$(XROS_DIR)/obj/%.o: % xros/vx_xros.h build/thunks/stamp
+# (the sources whose calls through ms_abi pointers are wrapped for visionOS: copies in $(XROS_DIR)/src, VISIONOS_PORT.md)
+XROS_SCAN = $(filter %.c %.m,$(filter $(SRC),$(XROS_SRC)))
+$(XROS_DIR)/src/stamp: $(XROS_SCAN) tools/xros_x86calls.py tools/vx_abi_scan.py
 	@mkdir -p $(dir $@)
-	$(XROS_CC) $(XROS_CFLAGS) -c -o $@ $<
+	python3 tools/xros_x86calls.py $(XROS_DIR)/src $(XROS_SCAN) > $(XROS_DIR)/src/list
+	@touch $@
+$(XROS_DIR)/obj/%.o: % xros/vx_xros.h build/thunks/stamp $(XROS_DIR)/src/stamp
+	@mkdir -p $(dir $@)
+	@f=$(XROS_DIR)/src/$<; [ -f $$f ] || f=$<; echo "$(XROS_CC) ... -c -o $@ $$f"; $(XROS_CC) $(XROS_CFLAGS) -c -o $@ $$f
 # (the app has its own main: the loader's is called from it, xros/app)
 $(XROS_DIR)/obj/src/loader.c.o: XROS_CFLAGS += -Dmain=vx_loader_main
 $(XROS_DIR)/libvxrt.a: $(XROS_OBJ)

@@ -43,6 +43,11 @@ storage = fn("clang_Cursor_getStorageClass", C.c_int, Cursor)
 cursorArg = fn("clang_Cursor_getArgument", Cursor, Cursor, C.c_uint)
 cursorNumArgs = fn("clang_Cursor_getNumArguments", C.c_int, Cursor)
 cstr = fn("clang_getCString", C.c_char_p, String)
+class Range(C.Structure): _fields_ = [("ptr", C.c_void_p * 2), ("b", C.c_uint), ("e", C.c_uint)]
+getExtent = fn("clang_getCursorExtent", Range, Cursor)
+rangeStart = fn("clang_getRangeStart", Loc, Range)
+rangeEnd = fn("clang_getRangeEnd", Loc, Range)
+getFile = fn("clang_getFileName", String, C.c_void_p)
 nullCursor = fn("clang_Cursor_isNull", C.c_int, Cursor)
 numDiags = fn("clang_getNumDiagnostics", C.c_uint, C.c_void_p)
 getDiag = fn("clang_getDiagnostic", C.c_void_p, C.c_void_p, C.c_uint)
@@ -82,6 +87,11 @@ def where(cur):
     spellLoc(getLoc(cur), None, C.byref(line), C.byref(col), C.byref(off))
     return line.value, col.value
 
+def offset(loc):                                         # (file name, byte offset) where the text of loc is
+    f, off = C.c_void_p(), C.c_uint()
+    spellLoc(loc, C.byref(f), None, None, C.byref(off))
+    return (s(getFile(f)) if f.value else ""), off.value
+
 def scan(path, index):
     args = [b"-target", b"x86_64-apple-macos14", b"-isysroot", SDK.encode(), b"-fobjc-arc", b"-Isrc", b"-Ithird_party/vulkan", b"-Wno-everything", b"-DVX_ABI_SCAN"]
     if path.endswith(".m"): args = [b"-x", b"objective-c"] + args
@@ -118,7 +128,9 @@ def scan(path, index):
                 if box: ft = fntype(cursorType(box[0]))
                 if ft is not None and callConv(ft) == WIN64:
                     line, col = where(cur)
-                    calls.append({"line": line, "col": col, "ret_cls": classify(resultType(ft)),
+                    ext = getExtent(box[0])                 # (the callee's text: tools/xros_x86calls.py wraps it)
+                    (f0, b0), (f1, b1) = offset(rangeStart(ext)), offset(rangeEnd(ext))
+                    calls.append({"line": line, "col": col, "callee_file": f0 if f0 == f1 else "", "callee_at": [b0, b1], "ret_cls": classify(resultType(ft)),
                                   "params": [classify(argType(ft, i)) for i in range(max(numArgs(ft), 0))],
                                   "callee": s(cursorSpell(ref)) if not nullCursor(ref) else ""})
         return 2
