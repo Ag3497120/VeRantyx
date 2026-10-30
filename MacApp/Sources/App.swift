@@ -11,6 +11,8 @@
 //   VeRantyx --snapshot <folder>           saves pictures of each page of the window (scrolled: <page>-2.png, ...)
 //                                          (--snapshot-get <app id>: with the "Get and play" question of that game
 //                                          shown, as its button does; nothing is downloaded)
+//   VeRantyx --steam-check                 prints whether a game started now would get Steam for Mac, as Play waits for
+//                                          (ready, offline, not-signed-in, not-running, unavailable)
 //   VeRantyx --report                      saves the logs as a report does and prints the form's link (opens nothing)
 //   VeRantyx --missing-functions <log>     prints the missing Windows functions a game log names, as the report sends them
 //   VeRantyx --headset-report <session_log.txt> [Mac fps]
@@ -36,6 +38,10 @@ enum Entry {
                     exit(0)
                 } catch { print(error.localizedDescription); exit(1) }
             }
+            dispatchMain()
+        }
+        if a.contains("--steam-check") {
+            Task { let r = await Steam.readiness(); print(r.rawValue); exit(r == .ready ? 0 : 1) }
             dispatchMain()
         }
         if a.contains("--report") {
@@ -168,6 +174,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let game = model.games.first(where: { $0.id == id }) ?? placeholder else { print("\(id): not installed"); exit(2) }
         print("start \(game.name): exe=\(game.exe?.path ?? "(own launcher)") headset=\(model.headset(for: game).rawValue) quality=\(model.quality(for: game).rawValue) flat=\(flat)")
         model.start(game, flat: flat)
+        var said: String? = nil                           // (a start waits for Steam for Mac first: what it waits for)
+        while model.steamWait != nil {
+            if let text = model.steamWaitText, text != said { print(text); said = text }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
         guard let play = model.play else { print("did not start: \(model.error ?? "")"); exit(1) }
         if Play.dryRun { for _ in 0..<20 where play.running { try? await Task.sleep(nanoseconds: 100_000_000) }; print(play.dryRunText); exit(0) }
         let began = Date()

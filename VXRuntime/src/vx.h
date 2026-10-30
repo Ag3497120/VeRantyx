@@ -210,6 +210,7 @@ void vx_client_init(void);             // what desktop clients use: certificate 
 void vx_crypt32_init(void);            // certificates, stores, signatures by macOS; wintrust that trusts nothing unverified (crypt32.c)
 void vx_dpapi_init(void);              // CryptProtectData/Memory with a key of the VXRT_ROOT, AES-256-GCM (dpapi.c)
 void vx_steambridge_init(void);
+int vx_steam_check(void);                     // steambridge.c: "vxrt --vxrt-steam-check": is Mac Steam ready for a game (exit 0)?
 void vx_services_init(void);           // resources, command lines, random numbers, psapi, C runtime extras (services.c)
 void vx_system_init(void);             // processor topology, thread pool, shell folders (system.c)
 void vx_security_init(void);           // SIDs, ACLs, security descriptors, SDDL, tokens, AccessCheck (security.c)

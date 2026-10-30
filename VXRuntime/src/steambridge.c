@@ -400,6 +400,37 @@ int vx_steambridge_enabled(void) {
     return on;
 }
 
+// "vxrt --vxrt-steam-check": whether a game started now would get Steam, asked of the same steamclient.dylib (and the
+// same slice) the bridge loads, the way steam_api does: a pipe to the running client, its signed-in user, and whether
+// that user is online (a game's sign-in through Steam needs Steam's servers: Elite's Frontier launcher shows "does not
+// own Elite Dangerous" without them, issue #10). Then both are let go. Nothing of Steam's files is read or written.
+// One word on stdout and the exit status: ready 0, unavailable 2 (no client library), not-running 3 (no pipe),
+// not-signed-in 4 (no user), offline 5 (a user, not connected to Steam).
+int vx_steam_check(void) {
+    if (!mac_lib()) { puts("unavailable"); return 2; }
+    typedef SYSV int (*pipe_fn)(void);
+    typedef SYSV int (*user_fn)(int);
+    typedef SYSV int (*logged_fn)(int, int);
+    typedef SYSV void (*release_user_fn)(int, int);
+    typedef SYSV int (*release_pipe_fn)(int);
+    pipe_fn create = (pipe_fn)dlsym(g_lib, "Steam_CreateSteamPipe");
+    user_fn connect = (user_fn)dlsym(g_lib, "Steam_ConnectToGlobalUser");
+    logged_fn logged = (logged_fn)dlsym(g_lib, "Steam_BLoggedOn");
+    release_user_fn release_user = (release_user_fn)dlsym(g_lib, "Steam_ReleaseUser");
+    release_pipe_fn release_pipe = (release_pipe_fn)dlsym(g_lib, "Steam_BReleaseSteamPipe");
+    if (!create || !connect || !logged || !release_user || !release_pipe) { puts("unavailable"); return 2; }
+    int pipe = create();
+    if (!pipe) { puts("not-running"); return 3; }
+    int user = connect(pipe), status = 0;
+    if (!user) { puts("not-signed-in"); status = 4; }
+    else if (!logged(user, pipe)) { puts("offline"); status = 5; }
+    else puts("ready");
+    if (user) release_user(pipe, user);
+    release_pipe(pipe);
+    fflush(stdout);
+    return status;
+}
+
 void vx_steambridge_init(void) {
     for (int i = 0; i < METHODS; i++) g_vtbl[i] = g_stubs[i];
     g_trace = getenv("VXRT_TRACE_STEAM") ? atoi(getenv("VXRT_TRACE_STEAM")) : 0;   // 2: every call

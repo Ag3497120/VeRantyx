@@ -35,7 +35,6 @@
  "A Vision Pro eye's pixels: 16–21 fps on an M1 Max.": "Die Pixel eines Vision Pro-Auges: 16–21 fps auf einem M1 Max.",
  "The game stopped by itself. If it keeps doing so, please report it (Help > Report a problem) with the logs.": "Das Spiel hat sich von selbst beendet. Wenn das wieder passiert, melde es bitte mit den Protokollen (Hilfe > Problem melden).",
  "Steam for Mac is not running: open Steam, sign in, and try again.": "Steam for Mac läuft nicht: Öffne Steam, melde dich an und versuche es erneut.",
- "The game could not reach Steam for Mac. Open Steam, let it finish updating, sign in, and try again.": "Das Spiel konnte Steam for Mac nicht erreichen. Öffne Steam, lass das Update fertig laufen, melde dich an und versuche es erneut.",
  "SteamVR is not installed yet (Get started).": "SteamVR ist noch nicht installiert („Erste Schritte“).",
  "The Windows runtime files are missing (Get started).": "Die Windows-Laufzeitdateien fehlen („Erste Schritte“).",
  "SteamVR or a game is already running. Stop it first (Help > Stop everything).": "SteamVR oder ein Spiel läuft bereits. Beende es zuerst (Hilfe > Alles stoppen).",
@@ -274,5 +273,13 @@
  "The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.": "Das Spiel wird noch geschlossen. Du kannst es im Headset beenden, weiter warten oder „Beenden erzwingen“ wählen.",
  "Waiting for the game to close normally…": "Warten, bis das Spiel regulär beendet wird…",
  "Force stop": "Beenden erzwingen",
- "Ends the game immediately. Unsaved progress may be lost.": "Beendet das Spiel sofort. Nicht gespeicherter Fortschritt kann verloren gehen."
+ "Ends the game immediately. Unsaved progress may be lost.": "Beendet das Spiel sofort. Nicht gespeicherter Fortschritt kann verloren gehen.",
+ "Checking Steam for Mac before starting %@…": "Steam für Mac wird geprüft, bevor %@ startet …",
+ "Steam for Mac is not running. Open it and sign in: %@ starts when it is ready.": "Steam für Mac läuft nicht. Öffne es und melde dich an: %@ startet, sobald es bereit ist.",
+ "Waiting for Steam to sign in… %@ starts when it has.": "Warten auf die Anmeldung bei Steam … %@ startet danach.",
+ "Waiting for Steam to go online… %@ signs in through Steam, which needs Steam's servers.": "Warten, bis Steam online ist … %@ meldet sich über Steam an und braucht dafür die Steam-Server.",
+ "Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.": "Steam für Mac war nicht erreichbar: Sein Client ließ sich nicht laden. Öffne Steam, lass es fertig aktualisieren, melde dich an und versuche es erneut.",
+ " The game's launcher may then say your account does not own the game: quit it and press Play again.": " Der Launcher des Spiels meldet dann womöglich, dass dein Konto das Spiel nicht besitzt: Beende ihn und drücke erneut auf Spielen.",
+ "Couldn't reach Steam for Mac: it was not running when the game started.": "Steam für Mac war nicht erreichbar: Es lief nicht, als das Spiel startete.",
+ "Steam for Mac was not signed in when the game started.": "Steam für Mac war beim Start des Spiels nicht angemeldet."
 }

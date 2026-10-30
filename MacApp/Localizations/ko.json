@@ -35,7 +35,6 @@
  "A Vision Pro eye's pixels: 16–21 fps on an M1 Max.": "Vision Pro 한쪽 눈의 픽셀 수: M1 Max에서 16–21 fps.",
  "The game stopped by itself. If it keeps doing so, please report it (Help > Report a problem) with the logs.": "게임이 스스로 종료되었습니다. 계속 그렇다면 로그와 함께 보고해 주십시오(도움말 > 문제 보고).",
  "Steam for Mac is not running: open Steam, sign in, and try again.": "Steam for Mac이 실행 중이 아닙니다. Steam을 열고 로그인한 후 다시 시도하십시오.",
- "The game could not reach Steam for Mac. Open Steam, let it finish updating, sign in, and try again.": "게임이 Steam for Mac에 연결하지 못했습니다. Steam을 열어 업데이트를 마치고 로그인한 후 다시 시도하십시오.",
  "SteamVR is not installed yet (Get started).": "SteamVR이 아직 설치되지 않았습니다(시작하기).",
  "The Windows runtime files are missing (Get started).": "Windows 런타임 파일이 없습니다(시작하기).",
  "SteamVR or a game is already running. Stop it first (Help > Stop everything).": "SteamVR 또는 게임이 이미 실행 중입니다. 먼저 중지하십시오(도움말 > 모두 중지).",
@@ -274,5 +273,13 @@
  "The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.": "게임이 아직 종료 중입니다. 헤드셋에서 종료하거나 계속 기다리거나 강제 종료를 선택할 수 있습니다.",
  "Waiting for the game to close normally…": "게임이 정상적으로 종료되기를 기다리는 중…",
  "Force stop": "강제 종료",
- "Ends the game immediately. Unsaved progress may be lost.": "게임을 즉시 종료합니다. 저장하지 않은 진행 상황이 손실될 수 있습니다."
+ "Ends the game immediately. Unsaved progress may be lost.": "게임을 즉시 종료합니다. 저장하지 않은 진행 상황이 손실될 수 있습니다.",
+ "Checking Steam for Mac before starting %@…": "%@을(를) 시작하기 전에 Mac용 Steam을 확인하는 중…",
+ "Steam for Mac is not running. Open it and sign in: %@ starts when it is ready.": "Mac용 Steam이 실행 중이 아닙니다. Steam을 열고 로그인하세요. 준비되면 %@이(가) 시작됩니다.",
+ "Waiting for Steam to sign in… %@ starts when it has.": "Steam 로그인을 기다리는 중… 로그인되면 %@이(가) 시작됩니다.",
+ "Waiting for Steam to go online… %@ signs in through Steam, which needs Steam's servers.": "Steam이 온라인이 되기를 기다리는 중… %@은(는) Steam을 통해 로그인하므로 Steam 서버 연결이 필요합니다.",
+ "Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.": "Mac용 Steam에 연결할 수 없습니다: 클라이언트를 불러오지 못했습니다. Steam을 열고 업데이트가 끝나면 로그인한 뒤 다시 시도하세요.",
+ " The game's launcher may then say your account does not own the game: quit it and press Play again.": " 그 때문에 게임 런처가 계정이 게임을 소유하지 않았다고 표시할 수 있습니다. 런처를 종료하고 다시 플레이를 누르세요.",
+ "Couldn't reach Steam for Mac: it was not running when the game started.": "Mac용 Steam에 연결할 수 없습니다: 게임이 시작될 때 Steam이 실행 중이 아니었습니다.",
+ "Steam for Mac was not signed in when the game started.": "게임이 시작될 때 Mac용 Steam에 로그인되어 있지 않았습니다."
 }

@@ -57,6 +57,51 @@ import Foundation
         guard model.isInstalled(game.id), !model.canStart(game, flat: false) else { throw NativeFailure("Windows readiness changed") }
         model.rosetta = true; model.steamVR = true; model.redistCount = 1
         guard model.canStart(game, flat: false), model.ready else { throw NativeFailure("Windows launch regression") }
+        // Issue #10: a start waits for Steam for Mac to be signed in (Steam.readiness), so Play can be pressed before it is.
+        model.steamRunning = false
+        guard model.waitsForSteam(game), !model.canStart(game, flat: false), model.canPress(game, flat: false) else { throw NativeFailure("Play must wait for Steam, not refuse") }
+        model.steamWait = AppModel.SteamWait(gameID: game.id, name: game.name, flat: false, state: .notSignedIn)
+        guard !model.canPress(game, flat: false), model.steamWaitText?.contains(game.name) == true else { throw NativeFailure("Steam wait not shown or second start allowed") }
+        for state: SteamReadiness? in [nil, .notRunning, .offline, .unavailable] {
+            model.steamWait?.state = state
+            guard model.steamWaitText?.isEmpty == false else { throw NativeFailure("Steam wait state without text") }
+        }
+        model.cancelSteamWait()
+        guard model.steamWait == nil, model.steamWaitText == nil, model.canPress(game, flat: false), model.play == nil else { throw NativeFailure("Steam wait cancel") }
+        // the wait itself: Steam signing in, then its client gone (an error, nothing started); and a cancel while waiting
+        var answers: [SteamReadiness] = [.notRunning, .notSignedIn, .notSignedIn, .unavailable]   // (offline would start this game: allowsStart below)
+        model.steamReadiness = { answers.isEmpty ? .unavailable : answers.removeFirst() }
+        model.steamPollNanoseconds = 20_000_000
+        model.error = nil
+        model.start(game, flat: false)
+        var seen: [SteamReadiness] = []
+        for _ in 0..<200 where model.steamWait != nil {
+            if let state = model.steamWait?.state, seen.last != state { seen.append(state) }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        guard model.steamWait == nil, model.play == nil, model.error == SteamWaitText.unavailable,
+              seen == [.notRunning, .notSignedIn] else { throw NativeFailure("Steam wait loop: \(seen) \(model.error ?? "-")") }
+        model.error = nil
+        model.steamReadiness = { .notSignedIn }
+        model.start(game, flat: false)
+        for _ in 0..<100 where model.steamWait?.state == nil { try? await Task.sleep(nanoseconds: 5_000_000) }
+        guard model.steamWait?.state == .notSignedIn else { throw NativeFailure("Steam wait did not report signing in") }
+        model.cancelSteamWait()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        guard model.steamWait == nil, model.play == nil, model.error == nil else { throw NativeFailure("Steam wait cancel started something") }
+        model.steamRunning = true
+        guard SteamReadiness(checkOutput: "[vxrt] Steam bridge: Mac Steam has no signed-in user\nnot-signed-in\n") == .notSignedIn,
+              SteamReadiness(checkOutput: "ready\n") == .ready, SteamReadiness(checkOutput: "offline") == .offline,
+              SteamReadiness(checkOutput: "not-running") == .notRunning, SteamReadiness(checkOutput: "[vxrt] cannot load\nunavailable") == .unavailable,
+              SteamReadiness(checkOutput: "") == .ready,
+              SteamReadiness.ready.allowsStart(needsOnline: true), SteamReadiness.offline.allowsStart(needsOnline: false),
+              !SteamReadiness.offline.allowsStart(needsOnline: true), !SteamReadiness.notSignedIn.allowsStart(needsOnline: false),
+              !SteamReadiness.notRunning.allowsStart(needsOnline: false) else { throw NativeFailure("Steam readiness parsing") }
+        guard let noUser = Play.steamBridgeHint("[vxrt] 03:16:09.674 Steam bridge: Mac Steam has no signed-in user (ConnectToGlobalUser failed)", launcher: true),
+              let noLib = Play.steamBridgeHint("[vxrt] Steam bridge: cannot load /x/steamclient.dylib, so the program runs without Steam", launcher: false),
+              Play.steamBridgeHint("[vxrt] Steam bridge: Mac Steam is not reachable (CreateSteamPipe failed)", launcher: false) != nil,
+              noUser.count > noLib.count / 2, Play.hint("[vxrt] Steam bridge: cannot load /x") != nil,
+              Play.steamBridgeHint("[vxrt] Steam bridge: loaded steamclient.dylib\n[vxrt] Steam bridge: interface SteamUser019", launcher: true) == nil else { throw NativeFailure("Steam bridge failure not surfaced") }
         model.installedBackends[alyx.id] = [.nativeARM64]
         guard !model.isInstalled(game.id) else { throw NativeFailure("Native install counted as Windows") }
         model.chooseBackend(.nativeARM64)

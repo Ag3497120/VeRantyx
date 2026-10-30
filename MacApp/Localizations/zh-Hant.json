@@ -35,7 +35,6 @@
  "A Vision Pro eye's pixels: 16–21 fps on an M1 Max.": "Vision Pro 單眼的像素數：M1 Max 上 16–21 fps。",
  "The game stopped by itself. If it keeps doing so, please report it (Help > Report a problem) with the logs.": "遊戲自行結束了。若一再發生，請附上記錄檔回報（說明 > 回報問題）。",
  "Steam for Mac is not running: open Steam, sign in, and try again.": "Steam for Mac 未執行：請打開 Steam 並登入，然後再試一次。",
- "The game could not reach Steam for Mac. Open Steam, let it finish updating, sign in, and try again.": "遊戲無法連線至 Steam for Mac。請打開 Steam，等待更新完成並登入，然後再試一次。",
  "SteamVR is not installed yet (Get started).": "尚未安裝 SteamVR（開始使用）。",
  "The Windows runtime files are missing (Get started).": "缺少 Windows 執行階段檔案（開始使用）。",
  "SteamVR or a game is already running. Stop it first (Help > Stop everything).": "SteamVR 或遊戲已在執行。請先停止（說明 > 全部停止）。",
@@ -274,5 +273,13 @@
  "The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.": "遊戲仍在結束中。你可以在頭戴裝置中結束遊戲、繼續等待，或選擇「強制停止」。",
  "Waiting for the game to close normally…": "正在等待遊戲正常結束…",
  "Force stop": "強制停止",
- "Ends the game immediately. Unsaved progress may be lost.": "立即停止遊戲。未儲存的進度可能會遺失。"
+ "Ends the game immediately. Unsaved progress may be lost.": "立即停止遊戲。未儲存的進度可能會遺失。",
+ "Checking Steam for Mac before starting %@…": "啟動 %@ 前正在檢查 Steam for Mac…",
+ "Steam for Mac is not running. Open it and sign in: %@ starts when it is ready.": "Steam for Mac 未執行。請打開並登入：準備就緒後 %@ 會啟動。",
+ "Waiting for Steam to sign in… %@ starts when it has.": "正在等待 Steam 登入… 登入後 %@ 會啟動。",
+ "Waiting for Steam to go online… %@ signs in through Steam, which needs Steam's servers.": "正在等待 Steam 連線… %@ 透過 Steam 登入，需要連線到 Steam 的伺服器。",
+ "Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.": "無法連線 Steam for Mac：無法載入其用戶端。請打開 Steam，等待更新完成並登入，然後再試一次。",
+ " The game's launcher may then say your account does not own the game: quit it and press Play again.": "因此遊戲的啟動器可能會顯示你的帳號未擁有該遊戲：請結束啟動器，再按一次「遊玩」。",
+ "Couldn't reach Steam for Mac: it was not running when the game started.": "無法連線 Steam for Mac：遊戲啟動時 Steam 未執行。",
+ "Steam for Mac was not signed in when the game started.": "遊戲啟動時 Steam for Mac 未登入。"
 }

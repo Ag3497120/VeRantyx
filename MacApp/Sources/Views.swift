@@ -506,6 +506,18 @@ struct PlayView: View {
                 Banner(icon: "terminal", text: T("A game or SteamVR started elsewhere (Terminal) is running.", "別の場所（ターミナル）で起動したゲームか SteamVR が動いています。"),
                        action: (T("Stop it", "停止する"), { Task { await Play.stopEverything() } }))
             }
+            if let text = model.steamWaitText {
+                // (a start waiting for Steam for Mac to be signed in: AppModel.start)
+                HStack(spacing: 12) {
+                    ProgressView().controlSize(.small)
+                    Text(text).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    if model.steamWait?.state == .notRunning { Button(T("Open Steam", "Steam を開く")) { Steam.open() } }
+                    Button(T("Cancel", "キャンセル")) { model.cancelSteamWait() }
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.12)))
+            }
             if let play = model.play { SessionCard(play: play) }
             if model.flow != nil { FlowCard() }
             if model.windowsSteamInstalled || model.games.contains(where: \.viaWindowsSteam) { WindowsSteamCard() }
@@ -601,14 +613,14 @@ struct GameCard: View {
                         Label(T("On this Mac", "Mac の画面で"), systemImage: "desktopcomputer").frame(maxWidth: .infinity)
                     }
                     .help(T("Plays in a window on this Mac, without a headset or SteamVR.", "ヘッドセットも SteamVR も使わず、この Mac のウィンドウで遊びます。"))
-                    .disabled(!model.canStart(game, flat: true))
+                    .disabled(!model.canPress(game, flat: true))
                     Button {
                         model.start(game)
                     } label: {
                         Label(T("Headset", "ヘッドセット"), systemImage: "visionpro").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!model.canStart(game, flat: false))
+                    .disabled(!model.canPress(game, flat: false))
                 }
             } else {
                 HStack {
@@ -620,10 +632,10 @@ struct GameCard: View {
                         Label(T("Play", "プレイ"), systemImage: "play.fill").frame(minWidth: 70)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!model.canStart(game, flat: false))
+                    .disabled(!model.canPress(game, flat: false))
                 }
             }
-            if model.isInstalled(game.id), !model.canStart(game, flat: false), !model.configurationLocked, let title = game.title {
+            if model.isInstalled(game.id), model.steamWait == nil, !model.canPress(game, flat: false), !model.configurationLocked, let title = game.title {
                 Button(T("Get started", "はじめに")) { model.showInstallation(title) }
                     .font(.caption)
             }

@@ -100,6 +100,8 @@ enum Quality: String, CaseIterable, Identifiable {
     /// The ALVR headset's reports while the game ran (one each 5 s), for the "it ran" report.
     @ObservationIgnored private(set) var headsetSamples: [HeadsetReport] = []
     @ObservationIgnored private var lastHeadsetLine = ""
+    /// The game log's start has been looked at for the Steam bridge's word on Mac Steam (steamBridgeHint).
+    @ObservationIgnored private var steamBridgeChecked = false
     @ObservationIgnored private let wired: Bool
     /// The picture setting this play started with (the game's way to the headset may take another than the Play page's).
     @ObservationIgnored let quality: Quality
@@ -326,6 +328,12 @@ enum Quality: String, CaseIterable, Identifiable {
 
     private func pollStatus() {
         if backend == .nativeARM64 { pollNative(); return }
+        // (whether the game got Steam for Mac: the bridge says so in the game log's first lines, and the game itself
+        //  may not: Elite's launcher shows "does not own Elite Dangerous" instead, issue #10. Looked at for a minute.)
+        if !steamBridgeChecked && !viaWindowsSteam && fresh(gameLog) {
+            if let hint = Play.steamBridgeHint(Play.head(gameLog, 1 << 18), launcher: usesLauncher) { problem = hint; steamBridgeChecked = true }
+            else if Date().timeIntervalSince(startedAt) > 60 { steamBridgeChecked = true }
+        }
         if phase == .starting && !flat && listening(27062) { phase = .steamVR }
         let game = fresh(gameLog) ? gameText(8000) : ""
         gameLines = Array(game.split(separator: "\n", omittingEmptySubsequences: true).suffix(14).map(String.init))
@@ -514,14 +522,37 @@ enum Quality: String, CaseIterable, Identifiable {
         return String(decoding: (try? h.readToEnd()) ?? Data(), as: UTF8.self)
     }
 
+    /// A log's first bytes.
+    nonisolated static func head(_ url: URL, _ bytes: Int) -> String {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? h.close() }
+        return String(decoding: (try? h.read(upToCount: bytes)) ?? Data(), as: UTF8.self)
+    }
+
+    /// What VXRuntime's Steam bridge says of Steam for Mac in a game log (src/steambridge.c), for the player: the game
+    /// runs without Steam, and a launcher that signs in through Steam shows an error of its own instead.
+    nonisolated static func steamBridgeHint(_ log: String, launcher: Bool) -> String? {
+        let after = launcher ? T(" The game's launcher may then say your account does not own the game: quit it and press Play again.",
+                                 "そのためゲームのランチャーが「このアカウントはゲームを所有していない」と表示することがあります。ランチャーを終了して、もう一度プレイを押してください。") : ""
+        if log.contains("Steam bridge: cannot load") {
+            return T("Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.",
+                     "Steam for Mac に接続できませんでした（Steam のクライアントを読み込めません）。Steam を開いて更新を終え、サインインしてから、もう一度。") + after
+        }
+        if log.contains("Steam bridge: Mac Steam is not reachable") {
+            return T("Couldn't reach Steam for Mac: it was not running when the game started.", "Steam for Mac に接続できませんでした。ゲームの起動時に Steam が動いていませんでした。") + after
+        }
+        if log.contains("Steam bridge: Mac Steam has no signed-in user") {
+            return T("Steam for Mac was not signed in when the game started.", "ゲームの起動時、Steam for Mac はサインインしていませんでした。") + after
+        }
+        return nil
+    }
+
     /// What a log says went wrong, in words a player can act on (nil: nothing known).
     nonisolated static func hint(_ log: String) -> String? {
         if log.contains("Start Steam on the Mac and sign in first") || log.contains("Mac Steam is not running") {
             return T("Steam for Mac is not running: open Steam, sign in, and try again.", "Steam for Mac が起動していません。Steam を開いてサインインしてから、もう一度。")
         }
-        if log.contains("Steam bridge: cannot load") {
-            return T("The game could not reach Steam for Mac. Open Steam, let it finish updating, sign in, and try again.", "ゲームが Steam for Mac に接続できませんでした。Steam を開いて更新を終え、サインインしてから、もう一度。")
-        }
+        if let steam = steamBridgeHint(log, launcher: false) { return steam }
         if log.contains("Windows Steam is not running") {
             return T("Windows Steam is not running: open it (Play page), sign in in its window yourself, and try again.",
                      "Windows 版 Steam が起動していません。開いて（プレイのページ）、そのウィンドウでご自身でサインインしてから、もう一度。")

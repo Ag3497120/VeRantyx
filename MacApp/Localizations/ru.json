@@ -35,7 +35,6 @@
  "A Vision Pro eye's pixels: 16–21 fps on an M1 Max.": "Пиксели одного глаза Vision Pro: 16–21 fps на M1 Max.",
  "The game stopped by itself. If it keeps doing so, please report it (Help > Report a problem) with the logs.": "Игра остановилась сама. Если это повторяется, сообщите об этом с журналами («Справка» > «Сообщить о проблеме»).",
  "Steam for Mac is not running: open Steam, sign in, and try again.": "Steam for Mac не запущен: откройте Steam, войдите и повторите попытку.",
- "The game could not reach Steam for Mac. Open Steam, let it finish updating, sign in, and try again.": "Игре не удалось связаться со Steam for Mac. Откройте Steam, дождитесь окончания обновления, войдите и повторите попытку.",
  "SteamVR is not installed yet (Get started).": "SteamVR ещё не установлен («Начало работы»).",
  "The Windows runtime files are missing (Get started).": "Нет файлов среды выполнения Windows («Начало работы»).",
  "SteamVR or a game is already running. Stop it first (Help > Stop everything).": "SteamVR или игра уже запущены. Сначала остановите их («Справка» > «Остановить всё»).",
@@ -274,5 +273,13 @@
  "The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.": "Игра ещё закрывается. Можно выйти из неё в гарнитуре, продолжить ждать или выбрать «Завершить принудительно».",
  "Waiting for the game to close normally…": "Ждём штатного выхода из игры…",
  "Force stop": "Завершить принудительно",
- "Ends the game immediately. Unsaved progress may be lost.": "Немедленно завершает игру. Несохранённый прогресс может быть потерян."
+ "Ends the game immediately. Unsaved progress may be lost.": "Немедленно завершает игру. Несохранённый прогресс может быть потерян.",
+ "Checking Steam for Mac before starting %@…": "Проверка Steam для Mac перед запуском %@…",
+ "Steam for Mac is not running. Open it and sign in: %@ starts when it is ready.": "Steam для Mac не запущен. Откройте его и войдите в аккаунт: %@ запустится, когда он будет готов.",
+ "Waiting for Steam to sign in… %@ starts when it has.": "Ожидание входа в Steam… затем %@ запустится.",
+ "Waiting for Steam to go online… %@ signs in through Steam, which needs Steam's servers.": "Ожидание подключения Steam к сети… %@ входит через Steam, которому нужны серверы Steam.",
+ "Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.": "Не удалось связаться со Steam для Mac: не удалось загрузить его клиент. Откройте Steam, дождитесь окончания обновления, войдите в аккаунт и попробуйте снова.",
+ " The game's launcher may then say your account does not own the game: quit it and press Play again.": " Поэтому лаунчер игры может сообщить, что ваш аккаунт не владеет игрой: закройте его и снова нажмите «Играть».",
+ "Couldn't reach Steam for Mac: it was not running when the game started.": "Не удалось связаться со Steam для Mac: он не был запущен, когда стартовала игра.",
+ "Steam for Mac was not signed in when the game started.": "Steam для Mac не был авторизован, когда стартовала игра."
 }
