@@ -129,8 +129,7 @@ static size_t query(const void *addr, MEMORY_BASIC_INFORMATION *mbi) {
     size_t (WINAPI *q)(const void *, MEMORY_BASIC_INFORMATION *, size_t) = (size_t (WINAPI *)(const void *, MEMORY_BASIC_INFORMATION *, size_t))vx_find_export("kernel32.dll", "VirtualQuery");
     return q(addr, mbi, sizeof *mbi);
 }
-// The pages stay committed; their contents may go. Only read-write pages can be discarded (as on Windows); the x86
-// build lets macOS take the pages back. (The ARM64 build leaves them: the vCPU maps that memory, src/vm_hooks.c.)
+// The pages stay committed; their contents may go. Only read-write pages can be discarded (as on Windows).
 // Only private memory: a view of a file mapping (a file's pages, or memory another process shares) and an image are
 // refused, as VirtualAlloc's MEM_RESET refuses a range mapped to a file, and left as they are (a failed discard alters
 // nothing, documented). Windows documents no particular code for this: ERROR_INVALID_PARAMETER, as for the protection.
@@ -147,10 +146,9 @@ static WINAPI DWORD DiscardVirtualMemory(void *addr, size_t size) {
         a = (a & ~(uintptr_t)0xfff) + mbi.region;     // (the region's size counts from a's page)
     }
     if (vx_in_mapped_view((uintptr_t)addr, (uintptr_t)addr + size)) return 87;
-#ifndef __aarch64__
-    uintptr_t page = (uintptr_t)getpagesize(), from = ((uintptr_t)addr + page - 1) & ~(page - 1), to = ((uintptr_t)addr + size) & ~(page - 1);
-    if (to > from) madvise((void *)from, to - from, MADV_FREE);
-#endif
+    // (the contents go as VirtualAlloc's MEM_RESET lets them: fresh zero pages, out of the footprint; kernel32.c)
+    void *(WINAPI *valloc)(void *, size_t, DWORD, DWORD) = (void *(WINAPI *)(void *, size_t, DWORD, DWORD))vx_find_export("kernel32.dll", "VirtualAlloc");
+    if (valloc) valloc(addr, size, 0x80000 /* MEM_RESET */, 0x04);
     return 0;
 }
 typedef struct { uint64_t address; size_t bytes; } MEMORY_RANGE_ENTRY;

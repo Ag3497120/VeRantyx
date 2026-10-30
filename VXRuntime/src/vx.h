@@ -131,6 +131,7 @@ extern int vx_heap_stats;
 void vx_heap_note(const void *p, int sign);
 #define VX_HEAP_NOTE(p, sign) do { if (__builtin_expect(vx_heap_stats, 0) && (p)) vx_heap_note((p), (sign)); } while (0)
 int vx_heap_report(char *buf, size_t size);   // "<class> <MB> (<blocks>)..." of the counted blocks; 0 when off
+int vx_vm_report(char *buf, size_t size);     // where the untagged anonymous memory is (kernel32.c), for the memory report
 #ifdef __aarch64__
 // The program's memory below 4 GB (vCPU only: the host cannot map there): the host has it at vx_low_base + its
 // address, and vx_low_map marks the 64 KB granules handed out (vx_virtual_alloc_below), so that only a pointer into

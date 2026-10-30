@@ -75,6 +75,21 @@ static void test_memory(void) {
     CHECK(DiscardVirtualMemory(ro, 4096) != ERROR_SUCCESS);                       // only read-write pages
     p[0] = 1; p[65535] = 2;
     CHECK(p[0] == 1 && p[65535] == 2);                                            // still committed
+    // MEM_RESET: the contents are no longer of interest, the range stays committed and usable; MEM_RESET_UNDO may
+    // fail (some data replaced by zeros). (Under 1 MB: a released block that large is kept, at gone's address too.)
+    BYTE *rs = VirtualAlloc(NULL, 1 << 19, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(rs != NULL);
+    if (rs) {
+        memset(rs, 0x77, 1 << 19);
+        CHECK(VirtualAlloc(rs, 1 << 19, 0x80000 /* MEM_RESET */, PAGE_READWRITE) == rs);
+        rs[0] = 3; rs[(1 << 19) - 1] = 4; rs[12345] = 5;
+        CHECK(rs[0] == 3 && rs[(1 << 19) - 1] == 4 && rs[12345] == 5);
+        BYTE *undo = VirtualAlloc(rs, 1 << 19, 0x1000000 /* MEM_RESET_UNDO */, PAGE_READWRITE);
+        CHECK(undo == NULL || undo == rs);
+        CHECK(VirtualAlloc(rs + 4096, 8192, 0x80000, PAGE_READWRITE) == rs + 4096);   // (inside a page of the host's)
+        CHECK(rs[0] == 3);                                                           // (only whole host pages go)
+        CHECK(VirtualFree(rs, 0, MEM_RELEASE));
+    }
     // Views of file mappings are not private memory: refused, and their contents stay (another process may share
     // them; a file's pages are the file's)
     HANDLE shared = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 65536, NULL);

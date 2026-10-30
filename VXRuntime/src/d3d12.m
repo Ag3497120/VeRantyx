@@ -2103,6 +2103,14 @@ static int tex_sub12(const res12 *r, uint32_t sub, uint32_t *metal) {
     return 1;
 }
 
+// A new committed Metal buffer reads as zeros (fresh pages from the kernel, made when first touched: measured for
+// 20000 buffers of 16 bytes to 128 KB and larger ones); zeroing it on the CPU made every page of it count in the
+// footprint at once, also the parts the program never uses. VXRT_D3D12_ZERO_BUFFERS=1 zeroes them still.
+static int zero_new_buffers12(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_D3D12_ZERO_BUFFERS") && atoi(getenv("VXRT_D3D12_ZERO_BUFFERS")) != 0;
+    return on;
+}
 // A committed resource (heap nil) or one placed in a heap at an offset.
 static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t initial_state,
                                const void *clear, memheap12 *in, uint64_t offset, int reserved, const GUID *iid, void **out) {
@@ -2153,8 +2161,8 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
         }
         if (r->buffer.contents) {                                  // (reserved buffers are GPU-only)
             vx_guest_forget(r->buffer.contents, r->buffer.length);
-            if (!in && hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);
-        }   // (default and readback heaps start zeroed)
+            if (!in && hp->Type != 2 && zero_new_buffers12()) memset(r->buffer.contents, 0, r->buffer.length);
+        }   // (default and readback heaps start zeroed: a new Metal buffer is, its pages coming when touched)
     } else {
         uint32_t logical_mips = 0;
         int drop = tex_drop_levels12(hp, desc, in, reserved, &logical_mips);
@@ -6563,17 +6571,60 @@ static uint64_t graphics_desc_hash12(const GFX_PSO_DESC *d) {
     return fnv1a12(h, &d->flags, sizeof d->flags);
 }
 
+static uint64_t g_gfx_psos12, g_cs_psos12;                 // (pipelines made, all time: the memory report)
+static uint64_t g_resident_calls12[2], g_resident_objects12[2];   // (Evict, MakeResident: for the memory report)
+// VXRT_D3D12_EVICT_VOLATILE=1: what the program evicts, when it is CPU-visible memory (a committed resource or a heap
+// in shared storage), becomes purgeable (volatile) until it is made resident again: out of the footprint (measured:
+// a written 512 MB shared buffer, 516 -> 4 MB), contents kept unless the system runs short and takes them (then they
+// are lost, counted, where Windows would have paged them out). Private storage counts either way (measured), so it is
+// left as it is.
+static uint64_t g_volatile_bytes12, g_volatile_lost12;
+static id<MTLResource> evict_target12(void *object, int *is_heap, id<MTLHeap> *heap) {
+    d3d_object *base = object;
+    *is_heap = 0; *heap = nil;
+    if (base->kind == K12_MEMHEAP) {
+        id<MTLHeap> h = ((memheap12 *)base)->heap;
+        if (h.storageMode == MTLStorageModeShared) { *is_heap = 1; *heap = h; }
+        return nil;
+    }
+    if (base->kind != K12_RESOURCE) return nil;
+    res12 *r = (res12 *)base;
+    if (r->owner_heap || r->reserved) return nil;
+    id<MTLResource> m = r->buffer ? (id<MTLResource>)r->buffer : (id<MTLResource>)r->texture;
+    return m.storageMode == MTLStorageModeShared ? m : nil;
+}
+static void evict_volatile12(void *object, int make_resident) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_D3D12_EVICT_VOLATILE") && atoi(getenv("VXRT_D3D12_EVICT_VOLATILE")) != 0;
+    if (!on) return;
+    int is_heap; id<MTLHeap> heap;
+    id<MTLResource> m = evict_target12(object, &is_heap, &heap);
+    if (!m && !is_heap) return;
+    MTLPurgeableState was = is_heap ? [heap setPurgeableState:make_resident ? MTLPurgeableStateNonVolatile : MTLPurgeableStateVolatile]
+                                    : [m setPurgeableState:make_resident ? MTLPurgeableStateNonVolatile : MTLPurgeableStateVolatile];
+    uint64_t size = is_heap ? heap.size : m.allocatedSize;
+    if (make_resident) {
+        __atomic_sub_fetch(&g_volatile_bytes12, size, __ATOMIC_RELAXED);
+        if (was == MTLPurgeableStateEmpty) {
+            uint64_t n = __atomic_add_fetch(&g_volatile_lost12, 1, __ATOMIC_RELAXED);
+            if (n <= 20) vx_log("D3D12: an evicted %s of %llu KB was taken by the system while evicted: its contents are lost",
+                                is_heap ? "heap" : "resource", (unsigned long long)(size >> 10));
+        }
+    } else __atomic_add_fetch(&g_volatile_bytes12, size, __ATOMIC_RELAXED);
+}
 // (CachedPSO in a description is accepted and not needed: the pipeline is made from the description.)
 static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
     if (!desc) return E_INVALIDARG;
     HRESULT hr = create_compute_pso12(this, desc, iid, out);
     if (hr >= 0 && out && *out) ((pso12 *)*out)->desc_hash = compute_desc_hash12(desc);
+    if (hr >= 0) __atomic_add_fetch(&g_cs_psos12, 1, __ATOMIC_RELAXED);
     return hr;
 }
 static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
     if (!desc) return E_INVALIDARG;
     HRESULT hr = create_graphics_pso12(this, desc, iid, out);
     if (hr >= 0 && out && *out) ((pso12 *)*out)->desc_hash = graphics_desc_hash12(desc);
+    if (hr >= 0) __atomic_add_fetch(&g_gfx_psos12, 1, __ATOMIC_RELAXED);
     return hr;
 }
 
@@ -14022,6 +14073,24 @@ static void mem_report12(dev12 *d) {
            __atomic_load_n(&g_replay_copy_peak12, __ATOMIC_RELAXED) / 1048576.0,
            __atomic_load_n(&gpu_ir_stream_bytes, __ATOMIC_RELAXED) / 1048576.0, gpu_ir_command_size());
     if (vx_heap_report(heap, sizeof heap)) vx_log("D3D12: memory: the game's heap blocks (HeapAlloc, malloc, new): %s", heap);
+    char vm_text[900];
+    extern uint64_t vx_mem_reset_calls, vx_mem_reset_bytes;
+    if (vx_vm_report(vm_text, sizeof vm_text)) vx_log("D3D12: memory: %s; MEM_RESET and DiscardVirtualMemory %llu calls, %.0f MB given back",
+        vm_text, (unsigned long long)vx_mem_reset_calls, vx_mem_reset_bytes / 1048576.0);
+    {   // (residency: what the program evicted, as it has it now; Metal keeps everything resident)
+        uint64_t evicted = 0, nev = 0;
+        pthread_rwlock_rdlock(&d->bufs_lock);
+        for (uint32_t i = 0; i < d->nbufs; i++) {
+            res12 *b = d->bufs[i];
+            if (!b->owner_heap && !b->reserved && !b->residency_refs) { evicted += b->buffer.allocatedSize; nev++; }
+        }
+        pthread_rwlock_unlock(&d->bufs_lock);
+        vx_log("D3D12: memory: residency: Evict %llu calls (%llu objects), MakeResident %llu calls (%llu objects); committed buffers "
+               "evicted now %.0f MB (%llu); purgeable while evicted %.0f MB (%llu taken); graphics pipelines made %llu, compute %llu", (unsigned long long)g_resident_calls12[0],
+               (unsigned long long)g_resident_objects12[0], (unsigned long long)g_resident_calls12[1], (unsigned long long)g_resident_objects12[1],
+               evicted / 1048576.0, (unsigned long long)nev, g_volatile_bytes12 / 1048576.0, (unsigned long long)g_volatile_lost12,
+               (unsigned long long)g_gfx_psos12, (unsigned long long)g_cs_psos12);
+    }
 }
 // VXRT_MEM_LIMITS=<MB>[,<MB>...]: a device's footprint limit (jetsam's), watched from the presents. When the
 // footprint (or its peak, which counts the spikes between presents) first goes over one, the present, the time since
@@ -14252,6 +14321,8 @@ static uint32_t *residency_priority12(dev12 *device, void *object) {
 
 static WINAPI HRESULT dev_update_residency(void *this, uint32_t count, void *const *objects, int make_resident) {
     dev12 *device = this;
+    __atomic_add_fetch(&g_resident_calls12[make_resident != 0], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_resident_objects12[make_resident != 0], count, __ATOMIC_RELAXED);
     if (count && !objects) return E_INVALIDARG;
     pthread_mutex_lock(&device->lock);
     HRESULT result = S_OK;
@@ -14272,8 +14343,8 @@ static WINAPI HRESULT dev_update_residency(void *this, uint32_t count, void *con
     if (result >= 0) {
         for (uint32_t i = 0; i < count; i++) {
             uint32_t *refs = residency_counter12(device, objects[i]);
-            if (make_resident) __atomic_add_fetch(refs, 1, __ATOMIC_RELAXED);
-            else __atomic_sub_fetch(refs, 1, __ATOMIC_RELAXED);
+            uint32_t now = make_resident ? __atomic_add_fetch(refs, 1, __ATOMIC_RELAXED) : __atomic_sub_fetch(refs, 1, __ATOMIC_RELAXED);
+            if (now == (make_resident ? 1u : 0u)) evict_volatile12(objects[i], make_resident);
         }
     }
     pthread_mutex_unlock(&device->lock);

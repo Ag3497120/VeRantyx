@@ -736,11 +736,13 @@ void vx_code_freed(void *addr, size_t len);            // (its translations go: 
 #define MEM_DECOMMIT 0x4000
 #define MEM_RELEASE  0x8000
 #define MEM_FREE     0x10000
+#define MEM_RESET    0x80000
+#define MEM_RESET_UNDO 0x1000000
 #define MEM_PRIVATE  0x20000
 #define MEM_IMAGE    0x1000000
 #define GRANULARITY  0x10000
 
-typedef struct { uintptr_t base; size_t size; DWORD protect; } reservation;
+typedef struct { uintptr_t base; size_t size; DWORD protect, type; } reservation;   // (type: VirtualAlloc's, as reserved)
 // A reservation maps whole 64 KB units, as Windows uses them up: with only its pages mapped, every small one leaves
 // a gap no aligned reservation fits in, and the kernel's search for room walks all of those (2 ms per call with
 // Half-Life: Alyx's 60000 small blocks).
@@ -755,12 +757,12 @@ static reservation *find_reservation(uintptr_t addr) {      // with g_vm_lock he
     while (lo < hi) { int mid = (lo + hi) / 2; if (g_res[mid].base + g_res[mid].size <= addr) lo = mid + 1; else hi = mid; }
     return lo < g_res_count && g_res[lo].base <= addr ? &g_res[lo] : NULL;
 }
-static void res_insert(uintptr_t base, size_t size, DWORD protect) {
+static void res_insert(uintptr_t base, size_t size, DWORD protect, DWORD type) {
     if (g_res_count == g_res_cap) { g_res_cap = g_res_cap ? g_res_cap * 2 : 256; g_res = realloc(g_res, g_res_cap * sizeof *g_res); }
     int lo = 0, hi = g_res_count;
     while (lo < hi) { int mid = (lo + hi) / 2; if (g_res[mid].base < base) lo = mid + 1; else hi = mid; }
     memmove(g_res + lo + 1, g_res + lo, (size_t)(g_res_count - lo) * sizeof *g_res);
-    g_res[lo] = (reservation){ base, size, protect };
+    g_res[lo] = (reservation){ base, size, protect, type };
     g_res_count++;
 }
 static void res_remove(reservation *r) {
@@ -823,6 +825,11 @@ static void prot_set(uintptr_t start, uintptr_t end, DWORD protect) {   // prote
     memcpy(g_prot + i, add, n * sizeof *add);
     g_nprot = g_nprot - (j - i) + n;
 }
+static size_t prot_first(uintptr_t a) {                    // the first range ending after a
+    size_t lo = 0, hi = g_nprot;
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_prot[mid].end <= a) lo = mid + 1; else hi = mid; }
+    return lo;
+}
 static DWORD prot_get(uintptr_t a) {
     size_t lo = 0, hi = g_nprot;
     while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_prot[mid].end <= a) lo = mid + 1; else hi = mid; }
@@ -842,10 +849,33 @@ static DWORD image_protect(const vx_image *m, uintptr_t a) {
     }
     return 0x02;
 }
+// MEM_RESET: the contents of the range are no longer of interest (they may stay, or not, Windows says): its whole host
+// pages become fresh zero pages, out of the footprint until written again. MEM_RESET_UNDO then fails as Windows' does
+// when the memory was taken: some of the data was replaced by zeros. (Counted for the memory report.)
+uint64_t vx_mem_reset_calls, vx_mem_reset_bytes;
+static void *reset_pages(void *addr, size_t size, DWORD type) {     // with g_vm_lock held
+    if (type & MEM_RESET_UNDO) { vx_set_last_error(87); return NULL; }
+    uintptr_t page = vm_page_size, from = ((uintptr_t)addr + page - 1) & ~(page - 1), to = ((uintptr_t)addr + size) & ~(page - 1);
+    __atomic_add_fetch(&vx_mem_reset_calls, 1, __ATOMIC_RELAXED);
+    if (to > from) {
+        VX_CODE_FREED((void *)from, to - from);
+        mach_vm_address_t a = from;
+        if (mach_vm_allocate(mach_task_self(), &a, to - from, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS) {
+            mach_vm_protect(mach_task_self(), a, to - from, 0, VX_PROT_RWX);
+            __atomic_add_fetch(&vx_mem_reset_bytes, to - from, __ATOMIC_RELAXED);
+        }
+    }
+    return addr;
+}
 static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD protect) {
     if (!size) { vx_set_last_error(87); return NULL; }
     VX_NO_STOP_LOCK(&g_vm_lock);
     reservation *r = addr ? find_reservation((uintptr_t)addr) : NULL;
+    if (r && (type & (MEM_RESET | MEM_RESET_UNDO)) && !(type & (MEM_RESERVE | MEM_COMMIT))) {
+        void *p = reset_pages(addr, size, type);
+        VX_NO_STOP_UNLOCK(&g_vm_lock);
+        return p;
+    }
     if (r && !(type & MEM_RESERVE)) {                       // committing inside an existing reservation
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
         prot_set(start, ((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff, protect);
@@ -864,7 +894,7 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         g_spare[i] = g_spare[--g_nspare];
         if (mach_vm_allocate(mach_task_self(), &got, mapped_size(len), VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) break;
         mach_vm_protect(mach_task_self(), got, mapped_size(len), 0, VX_PROT_RWX);
-        res_insert((uintptr_t)got, (size_t)len, protect);
+        res_insert((uintptr_t)got, (size_t)len, protect, type);
         valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
         VX_NO_STOP_UNLOCK(&g_vm_lock);
         return (void *)got;
@@ -889,7 +919,7 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         return NULL;
     }
     mach_vm_protect(mach_task_self(), a, mapped_size(len), 0, VX_PROT_RWX);
-    res_insert((uintptr_t)a, (size_t)len, protect);
+    res_insert((uintptr_t)a, (size_t)len, protect, type);
     g_va_kind[2]++;
     static uint64_t made;
     uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
@@ -919,7 +949,7 @@ static void *low_alloc(size_t size, uintptr_t limit, DWORD protect) {
             if (mach_vm_allocate(mach_task_self(), &host, n * GRANULARITY, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) break;
             mach_vm_protect(mach_task_self(), host, n * GRANULARITY, 0, VX_PROT_RWX);
             memset(vx_low_map + a / GRANULARITY, 1, n);
-            res_insert((uintptr_t)host, n * GRANULARITY, protect);
+            res_insert((uintptr_t)host, n * GRANULARITY, protect, MEM_RESERVE | MEM_COMMIT);
             cursor = a + n * GRANULARITY;
             VX_NO_STOP_UNLOCK(&g_vm_lock);
             return (void *)(uintptr_t)host;
@@ -949,7 +979,7 @@ void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
                 mach_vm_address_t got = a;
                 if (mach_vm_allocate(mach_task_self(), &got, len, VM_FLAGS_FIXED) == KERN_SUCCESS) {
                     mach_vm_protect(mach_task_self(), got, len, 0, VX_PROT_RWX);
-                    res_insert((uintptr_t)got, (size_t)len, protect);
+                    res_insert((uintptr_t)got, (size_t)len, protect, MEM_RESERVE | MEM_COMMIT);
                     cursor = (uintptr_t)(got + len);
                     VX_NO_STOP_UNLOCK(&g_vm_lock);
                     return (void *)got;
@@ -998,6 +1028,72 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
     VX_NO_STOP_UNLOCK(&g_vm_lock);
     if (!ok) vx_set_last_error(487);
     return ok;
+}
+// VXRT_MEM_LIMITS' memory report (d3d12.m): where the untagged anonymous memory (footprint's "VM_ALLOCATE") is. The
+// program's reservations (reserved, committed as VirtualAlloc was told, dirty and compressed as the kernel has it, the
+// largest by dirty), the kept released blocks, the program's small heap blocks (the ARM64 runtime's range), and the rest
+// (this runtime's own: stacks, TEBs, tables). Committed memory never written is not in the footprint (pages come when
+// touched), so committed minus dirty is what the program committed and left untouched.
+static void vm_dirty(uintptr_t start, uintptr_t end, uint64_t *dirty, uint64_t *swapped, int untagged_only) {
+    for (mach_vm_address_t a = start; a < end;) {
+        mach_vm_address_t at = a; mach_vm_size_t sz = 0;
+        vm_region_extended_info_data_t info; mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT; mach_port_t obj;
+        if (mach_vm_region(mach_task_self(), &at, &sz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS || at >= end) return;
+        if (!untagged_only || info.user_tag == 0) {
+            // (a region partly inside counts in proportion)
+            uint64_t lo = at < start ? start : at, hi = at + sz > end ? end : at + sz, page = vm_kernel_page_size;
+            double part = sz ? (double)(hi - lo) / (double)sz : 0;
+            if (info.share_mode != SM_EMPTY) {
+                *dirty += (uint64_t)(info.pages_dirtied * page * part);
+                *swapped += (uint64_t)(info.pages_swapped_out * page * part);
+            }
+        }
+        a = at + sz;
+    }
+}
+int vx_vm_report(char *buf, size_t size) {
+    uint64_t reserved = 0, committed = 0, dirty = 0, swapped = 0, spare_dirty = 0, spare_sw = 0, heap_dirty = 0, heap_sw = 0;
+    uint64_t all_dirty = 0, all_sw = 0;
+    struct { uintptr_t base; size_t size; uint64_t dirty, committed; } top[6] = { { 0 } };
+    VX_NO_STOP_LOCK(&g_vm_lock);
+    int nres = g_res_count;
+    for (int i = 0; i < g_res_count; i++) {
+        reservation *r = &g_res[i];
+        reserved += r->size;
+        uint64_t c = 0;
+        if (r->type & MEM_COMMIT) c = r->size;                 // (committed as reserved; else the commits made since)
+        else for (size_t k = prot_first(r->base); k < g_nprot && g_prot[k].start < r->base + r->size; k++) {
+            uintptr_t lo = g_prot[k].start > r->base ? g_prot[k].start : r->base, hi = g_prot[k].end < r->base + r->size ? g_prot[k].end : r->base + r->size;
+            if (hi > lo) c += hi - lo;
+        }
+        committed += c;
+        uint64_t d = 0, s = 0;
+        vm_dirty(r->base, r->base + mapped_size(r->size), &d, &s, 0);
+        dirty += d; swapped += s;
+        for (int t = 0; t < 6; t++) if (d + s > top[t].dirty) {
+            memmove(top + t + 1, top + t, (5 - t) * sizeof *top);
+            top[t].base = r->base; top[t].size = r->size; top[t].dirty = d + s; top[t].committed = c;
+            break;
+        }
+    }
+    for (int i = 0; i < g_nspare; i++) vm_dirty(g_spare[i].base, g_spare[i].base + g_spare[i].size, &spare_dirty, &spare_sw, 0);
+    VX_NO_STOP_UNLOCK(&g_vm_lock);
+    typedef struct { uint64_t head[24]; uint64_t cursor, limit, base; } xh_range;
+    xh_range *(*heap)(void) = (xh_range *(*)(void))dlsym(RTLD_DEFAULT, "vxvm_heap");
+    xh_range *h = heap ? heap() : NULL;
+    if (h) vm_dirty(h->base, h->cursor, &heap_dirty, &heap_sw, 0);
+    vm_dirty(0, (uintptr_t)1 << 47, &all_dirty, &all_sw, 1);
+    size_t o = (size_t)snprintf(buf, size, "untagged anonymous %.0f MB dirty + %.0f MB compressed; the program's %d reservations "
+        "%.0f MB reserved, %.0f MB committed, %.0f MB dirty + %.0f MB compressed (committed and never written: %.0f MB); kept released "
+        "blocks %.0f MB; small heap blocks %.0f MB carved, %.0f MB dirty; the rest (ours) %.0f MB; largest by dirty:",
+        all_dirty / 1048576.0, all_sw / 1048576.0, nres, reserved / 1048576.0, committed / 1048576.0, dirty / 1048576.0,
+        swapped / 1048576.0, committed > dirty + swapped ? (committed - dirty - swapped) / 1048576.0 : 0.0,
+        (spare_dirty + spare_sw) / 1048576.0, h ? (h->cursor - h->base) / 1048576.0 : 0.0, (heap_dirty + heap_sw) / 1048576.0,
+        ((double)all_dirty + all_sw - dirty - swapped - spare_dirty - spare_sw - heap_dirty - heap_sw) / 1048576.0);
+    for (int t = 0; t < 6 && top[t].size && o < size; t++)
+        o += (size_t)snprintf(buf + o, size - o, " %#llx %.0f MB (committed %.0f, dirty %.0f)", (unsigned long long)top[t].base,
+                              top[t].size / 1048576.0, top[t].committed / 1048576.0, top[t].dirty / 1048576.0);
+    return 1;
 }
 // Memory that is neither the program's (a reservation, a PE image) nor writable at all: macOS code, this runtime's own
 // functions (GetProcAddress of a built-in DLL gives their addresses). Hooking libraries (the Steam overlay's) make a
