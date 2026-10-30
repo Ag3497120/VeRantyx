@@ -8,6 +8,7 @@
 // ...); otherwise to a PE file, searched in the program's directory, C:\windows\system32 and the current
 // directory. Real DLLs (a game's steam_api64.dll, openvr_api.dll, msvcp140.dll) therefore load as they are.
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -566,6 +567,57 @@ static int search_dll(const char *name, char *out, size_t cap) {
 static vx_image *load_pe(const char *path, int is_main);
 static int init_dll(vx_image *m);
 
+// VXRT_IMAGE_CACHE=<dir>: a loaded image's pages come from a file there, so the ones the program only reads are clean
+// and file-backed (out of the footprint: a device's memory limit counts dirty and compressed memory, not those), as
+// Windows maps an image from its file. Copied and relocated as always, the image is written to
+// <dir>/<name>-<hash of the file>-<base>.img the first time (the same bytes every time, at that base); the file is then
+// mapped privately over the copy, after comparing it with the copy (a stale or damaged file is written again). A write
+// to a page (imports, .data, a patch) copies that page, as Windows' copy-on-write does. Measured with Cyberpunk 2077
+// (exe and 30 DLLs): ~300 MB of the image copies' dirty pages.
+static uint64_t image_key(const uint8_t *p, size_t n) {   // (FNV-1a over 8-byte words, the tail bytewise)
+    uint64_t h = 0xcbf29ce484222325ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001b3ull; }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h ^ n;
+}
+static uint64_t g_image_cache_bytes;                     // (mapped from cache files, all images)
+static void image_from_cache(const char *path, uint8_t *base, uint32_t size, uint64_t key) {
+    const char *dir = getenv("VXRT_IMAGE_CACHE");
+    if (!dir || !*dir || !key) return;
+    const char *slash = strrchr(path, '/');
+    char name[4096], tmp[4200];
+    snprintf(name, sizeof name, "%s/%s-%016llx-%llx.img", dir, slash ? slash + 1 : path, (unsigned long long)key,
+             (unsigned long long)(uintptr_t)base);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int fd = open(name, O_RDONLY);
+        if (fd >= 0) {
+            struct stat st;
+            void *f = !fstat(fd, &st) && st.st_size == (off_t)size ? mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+            int same = f != MAP_FAILED && !memcmp(f, base, size);
+            if (f != MAP_FAILED) munmap(f, size);
+            if (same && mmap(base, size, VX_PROT_CODE, MAP_PRIVATE | MAP_FIXED, fd, 0) == base) {
+                close(fd);
+                g_image_cache_bytes += size;
+                if (vx_trace) vx_log("%s: pages from %s", path, name);
+                return;
+            }
+            close(fd);
+            if (same) { vx_log("%s: cannot map %s: %s (the copy is kept)", path, name, strerror(errno)); return; }
+        }
+        if (attempt) break;
+        // (written whole, then renamed into place: another process reading it sees all of it or none)
+        mkdir(dir, 0755);
+        snprintf(tmp, sizeof tmp, "%s.%d.tmp", name, (int)getpid());
+        int w = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        size_t done = 0;
+        while (w >= 0 && done < size) { ssize_t k = write(w, base + done, size - done); if (k <= 0) break; done += (size_t)k; }
+        if (w >= 0) close(w);
+        if (done != size || rename(tmp, name)) { unlink(tmp); vx_log("%s: cannot write %s (the copy is kept)", path, name); return; }
+    }
+}
+uint64_t vx_image_cache_bytes(void) { return g_image_cache_bytes; }
+
 static vx_image *load_dll(const char *name) {
     vx_image *m = image_by_name(name);
     if (m) return m;
@@ -690,6 +742,7 @@ static vx_image *load_pe(const char *path, int is_main) {
     // named after the file and its bytes' hash, made for it at this base
     uint64_t aot_hash = getenv("VXRT_AOT_DIR") ? xa_hash(file, (uint64_t)len) : 0;
 #endif
+    uint64_t cache_key = getenv("VXRT_IMAGE_CACHE") ? image_key(file, (size_t)len) : 0;
     free(file);
 
     int64_t delta = (int64_t)((uint64_t)base - pref_base);
@@ -709,6 +762,7 @@ static vx_image *load_pe(const char *path, int is_main) {
             b += block;
         }
     }
+    image_from_cache(path, base, image_size, cache_key);
 
     vx_image *m = calloc(1, sizeof *m);
     const char *slash = strrchr(path, '/');

@@ -154,7 +154,8 @@ static WINAPI HRESULT adapter_query_video_memory(void *this, uint32_t node, uint
         static dispatch_once_t once;
         dispatch_once(&once, ^{ dev = MTLCreateSystemDefaultDevice(); });
         info[0] = gpu_budget(dev.recommendedMaxWorkingSetSize);
-        info[1] = dev.currentAllocatedSize;
+        uint64_t used = dev.currentAllocatedSize, evicted = d3d12_volatile_bytes();   // (evicted and purgeable: not in use)
+        info[1] = used > evicted ? used - evicted : 0;
         info[2] = info[0] / 2;
     }
     return S_OK;

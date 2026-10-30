@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include "vx.h"
@@ -742,7 +743,8 @@ void vx_code_freed(void *addr, size_t len);            // (its translations go: 
 #define MEM_IMAGE    0x1000000
 #define GRANULARITY  0x10000
 
-typedef struct { uintptr_t base; size_t size; DWORD protect, type; } reservation;   // (type: VirtualAlloc's, as reserved)
+typedef struct { uintptr_t base; size_t size; DWORD protect, type; uint64_t foff; } reservation;   // (type: VirtualAlloc's, as
+                                                         // reserved; foff: 1 + its offset in VXRT_PAGEFILE's file, or 0)
 // A reservation maps whole 64 KB units, as Windows uses them up: with only its pages mapped, every small one leaves
 // a gap no aligned reservation fits in, and the kernel's search for room walks all of those (2 ms per call with
 // Half-Life: Alyx's 60000 small blocks).
@@ -825,6 +827,66 @@ static void prot_set(uintptr_t start, uintptr_t end, DWORD protect) {   // prote
     memcpy(g_prot + i, add, n * sizeof *add);
     g_nprot = g_nprot - (j - i) + n;
 }
+// VXRT_PAGEFILE=<dir> (ARM64): the program's large reservations (VXRT_PAGEFILE_MIN_MB and more, 64 by default) are
+// mapped shared from a file there instead of anonymous memory, as Windows backs committed memory with its page file:
+// their pages are the file's, out of the footprint a device's memory limit counts (measured: 1 GB written, footprint
+// 1 -> 1 MB), and the system writes them to the file when it needs the memory instead of ending the process. The file
+// is removed once open (VXRT_PAGEFILE_GB of offsets, 512 by default: sparse, its blocks come when written). Decommit,
+// MEM_RESET and release punch the range out of the file (its pages read as zeros again, its blocks freed); a
+// released range's offsets are used again by a reservation of the same size.
+static int g_pf_fd = -1, g_pf_on = -1;
+static uint64_t g_pf_size, g_pf_cursor, g_pf_min, g_pf_bytes;
+static struct { uint64_t off, size; } g_pf_free[256]; static int g_pf_nfree;
+static int pf_on(void) {
+#ifdef __aarch64__
+    if (g_pf_on >= 0) return g_pf_on;
+    g_pf_on = 0;
+    const char *dir = getenv("VXRT_PAGEFILE");
+    if (!dir || !*dir) return 0;
+    const char *gb = getenv("VXRT_PAGEFILE_GB"), *min = getenv("VXRT_PAGEFILE_MIN_MB");
+    g_pf_size = (gb && atoll(gb) > 0 ? (uint64_t)atoll(gb) : 512) << 30;
+    g_pf_min = (min && atoll(min) >= 0 && *min ? (uint64_t)atoll(min) : 64) << 20;
+    char path[4096];
+    snprintf(path, sizeof path, "%s/vxrt-pagefile-%d.bin", dir, (int)getpid());
+    mkdir(dir, 0755);
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) unlink(path);
+    if (fd < 0 || ftruncate(fd, (off_t)g_pf_size)) { vx_log("VXRT_PAGEFILE: cannot make %s: %s", path, strerror(errno)); if (fd >= 0) close(fd); return 0; }
+    g_pf_fd = fd;
+    vx_log("VXRT_PAGEFILE: reservations of %llu MB or more on the pages of a file in %s (%llu GB of offsets, removed)",
+           (unsigned long long)(g_pf_min >> 20), dir, (unsigned long long)(g_pf_size >> 30));
+    return g_pf_on = 1;
+#else
+    return 0;                                     // (x86: the program's code runs from its memory, which needs exec)
+#endif
+}
+static void pf_punch(uint64_t off, uint64_t len) {         // (whole 4 KB blocks; the file system's are that size)
+    uint64_t from = (off + 0xfff) & ~0xfffull, to = (off + len) & ~0xfffull;
+    if (to > from) { fpunchhole_t ph = { 0, 0, (off_t)from, (off_t)(to - from) }; fcntl(g_pf_fd, F_PUNCHHOLE, &ph); }
+}
+// Maps [a, a + n) from the file (with g_vm_lock held): 1 + the offset, or 0 (left anonymous)
+static uint64_t pf_map(uintptr_t a, uint64_t n) {
+    if (n < g_pf_min || !pf_on()) return 0;
+    uint64_t off = ~0ull;
+    for (int i = 0; i < g_pf_nfree; i++) if (g_pf_free[i].size == n) { off = g_pf_free[i].off; g_pf_free[i] = g_pf_free[--g_pf_nfree]; break; }
+    if (off == ~0ull) { if (g_pf_cursor + n > g_pf_size) return 0; off = g_pf_cursor; g_pf_cursor += n; }
+    if (mmap((void *)a, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, g_pf_fd, (off_t)off) != (void *)a) {
+        vx_log("VXRT_PAGEFILE: cannot map %#llx bytes at %#lx: %s (anonymous memory instead)", (unsigned long long)n, (unsigned long)a, strerror(errno));
+        mach_vm_address_t m = a;                  // (anonymous again; the offsets are not used again)
+        mach_vm_allocate(mach_task_self(), &m, n, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+        mach_vm_protect(mach_task_self(), m, n, 0, VX_PROT_RWX);
+        return 0;
+    }
+    g_pf_bytes += n;
+    return off + 1;
+}
+static void pf_release(uint64_t foff, uint64_t n) {
+    pf_punch(foff - 1, n);
+    g_pf_bytes -= n;
+    if (g_pf_nfree < 256) g_pf_free[g_pf_nfree++] = (typeof(g_pf_free[0])){ foff - 1, n };
+}
+uint64_t vx_pagefile_bytes(void) { return g_pf_bytes; }
+__attribute__((constructor)) static void pf_init(void) { if (getenv("VXRT_PAGEFILE")) pf_on(); }   // (made before the program runs)
 static size_t prot_first(uintptr_t a) {                    // the first range ending after a
     size_t lo = 0, hi = g_nprot;
     while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_prot[mid].end <= a) lo = mid + 1; else hi = mid; }
@@ -853,8 +915,14 @@ static DWORD image_protect(const vx_image *m, uintptr_t a) {
 // pages become fresh zero pages, out of the footprint until written again. MEM_RESET_UNDO then fails as Windows' does
 // when the memory was taken: some of the data was replaced by zeros. (Counted for the memory report.)
 uint64_t vx_mem_reset_calls, vx_mem_reset_bytes;
-static void *reset_pages(void *addr, size_t size, DWORD type) {     // with g_vm_lock held
+static void *reset_pages(reservation *r, void *addr, size_t size, DWORD type) {     // with g_vm_lock held
     if (type & MEM_RESET_UNDO) { vx_set_last_error(87); return NULL; }
+    if (r->foff) {                                          // (VXRT_PAGEFILE: out of the file, reading as zeros)
+        __atomic_add_fetch(&vx_mem_reset_calls, 1, __ATOMIC_RELAXED);
+        uintptr_t from = ((uintptr_t)addr + 0xfff) & ~(uintptr_t)0xfff, to = ((uintptr_t)addr + size) & ~(uintptr_t)0xfff;
+        if (to > from) { VX_CODE_FREED((void *)from, to - from); pf_punch(r->foff - 1 + (from - r->base), to - from); __atomic_add_fetch(&vx_mem_reset_bytes, to - from, __ATOMIC_RELAXED); }
+        return addr;
+    }
     uintptr_t page = vm_page_size, from = ((uintptr_t)addr + page - 1) & ~(page - 1), to = ((uintptr_t)addr + size) & ~(page - 1);
     __atomic_add_fetch(&vx_mem_reset_calls, 1, __ATOMIC_RELAXED);
     if (to > from) {
@@ -872,7 +940,7 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
     VX_NO_STOP_LOCK(&g_vm_lock);
     reservation *r = addr ? find_reservation((uintptr_t)addr) : NULL;
     if (r && (type & (MEM_RESET | MEM_RESET_UNDO)) && !(type & (MEM_RESERVE | MEM_COMMIT))) {
-        void *p = reset_pages(addr, size, type);
+        void *p = reset_pages(r, addr, size, type);
         VX_NO_STOP_UNLOCK(&g_vm_lock);
         return p;
     }
@@ -919,7 +987,9 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         return NULL;
     }
     mach_vm_protect(mach_task_self(), a, mapped_size(len), 0, VX_PROT_RWX);
+    uint64_t foff = pf_map((uintptr_t)a, mapped_size(len));
     res_insert((uintptr_t)a, (size_t)len, protect, type);
+    if (foff) find_reservation((uintptr_t)a)->foff = foff;
     g_va_kind[2]++;
     static uint64_t made;
     uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
@@ -1009,6 +1079,9 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
 #ifdef __aarch64__
             memset(vx_low_map + (r->base - vx_low_base) / GRANULARITY, 0, n / GRANULARITY);
 #endif
+        } else if (r->foff) {                                             // (VXRT_PAGEFILE: out of the file)
+            mach_vm_deallocate(mach_task_self(), r->base, n);
+            pf_release(r->foff, n);
         } else if (n >= (1u << 20) && g_nspare < 32 && g_spare_bytes + n <= (512u << 20) && r->base >= (1ull << 32)) {
             g_spare[g_nspare++] = (spare_block){ r->base, n };              // (low-memory blocks are not reused)
             g_spare_bytes += n;
@@ -1020,10 +1093,19 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
         size_t len = size ? (((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff) - start : r->base + r->size - start;
         VX_CODE_FREED((void *)start, len);
-        mach_vm_address_t a = start;                       // fresh zero pages over the range
-        ok = mach_vm_allocate(mach_task_self(), &a, len, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
+        // Fresh zero pages over the range's whole host pages (out of the footprint); the parts of a host page (16 KB
+        // on ARM64) that the range only covers in part are zeroed, as the rest of that page is not the range's.
+        uintptr_t page = vm_page_size, from = (start + page - 1) & ~(page - 1), to = (start + len) & ~(page - 1);
+        ok = 1;
+        if (r->foff) pf_punch(r->foff - 1 + (start - r->base), len);   // (VXRT_PAGEFILE: zeros, out of the file)
+        else if (to > from) {
+            mach_vm_address_t a = from;
+            ok = mach_vm_allocate(mach_task_self(), &a, to - from, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
+            if (ok) mach_vm_protect(mach_task_self(), a, to - from, 0, VX_PROT_RWX);
+            if (from > start) memset((void *)start, 0, from - start);
+            if (start + len > to) memset((void *)to, 0, start + len - to);
+        } else memset((void *)start, 0, len);
         prot_set(start, start + len, 0);
-        if (ok) mach_vm_protect(mach_task_self(), a, len, 0, VX_PROT_RWX);
     }
     VX_NO_STOP_UNLOCK(&g_vm_lock);
     if (!ok) vx_set_last_error(487);
@@ -1039,7 +1121,8 @@ static void vm_dirty(uintptr_t start, uintptr_t end, uint64_t *dirty, uint64_t *
         mach_vm_address_t at = a; mach_vm_size_t sz = 0;
         vm_region_extended_info_data_t info; mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT; mach_port_t obj;
         if (mach_vm_region(mach_task_self(), &at, &sz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS || at >= end) return;
-        if (!untagged_only || info.user_tag == 0) {
+        // (a file's pages - VXRT_PAGEFILE, VXRT_D3D12_FILE_BUFFERS, VXRT_IMAGE_CACHE - are not in the footprint)
+        if ((!untagged_only || info.user_tag == 0) && !info.external_pager) {
             // (a region partly inside counts in proportion)
             uint64_t lo = at < start ? start : at, hi = at + sz > end ? end : at + sz, page = vm_kernel_page_size;
             double part = sz ? (double)(hi - lo) / (double)sz : 0;

@@ -88,6 +88,12 @@ static void test_memory(void) {
         CHECK(undo == NULL || undo == rs);
         CHECK(VirtualAlloc(rs + 4096, 8192, 0x80000, PAGE_READWRITE) == rs + 4096);   // (inside a page of the host's)
         CHECK(rs[0] == 3);                                                           // (only whole host pages go)
+        // MEM_DECOMMIT of one 4 KB page inside a host page (16 KB on ARM64): the neighbours keep their contents
+        rs[8192] = 6; rs[16383] = 7;
+        CHECK(VirtualFree(rs + 12288, 4096, MEM_DECOMMIT));
+        CHECK(rs[0] == 3 && rs[8192] == 6 && rs[12345] == 0);
+        CHECK(VirtualAlloc(rs + 12288, 4096, MEM_COMMIT, PAGE_READWRITE) == rs + 12288);
+        CHECK(rs[16383] == 0 && rs[12288] == 0);
         CHECK(VirtualFree(rs, 0, MEM_RELEASE));
     }
     // Views of file mappings are not private memory: refused, and their contents stay (another process may share
@@ -130,6 +136,28 @@ static void test_memory(void) {
     SetLastError(0); CHECK(!K32QueryWorkingSetEx(GetCurrentProcess(), ws, 8) && GetLastError() == ERROR_BAD_LENGTH);
     CHECK(VirtualFreeEx(GetCurrentProcess(), ro, 0, MEM_RELEASE));
     CHECK(VirtualFree(p, 0, MEM_RELEASE));
+    // A 2 MB block (on VXRT_PAGEFILE's file with VXRT_PAGEFILE_MIN_MB=1): decommit inside a host page, MEM_RESET,
+    // commit again, release (after the working-set check: a released block this large is kept, maybe at gone's
+    // address)
+    BYTE *big = VirtualAlloc(NULL, 2 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(big != NULL);
+    if (big) {
+        memset(big, 0x55, 2 << 20);
+        CHECK(VirtualFree(big + 12288, 4096, MEM_DECOMMIT));
+        CHECK(big[12287] == 0x55 && big[16384] == 0x55 && big[8192] == 0x55);
+        CHECK(VirtualAlloc(big + 12288, 4096, MEM_COMMIT, PAGE_READWRITE) == big + 12288);
+        CHECK(big[12288] == 0 && big[16383] == 0);
+        CHECK(VirtualAlloc(big + 65536, 65536, 0x80000 /* MEM_RESET */, PAGE_READWRITE) == big + 65536);
+        big[65536] = 9; big[131071] = 8;
+        CHECK(big[65536] == 9 && big[131071] == 8 && big[65535] == 0x55 && big[131072] == 0x55);
+        CHECK(VirtualFree(big + (1 << 20), 1 << 20, MEM_DECOMMIT));
+        CHECK(VirtualAlloc(big + (1 << 20), 1 << 20, MEM_COMMIT, PAGE_READWRITE) == big + (1 << 20));
+        CHECK(big[1 << 20] == 0 && big[(2 << 20) - 1] == 0 && big[(1 << 20) - 1] == 0x55);
+        CHECK(VirtualFree(big, 0, MEM_RELEASE));
+        BYTE *again = VirtualAlloc(NULL, 2 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);   // (its pages read as zeros)
+        CHECK(again && again[0] == 0 && again[(2 << 20) - 1] == 0 && again[777777] == 0);
+        if (again) CHECK(VirtualFree(again, 0, MEM_RELEASE));
+    }
     perf_info pi;
     SetLastError(0); CHECK(!K32GetPerformanceInfo(&pi, 8) && GetLastError() == ERROR_BAD_LENGTH);
     CHECK(K32GetPerformanceInfo(&pi, sizeof pi));
