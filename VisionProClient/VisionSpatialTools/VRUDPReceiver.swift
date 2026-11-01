@@ -81,8 +81,15 @@ final class VRUDPReceiver: ObservableObject {
     @Published private(set) var receiveDiagnostics = String(localized: "Waiting for video packets.")
     @Published private(set) var diagnosticsSummary = "packets=0 incomplete=0"
 
+    /// Settings key: send the stream over the direct Wi-Fi link between the
+    /// headset and the Mac (AWDL) instead of through the router.
+    static let directLinkKey = "directWiFiLink"
+
     private var browser: NWBrowser?
     private var connection: NWConnection?
+    // The direct link is asked for by ruling out the router's interfaces; if no
+    // direct path comes up, the next connections go through the router again.
+    private var directLinkUnavailable = false
     private let networkQueue = DispatchQueue(label: "com.verantyx.vrudp-receiver", qos: .userInteractive)
     // Pose packets leave from the render thread. Sending them through
     // networkQueue made them wait behind keyframe reassembly, which arrived at
@@ -144,6 +151,7 @@ final class VRUDPReceiver: ObservableObject {
             guard let self else { return }
             guard !self.shouldRun else { return }
             self.shouldRun = true
+            self.directLinkUnavailable = false
             self.beginBrowsing()
             self.watchdogGeneration &+= 1
             self.scheduleVideoWatchdog(generation: self.watchdogGeneration)
@@ -199,16 +207,37 @@ final class VRUDPReceiver: ObservableObject {
         print("Browsing for Mac HardwareEncoder (_verantyxvr._udp)...")
     }
 
-    private func connect(to endpoint: NWEndpoint) {
+    private static func isDirectLink(_ interface: NWInterface) -> Bool {
+        interface.name.hasPrefix("awdl") || interface.name.hasPrefix("llw")
+    }
+
+    private func connect(to endpoint: NWEndpoint, prohibiting routerInterfaces: [NWInterface] = []) {
         let parameters = NWParameters.udp
         parameters.allowFastOpen = true
         parameters.includePeerToPeer = true
+        if !routerInterfaces.isEmpty { parameters.prohibitedInterfaces = routerInterfaces }
 
         let newConnection = NWConnection(to: endpoint, using: parameters)
         newConnection.stateUpdateHandler = { [weak self] state in
             guard let self, self.shouldRun, self.connection === newConnection else { return }
             print("VRUDPConnection State: \(state)")
             if state == .ready {
+                let used = newConnection.currentPath?.availableInterfaces.first
+                print("Video link: \(used?.name ?? "unknown")")
+                // The Mac sends the video back the way HELLO_VR came, so the
+                // link has to be chosen before it is sent.
+                if UserDefaults.standard.bool(forKey: Self.directLinkKey), !self.directLinkUnavailable,
+                   routerInterfaces.isEmpty, let used, !Self.isDirectLink(used) {
+                    let router = newConnection.currentPath?.availableInterfaces.filter { !Self.isDirectLink($0) } ?? [used]
+                    print("Reconnecting without \(router.map(\.name)) to use the direct Wi-Fi link")
+                    newConnection.stateUpdateHandler = nil
+                    newConnection.cancel()
+                    self.connection = nil
+                    self.connect(to: endpoint, prohibiting: router)
+                    return
+                }
+                let link = used.map { Self.isDirectLink($0) ? String(localized: "direct Wi-Fi link (\($0.name))") : String(localized: "through the router (\($0.name))") }
+                    ?? String(localized: "unknown link")
                 self.streamGeneration &+= 1
                 self.frames.removeAll()
                 self.lastPlayedFrame = nil
@@ -222,9 +251,10 @@ final class VRUDPReceiver: ObservableObject {
                 newConnection.send(content: Data("HELLO_VR".utf8), completion: .idempotent)
                 self.setTrackingConnection(newConnection)
                 DispatchQueue.main.async { [weak self] in
-                    self?.connectionStatus = String(localized: "Connected to the Mac. Waiting for video from the encoder.")
+                    self?.connectionStatus = String(localized: "Connected to the Mac, \(link). Waiting for video from the encoder.")
                 }
             } else if case .failed(let error) = state {
+                if !routerInterfaces.isEmpty { self.directLinkUnavailable = true }
                 self.connectionFailed(newConnection, error: error)
             }
         }
@@ -232,6 +262,15 @@ final class VRUDPReceiver: ObservableObject {
         connection = newConnection
         newConnection.start(queue: networkQueue)
         receive(on: newConnection)
+        if !routerInterfaces.isEmpty {
+            // Without a direct path the connection waits instead of failing.
+            networkQueue.asyncAfter(deadline: .now() + 6) { [weak self] in
+                guard let self, self.connection === newConnection, newConnection.state != .ready else { return }
+                print("No direct Wi-Fi link to the Mac; going through the router")
+                self.directLinkUnavailable = true
+                self.connectionFailed(newConnection, error: .posix(.ETIMEDOUT))
+            }
+        }
     }
 
     func stop() {

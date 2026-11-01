@@ -14,6 +14,7 @@ struct SteamVRStreamerView: View {
     // Read by VRCompositorRenderer (UserDefaults) once a second.
     @AppStorage(VRCompositorRenderer.showFpsOverlayKey) private var showFpsOverlay = true
     @AppStorage("trackLeftHandWithCameras") private var trackLeftHandWithCameras = true
+    @AppStorage(VRUDPReceiver.directLinkKey) private var directWiFiLink = false
     @State private var isStarting = false
     @State private var isStopping = false
     @State private var showsHowTo = true
@@ -167,6 +168,7 @@ struct SteamVRStreamerView: View {
             Toggle("Hold the merged Joy-Con pair in the left hand (right hand free)", isOn: $mergedJoyConOneHanded)
             Toggle("Show the fps overlay in VR (game / received / latency / audio)", isOn: $showFpsOverlay)
             Toggle("Track the left hand with the cameras as well (fixed gamepad pose when it is out of view)", isOn: $trackLeftHandWithCameras)
+            Toggle("Direct Wi-Fi link to the Mac, not through the router (applies at the next connection)", isOn: $directWiFiLink)
             Picker("One-handed gamepad hold", selection: $gamepadHold) {
                 Text("Upright").tag(0)
                 Text("Turned left").tag(1)
