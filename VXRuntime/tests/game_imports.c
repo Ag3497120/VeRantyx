@@ -183,6 +183,19 @@ int main(void) {
         CHECK(enum_packages(&count, &packages) == 0 && count == 0);
         CHECK(acquire(NULL, unisp, 2 /* SECPKG_CRED_OUTBOUND */, NULL, NULL, NULL, NULL, cred, expiry) < 0);
     }
-    printf("game imports: msvcrt vsprintf, classic event tracing, No Man's Sky's -> %s\n", failures ? "FAILED" : "ok");
+    // (Half-Life: Alyx's kernel32!lstrcpynA, issue #12: the count includes the terminating zero)
+    HMODULE k32a = GetModuleHandleA("kernel32.dll");
+    char *(WINAPI *cpyn)(char *, const char *, int) = (void *)GetProcAddress(k32a, "lstrcpynA");
+    WCHAR *(WINAPI *cpynw)(WCHAR *, const WCHAR *, int) = (void *)GetProcAddress(k32a, "lstrcpynW");
+    CHECK(cpyn && cpynw);
+    if (cpyn && cpynw) {
+        char b[8] = "xxxxxxx"; WCHAR w[8];
+        CHECK(cpyn(b, "abcdef", 4) == b && !strcmp(b, "abc"));
+        CHECK(cpyn(b, "ab", 8) == b && !strcmp(b, "ab"));
+        b[0] = 'q'; CHECK(cpyn(b, "zz", 0) == b && b[0] == 'q');
+        CHECK(cpyn(b, "zz", 1) == b && b[0] == 0);
+        CHECK(cpynw(w, L"abcdef", 3) == w && !wcscmp(w, L"ab"));
+    }
+    printf("game imports: msvcrt vsprintf, classic event tracing, No Man's Sky's, lstrcpyn -> %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

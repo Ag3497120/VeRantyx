@@ -300,9 +300,28 @@ static WINAPI int lstrcmpiA(const char *a, const char *b) { return strcasecmp(a,
 static WINAPI int lstrcmpA(const char *a, const char *b) { return strcmp(a, b); }
 static WINAPI int lstrlenA(const char *s) { return s ? (int)strlen(s) : 0; }
 static WINAPI int lstrlenW(const WCHAR *s) { return s ? (int)vx_wcslen(s) : 0; }
+// (lstrcpynA: Half-Life: Alyx on an M4 Max asked for it, issue #12. n counts the terminating zero, which is always
+//  written when n > 0; n <= 0 copies nothing.)
+static WINAPI char *lstrcpynA(char *d, const char *s, int n) {
+    if (n <= 0) return d;
+    int i = 0;
+    for (; i < n - 1 && s[i]; i++) d[i] = s[i];
+    d[i] = 0;
+    return d;
+}
+static WINAPI WCHAR *lstrcpynW(WCHAR *d, const WCHAR *s, int n) {
+    if (n <= 0) return d;
+    int i = 0;
+    for (; i < n - 1 && s[i]; i++) d[i] = s[i];
+    d[i] = 0;
+    return d;
+}
+static WINAPI char *lstrcpyA(char *d, const char *s) { memmove(d, s, strlen(s) + 1); return d; }
+static WINAPI char *lstrcatA(char *d, const char *s) { memmove(d + strlen(d), s, strlen(s) + 1); return d; }
 
 static const vx_export text_k32[] = {
     VX_EXPORT(lstrcmpiA), VX_EXPORT(lstrcmpA), VX_EXPORT(lstrlenA), VX_EXPORT(lstrlenW),
+    VX_EXPORT(lstrcpynA), VX_EXPORT(lstrcpynW), VX_EXPORT(lstrcpyA), VX_EXPORT(lstrcatA),
     VX_EXPORT(CompareStringW), VX_EXPORT(CompareStringEx), VX_EXPORT(CompareStringOrdinal), VX_EXPORT(CompareStringA),
     VX_EXPORT(ExpandEnvironmentStringsA), VX_EXPORT(ExpandEnvironmentStringsW),
     VX_EXPORT(LCMapStringW), VX_EXPORT(LCMapStringEx), VX_EXPORT(GetStringTypeW), VX_EXPORT(GetCPInfo),
