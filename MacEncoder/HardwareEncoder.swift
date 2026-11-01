@@ -159,6 +159,12 @@ var videoBytesSent = 0
 var transmittedFrameCount = 0
 var droppedTransportFrames = 0
 var capturedFrameCount = 0
+// The longest time between two of the game's frames in each diagnostics period, and how many gaps passed 100 ms:
+// a tester's "the picture freezes for a moment every few seconds" (issue #8) is then in hardware-encoder.log
+// ("gap=" and "stalls=") whether the game stopped or the stream did.
+var lastCapturedFrameAt: TimeInterval = 0
+var longestCaptureGap: TimeInterval = 0
+var captureStalls = 0
 var submittedFrameCount = 0
 var posePacketCount = 0
 var lastPoseReceivedAt: TimeInterval = 0
@@ -1927,12 +1933,14 @@ func reportDiagnosticsIfDue() {
         packets: sentVideoPacketCount, bytes: videoBytesSent,
         errors: videoPacketSendErrorCount, drops: droppedTransportFrames, poses: posePacketCount)
     let poseAge = lastPoseReceivedAt > 0 ? now - lastPoseReceivedAt : -1
+    let gap = longestCaptureGap, stalls = captureStalls
+    longestCaptureGap = 0; captureStalls = 0
     encoderDiagnosticLock.unlock()
     peerLock.lock()
     let endpoint = videoPeer.map { String(describing: $0.endpoint) } ?? "none"
     peerLock.unlock()
     let captureFPS = Double(current.capture - lastDiagnostics.capture) / elapsed
-    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps bitrate=%.1fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs peer=%@",
+    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps bitrate=%.1fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs gap=%.0fms stalls=%d peer=%@",
         elapsed, dbHeaderPtr.pointee.captureSourceMode, captureFPS,
         Double(current.submit - lastDiagnostics.submit) / elapsed,
         Double(current.encode - lastDiagnostics.encode) / elapsed,
@@ -1941,7 +1949,7 @@ func reportDiagnosticsIfDue() {
         Double(adaptiveBitrate.current) / 1_000_000,
         current.packets - lastDiagnostics.packets, current.errors - lastDiagnostics.errors,
         current.drops - lastDiagnostics.drops, droppedEncoderFrames,
-        Double(current.poses - lastDiagnostics.poses) / elapsed, poseAge, endpoint))
+        Double(current.poses - lastDiagnostics.poses) / elapsed, poseAge, gap * 1000, stalls, endpoint))
     if videoPeer != nil {
         adaptiveBitrate.update(
             localLossEvents: (current.errors - lastDiagnostics.errors) + (current.drops - lastDiagnostics.drops),
@@ -2690,6 +2698,12 @@ while isEncoding {
                 if hasSource {
                     encoderDiagnosticLock.lock()
                     capturedFrameCount += 1
+                    if lastCapturedFrameAt > 0 {
+                        let gap = pollTime - lastCapturedFrameAt
+                        longestCaptureGap = max(longestCaptureGap, gap)
+                        if gap > 0.1 { captureStalls += 1 }
+                    }
+                    lastCapturedFrameAt = pollTime
                     encoderDiagnosticLock.unlock()
                 }
 
