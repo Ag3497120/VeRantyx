@@ -1505,3 +1505,11 @@ clean:
 	rm -rf build
 
 .PHONY: vr-check all tests check check-run runtime-tests runtime-tests-run shader-progress-check shader-progress-check-run bench d3d12-bench clean shaders translator-check vulkan-test-shaders shader-cache-check
+
+# The log's repeat limit (src/loader.c): 100000 identical lines come out as 21 (20 copies and the note).
+build/log_repeat.exe: tests/log_repeat.c
+	$(MINGW) -O1 -Wall -o $@ $<
+log-repeat-check: build/vxrt build/log_repeat.exe
+	@n=$$($(VXRT) build/log_repeat.exe 2>&1 >/dev/null | grep -c 'VxrtNoSuchExportForTheLogTest\|came 20 times'); \
+	  if [ "$$n" -ge 21 ] && [ "$$n" -le 23 ]; then echo "log-repeat-check: OK ($$n lines)"; else echo "log-repeat-check: FAIL ($$n lines)"; exit 1; fi
+check: log-repeat-check

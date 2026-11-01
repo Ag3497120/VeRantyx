@@ -28,6 +28,36 @@
 vx_process vx_proc;
 int vx_trace;
 
+// How often one line may repeat word for word (VXRT_LOG_REPEAT, default 20, 0: no limit) before further copies
+// are written only once every 10 s. Windows Steam asked GetProcAddress for the same missing SetupAPI export
+// 4 million times and its log reached 494 MB in a few days. The frame-rate lines are left alone: the app and the
+// harness read every one of them.
+static int log_repeat_allowed(const char *body, size_t len) {
+    static int limit = -1;
+    if (limit < 0) { const char *e = getenv("VXRT_LOG_REPEAT"); limit = e ? atoi(e) : 20; if (limit < 0) limit = 0; }
+    if (!limit || (len >= 9 && !memcmp(body, "present: ", 9)) || (len >= 7 && !memcmp(body, "vulkan", 6))) return 1;
+    uint64_t h = 1469598103934665603ull;                    // FNV-1a of the line without its prefix and time
+    for (size_t i = 0; i < len; i++) h = (h ^ (uint8_t)body[i]) * 1099511628211ull;
+    if (!h) h = 1;
+    enum { SLOTS = 8192 };
+    static uint64_t keys[SLOTS];
+    static uint32_t counts[SLOTS], written_at[SLOTS];      // (written_at: seconds of the monotonic clock)
+    for (unsigned probe = 0; probe < 8; probe++) {
+        unsigned i = (unsigned)(h + probe) & (SLOTS - 1);
+        uint64_t k = __atomic_load_n(&keys[i], __ATOMIC_RELAXED);
+        if (!k && __atomic_compare_exchange_n(&keys[i], &k, h, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) k = h;
+        if (k != h) continue;
+        uint32_t c = __atomic_add_fetch(&counts[i], 1, __ATOMIC_RELAXED);
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint32_t now = (uint32_t)ts.tv_sec, last = __atomic_load_n(&written_at[i], __ATOMIC_RELAXED);
+        if (c < (uint32_t)limit) { __atomic_store_n(&written_at[i], now, __ATOMIC_RELAXED); return 1; }
+        if (c == (uint32_t)limit) { __atomic_store_n(&written_at[i], now, __ATOMIC_RELAXED); return 2; }
+        if (now - last >= 10 && __atomic_compare_exchange_n(&written_at[i], &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 1;
+        return 0;
+    }
+    return 1;                                               // (table full here: written)
+}
+
 // One write per line (processes share the terminal). A process started by another vxrt process names itself.
 void vx_log(const char *fmt, ...) {
     char line[2048];
@@ -44,13 +74,21 @@ void vx_log(const char *fmt, ...) {
         long day = (long)(ts.tv_sec % 86400);
         n += snprintf(line + n, sizeof line - (size_t)n, "%02ld:%02ld:%02ld.%03ld ", day / 3600, day / 60 % 60, day % 60, ts.tv_nsec / 1000000);
     }
+    int body = n;
     va_list ap; va_start(ap, fmt);
     n += vsnprintf(line + n, sizeof line - (size_t)n - 1, fmt, ap);
     va_end(ap);
     if (n > (int)sizeof line - 2) n = (int)sizeof line - 2;
+    int allowed = log_repeat_allowed(line + body, (size_t)(n - body));
+    if (!allowed) return;
     line[n++] = '\n';
     fflush(stderr);
     write(2, line, (size_t)n);
+    if (allowed == 2) {
+        n = snprintf(line, sizeof line, "[vxrt] (the line above came %d times: from now on it is logged once every 10 s; VXRT_LOG_REPEAT=0 logs all)\n",
+                     getenv("VXRT_LOG_REPEAT") ? atoi(getenv("VXRT_LOG_REPEAT")) : 20);
+        write(2, line, (size_t)n);
+    }
 }
 
 // ---- built-in module registry ------------------------------------------------------------------------------------
