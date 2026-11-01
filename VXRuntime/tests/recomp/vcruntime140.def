@@ -1,0 +1,10 @@
+LIBRARY vcruntime140.dll
+EXPORTS
+    _CxxThrowException
+    __CxxFrameHandler3
+    __C_specific_handler
+    __std_terminate
+    _purecall
+    memcpy
+    memset
+    memmove

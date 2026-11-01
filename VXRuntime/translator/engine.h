@@ -42,7 +42,11 @@ int xe_owns(const xe *e, uint64_t pc);
 int xe_in_guest(const xe *e, uint64_t pc);   // vCPU: pc in guest.c's code (a call the guest answers)
 // Forgets every translation (the code it came from changed). Not while another thread runs translated code.
 void xe_flush(xe *e);
-// Runs from ctx->rip until the code reaches stop (0), an x86 exception (ctx->fault, RIP at the instruction), or an
-// instruction that cannot be translated (-1).
+// Code another runner owns (the static recompiler's modules, translator/aot.c): xe_run returns XE_FOREIGN when the
+// program reaches such an address, instead of translating it.
+enum { XE_FOREIGN = -3 };
+void xe_set_foreign(xe *e, int (*owns)(uint64_t rip));
+// Runs from ctx->rip until the code reaches stop (0), an x86 exception (ctx->fault, RIP at the instruction), an
+// instruction that cannot be translated (-1), or code xe_set_foreign's function owns (XE_FOREIGN).
 int xe_run(xe *e, x86_ctx *ctx, uint64_t stop);
 xe_stats xe_get_stats(const xe *e);

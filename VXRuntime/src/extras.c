@@ -18,6 +18,8 @@
 #include <ifaddrs.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sys/sysctl.h>
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"   // (MD5, for programs that ask for it; nothing secure here)
 #include <CommonCrypto/CommonDigest.h>
 
@@ -85,6 +87,14 @@ static WINAPI int ms_vsprintf_p(uint64_t options, char *buf, size_t count, const
 static WINAPI void *ms_freopen(const char *path, const char *mode, void *stream) { (void)path; (void)mode; (void)stream; errno = EACCES; return NULL; }
 static WINAPI int ms_initialize_lconv(void) { return 0; }
 static WINAPI size_t ms_msize(void *p) { return p ? malloc_size(p) : (size_t)-1; }
+// _recalloc: realloc to num * size, the bytes past the old block zeroed.
+static WINAPI void *ms_recalloc(void *p, size_t num, size_t size) {
+    if (size && num > SIZE_MAX / size) return NULL;
+    size_t n = num * size, old = p ? malloc_size(p) : 0;
+    uint8_t *q = realloc(p, n ? n : 1);
+    if (q && n > old) memset(q + old, 0, n - old);
+    return q;
+}
 static WINAPI void *ms_expand(void *p, size_t n) { return p && malloc_size(p) >= n ? p : NULL; }
 static WINAPI int ms_itoa_s(int value, char *buf, size_t size, int radix) {
     if (!buf || !size || radix < 2 || radix > 36) return EINVAL;
@@ -629,6 +639,268 @@ static WINAPI BOOL GetVolumeNameForVolumeMountPointW(const WCHAR *mount_point, W
     for (size_t i = 0; i < sizeof volume_name; i++) name[i] = (WCHAR)volume_name[i];
     return 1;
 }
+
+// ---- Cyberpunk 2077 imports (Cyberpunk2077.exe, bink2w64.dll, REDGalaxy64.dll, GFSDK_Aftermath) ---------------------
+static WINAPI BOOL SetThreadStackGuarantee(DWORD *size) {   // (the stack is the size it was made: no reserve to grow into)
+    if (!size) { vx_set_last_error(87); return 0; }
+    *size = 0;
+    return 1;
+}
+static WINAPI BOOL GetPhysicallyInstalledSystemMemory(uint64_t *kilobytes) {
+    uint64_t total = 0;
+    size_t len = sizeof total;
+    if (!kilobytes) { vx_set_last_error(87); return 0; }
+    if (sysctlbyname("hw.memsize", &total, &len, NULL, 0)) total = 8ull << 30;
+    *kilobytes = total / 1024;
+    return 1;
+}
+static WINAPI void RaiseFailFastException(const DWORD *record, void *context, DWORD flags) {
+    (void)context; (void)flags;
+    DWORD code = record ? record[0] : 0xC0000602u;                 // STATUS_FAIL_FAST_EXCEPTION
+    vx_log("RaiseFailFastException(0x%08x): the process ends", code);
+    _exit((int)code);
+}
+// SYSTEM_CPU_SET_INFORMATION: 32 bytes a logical processor (Id 0x100 + n, as Windows numbers them); the performance
+// cores in the higher efficiency class.
+static WINAPI BOOL GetSystemCpuSetInformation(uint8_t *info, DWORD length, DWORD *returned, HANDLE process, DWORD flags) {
+    (void)process; (void)flags;
+    int n = 0, perf = 0;
+    size_t len = sizeof n;
+    if (sysctlbyname("hw.logicalcpu", &n, &len, NULL, 0) || n <= 0) n = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    len = sizeof perf;
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &perf, &len, NULL, 0)) perf = n;
+    if (n > 64) n = 64;
+    DWORD need = (DWORD)n * 32;
+    if (returned) *returned = need;
+    if (!info || length < need) { vx_set_last_error(122); return 0; }   // ERROR_INSUFFICIENT_BUFFER
+    memset(info, 0, need);
+    for (int i = 0; i < n; i++) {
+        uint8_t *e = info + 32 * i;
+        *(DWORD *)e = 32;                                          // Size; Type 0: CpuSetInformation
+        *(DWORD *)(e + 8) = 0x100u + (DWORD)i;                     // Id
+        e[14] = (uint8_t)i;                                        // LogicalProcessorIndex
+        e[15] = (uint8_t)i;                                        // CoreIndex
+        e[18] = (uint8_t)(i < perf ? 1 : 0);                       // EfficiencyClass
+    }
+    return 1;
+}
+static WINAPI BOOL SetThreadSelectedCpuSets(HANDLE thread, const DWORD *ids, DWORD count) { (void)thread; (void)ids; (void)count; return 1; }
+static WINAPI uint16_t GetThreadUILanguage(void) { return 0x409; }
+static WINAPI DWORD GetThreadErrorMode(void) { return 0; }
+static WINAPI BOOL CreateDirectoryExW(const WCHAR *template_dir, const WCHAR *name, void *sa) {
+    (void)template_dir;
+    BOOL (WINAPI *mk)(const WCHAR *, void *) = (BOOL (WINAPI *)(const WCHAR *, void *))vx_find_export("kernel32.dll", "CreateDirectoryW");
+    return mk ? mk(name, sa) : 0;
+}
+static WINAPI DWORD GetFinalPathNameByHandleA(HANDLE h, char *buffer, DWORD size, DWORD flags) {
+    WCHAR wide[1024];
+    DWORD n = GetFinalPathNameByHandleW(h, wide, 1024, flags);
+    if (!n || n >= 1024) return n;
+    if (n + 1 > size) return n + 1;
+    for (DWORD i = 0; i <= n; i++) buffer[i] = (char)(wide[i] < 128 ? wide[i] : '?');
+    return n;
+}
+// The A forms of the text functions: through the W ones in the ANSI code page.
+static int to_wide(const char *src, int n, WCHAR *out, int cap) {
+    int (WINAPI *mb)(uint32_t, DWORD, const char *, int, WCHAR *, int) =
+        (int (WINAPI *)(uint32_t, DWORD, const char *, int, WCHAR *, int))vx_find_export("kernel32.dll", "MultiByteToWideChar");
+    return mb ? mb(0, 0, src, n, out, cap) : 0;
+}
+static WINAPI BOOL GetStringTypeA(DWORD lcid, DWORD type, const char *src, int n, uint16_t *out) {
+    (void)lcid;
+    if (!src || !out) { vx_set_last_error(87); return 0; }
+    if (n < 0) n = (int)strlen(src) + 1;
+    WCHAR *w = malloc(((size_t)n + 1) * sizeof *w);
+    int k = w ? to_wide(src, n, w, n + 1) : 0;
+    BOOL (WINAPI *get)(DWORD, const WCHAR *, int, uint16_t *) =
+        (BOOL (WINAPI *)(DWORD, const WCHAR *, int, uint16_t *))vx_find_export("kernel32.dll", "GetStringTypeW");
+    BOOL r = k && get ? get(type, w, k, out) : 0;
+    free(w);
+    return r;
+}
+static WINAPI int LCMapStringA(DWORD lcid, DWORD flags, const char *src, int n, char *dst, int cap) {
+    if (!src) { vx_set_last_error(87); return 0; }
+    if (n < 0) n = (int)strlen(src) + 1;
+    if (flags & 0x400) {                                           // LCMAP_SORTKEY: the bytes, then a terminating 0
+        if (!cap) return n + 1;
+        if (cap < n + 1) { vx_set_last_error(122); return 0; }
+        memcpy(dst, src, (size_t)n); dst[n] = 0;
+        return n + 1;
+    }
+    WCHAR *w = malloc(((size_t)n + 1) * sizeof *w), *m = malloc(((size_t)n * 2 + 2) * sizeof *m);
+    int k = w && m ? to_wide(src, n, w, n + 1) : 0;
+    int (WINAPI *map)(DWORD, DWORD, const WCHAR *, int, WCHAR *, int) =
+        (int (WINAPI *)(DWORD, DWORD, const WCHAR *, int, WCHAR *, int))vx_find_export("kernel32.dll", "LCMapStringW");
+    int r = k && map ? map(lcid, flags, w, k, m, n * 2 + 1) : 0;
+    int (WINAPI *wc)(uint32_t, DWORD, const WCHAR *, int, char *, int, const char *, BOOL *) =
+        (int (WINAPI *)(uint32_t, DWORD, const WCHAR *, int, char *, int, const char *, BOOL *))vx_find_export("kernel32.dll", "WideCharToMultiByte");
+    int out = r && wc ? wc(0, 0, m, r, cap ? dst : NULL, cap, NULL, NULL) : 0;
+    free(w); free(m);
+    return out;
+}
+static WINAPI void DisableProcessWindowsGhosting(void) { }
+static WINAPI LONG RegDeleteKeyValueA(HANDLE key, const char *sub, const char *value) {
+    WCHAR ws[512], wv[512];
+    if ((sub && !to_wide(sub, -1, ws, 512)) || (value && !to_wide(value, -1, wv, 512))) return 87;
+    LONG (WINAPI *del)(HANDLE, const WCHAR *, const WCHAR *) = (LONG (WINAPI *)(HANDLE, const WCHAR *, const WCHAR *))vx_find_export("advapi32.dll", "RegDeleteKeyValueW");
+    return del ? del(key, sub ? ws : NULL, value ? wv : NULL) : 2;
+}
+static WINAPI BOOL CryptStringToBinaryW(const WCHAR *s, DWORD len, DWORD flags, uint8_t *out, DWORD *cap, DWORD *skip, DWORD *used) {
+    if (!s) { vx_set_last_error(87); return 0; }
+    if (!len) while (s[len]) len++;
+    char *a = malloc((size_t)len + 1);
+    if (!a) return 0;
+    for (DWORD i = 0; i < len; i++) a[i] = (char)(s[i] < 128 ? s[i] : '?');
+    a[len] = 0;
+    BOOL (WINAPI *dec)(const char *, DWORD, DWORD, uint8_t *, DWORD *, DWORD *, DWORD *) =
+        (BOOL (WINAPI *)(const char *, DWORD, DWORD, uint8_t *, DWORD *, DWORD *, DWORD *))vx_find_export("crypt32.dll", "CryptStringToBinaryA");
+    BOOL r = dec ? dec(a, len, flags, out, cap, skip, used) : 0;
+    free(a);
+    return r;
+}
+static WINAPI BOOL InternetGetConnectedState(DWORD *flags, DWORD reserved) {
+    (void)reserved;
+    if (flags) *flags = 0x02;                                      // INTERNET_CONNECTION_LAN
+    return 1;
+}
+static WINAPI int32_t DXGIGetDebugInterface1(uint32_t flags, const void *iid, void **out) {
+    (void)flags; (void)iid;
+    if (out) *out = NULL;
+    return (int32_t)0x80004002;                                     // E_NOINTERFACE: no DXGI debug layer
+}
+// Activation contexts (side-by-side manifests): there are none here; queries about the default one answer as for a
+// program whose manifest asks for nothing (no context, run level unspecified, no compatibility entries).
+static WINAPI BOOL QueryActCtxW(DWORD flags, HANDLE ctx, void *sub, DWORD info_class, void *buffer, size_t size, size_t *written) {
+    (void)flags; (void)ctx; (void)sub;
+    size_t need = info_class == 1 ? 16 :                           // ActivationContextBasicInformation
+                  info_class == 2 ? 72 :                           // ActivationContextDetailedInformation
+                  info_class == 7 ? 12 :                           // RunlevelInformationInActivationContext
+                  info_class == 8 ? 8 : 0;                         // CompatibilityInformationInActivationContext
+    if (!need) { vx_set_last_error(87); return 0; }
+    if (written) *written = need;
+    if (!buffer || size < need) { vx_set_last_error(122); return 0; }
+    memset(buffer, 0, need);
+    return 1;
+}
+// Making and activating one gives a context that changes nothing (its manifest's DLL redirections and
+// dependencies are not applied: the DLLs are found as without it).
+static WINAPI HANDLE CreateActCtxW(const void *actctx) {
+    if (!actctx) { vx_set_last_error(87); return (HANDLE)(intptr_t)-1; }
+    static char context;
+    return (HANDLE)&context;
+}
+static WINAPI HANDLE CreateActCtxA(const void *actctx) { return CreateActCtxW(actctx); }
+static WINAPI BOOL ActivateActCtx(HANDLE ctx, uintptr_t *cookie) { (void)ctx; if (cookie) *cookie = 1; return 1; }
+static WINAPI BOOL DeactivateActCtx(DWORD flags, uintptr_t cookie) { (void)flags; (void)cookie; return 1; }
+static WINAPI void ReleaseActCtx(HANDLE ctx) { (void)ctx; }
+static WINAPI void AddRefActCtx(HANDLE ctx) { (void)ctx; }
+static WINAPI BOOL GetCurrentActCtx(HANDLE *ctx) { if (ctx) *ctx = NULL; return 1; }
+static WINAPI BOOL FindActCtxSectionStringW(DWORD flags, const void *guid, DWORD section, const WCHAR *name, void *data) {
+    (void)flags; (void)guid; (void)section; (void)name; (void)data;
+    vx_set_last_error(14007);                                      // ERROR_SXS_KEY_NOT_FOUND
+    return 0;
+}
+static const vx_export kernel32_actctx[] = {
+    VX_EXPORT(CreateActCtxW), VX_EXPORT(CreateActCtxA), VX_EXPORT(ActivateActCtx), VX_EXPORT(DeactivateActCtx),
+    VX_EXPORT(ReleaseActCtx), VX_EXPORT(AddRefActCtx), VX_EXPORT(GetCurrentActCtx), VX_EXPORT(FindActCtxSectionStringW),
+};
+// ---- what MFC (mfc140u.dll, loaded by Razer Chroma's CChromaEditorLibrary64) needs to start ------------------------
+// Global and local memory handles are the blocks' own addresses here (GlobalAlloc), so these are about pointers.
+static WINAPI void *GlobalHandle(const void *p) { return (void *)p; }
+static WINAPI void *GlobalReAlloc(void *p, size_t n, unsigned flags) {
+    if (flags & 0x80) return p;                                    // GMEM_MODIFY: only the flags
+    return realloc(p, n ? n : 1);                                  // (as LocalReAlloc)
+}
+static WINAPI unsigned GlobalFlags(void *p) { (void)p; return 0; }
+static WINAPI void *LocalLock(void *p) { return p; }
+static WINAPI BOOL LocalUnlock(void *p) { (void)p; vx_set_last_error(0); return 0; }   // (not locked any more)
+static WINAPI char *lstrcpyA(char *a, const char *b) { memmove(a, b, strlen(b) + 1); return a; }
+static WINAPI uint16_t GetSystemDefaultUILanguage(void) { return 0x409; }
+static WINAPI BOOL GetStringTypeExW(DWORD lcid, DWORD type, const WCHAR *src, int n, uint16_t *out) {
+    (void)lcid;
+    BOOL (WINAPI *get)(DWORD, const WCHAR *, int, uint16_t *) =
+        (BOOL (WINAPI *)(DWORD, const WCHAR *, int, uint16_t *))vx_find_export("kernel32.dll", "GetStringTypeW");
+    return get ? get(type, src, n, out) : 0;
+}
+static WINAPI BOOL WritePrivateProfileStringW(const WCHAR *app, const WCHAR *key, const WCHAR *value, const WCHAR *file) {
+    (void)app; (void)key; (void)value; (void)file;
+    return 1;                                                      // (not kept: no .ini files written for programs here)
+}
+// Atoms: one table for the process (global and local alike), strings compared without case, 0xC000 on; integer
+// atoms (#n or MAKEINTATOM below 0xC000) are themselves.
+static pthread_mutex_t atom_lock = PTHREAD_MUTEX_INITIALIZER;
+static WCHAR *atom_names[0x3fff];
+static uint32_t atom_refs[0x3fff];
+static int atom_eq(const WCHAR *a, const WCHAR *b) {
+    for (;; a++, b++) {
+        WCHAR x = *a >= 'a' && *a <= 'z' ? *a - 32 : *a, y = *b >= 'a' && *b <= 'z' ? *b - 32 : *b;
+        if (x != y) return 0;
+        if (!x) return 1;
+    }
+}
+static uint16_t atom_find(const WCHAR *name, int add) {
+    if ((uintptr_t)name < 0x10000) return (uint16_t)(uintptr_t)name;
+    if (name[0] == '#') { unsigned v = 0; for (const WCHAR *p = name + 1; *p >= '0' && *p <= '9'; p++) v = v * 10 + (*p - '0'); return v && v < 0xC000 ? (uint16_t)v : 0; }
+    pthread_mutex_lock(&atom_lock);
+    int free_slot = -1;
+    for (int i = 0; i < 0x3fff; i++) {
+        if (!atom_names[i]) { if (free_slot < 0) free_slot = i; continue; }
+        if (atom_eq(atom_names[i], name)) { if (add) atom_refs[i]++; pthread_mutex_unlock(&atom_lock); return (uint16_t)(0xC000 + i); }
+    }
+    uint16_t r = 0;
+    if (add && free_slot >= 0) {
+        size_t n = 0;
+        while (name[n]) n++;
+        atom_names[free_slot] = malloc((n + 1) * sizeof(WCHAR));
+        if (atom_names[free_slot]) { memcpy(atom_names[free_slot], name, (n + 1) * sizeof(WCHAR)); atom_refs[free_slot] = 1; r = (uint16_t)(0xC000 + free_slot); }
+    }
+    pthread_mutex_unlock(&atom_lock);
+    if (!r) vx_set_last_error(2);
+    return r;
+}
+static WINAPI uint16_t GlobalAddAtomW(const WCHAR *name) { return atom_find(name, 1); }
+static WINAPI uint16_t GlobalFindAtomW(const WCHAR *name) { return atom_find(name, 0); }
+static WINAPI uint16_t GlobalDeleteAtom(uint16_t atom) {
+    if (atom >= 0xC000 && atom < 0xC000 + 0x3fff) {
+        pthread_mutex_lock(&atom_lock);
+        int i = atom - 0xC000;
+        if (atom_names[i] && !--atom_refs[i]) { free(atom_names[i]); atom_names[i] = NULL; }
+        pthread_mutex_unlock(&atom_lock);
+    }
+    return 0;
+}
+static WINAPI unsigned GlobalGetAtomNameW(uint16_t atom, WCHAR *out, int cap) {
+    if (!out || cap <= 0) { vx_set_last_error(87); return 0; }
+    WCHAR tmp[16];
+    const WCHAR *name = NULL;
+    if (atom < 0xC000) { char a[16]; snprintf(a, sizeof a, "#%u", atom); for (int k = 0; ; k++) { tmp[k] = (WCHAR)a[k]; if (!a[k]) break; } name = tmp; }
+    pthread_mutex_lock(&atom_lock);
+    if (!name && atom - 0xC000 < 0x3fff) name = atom_names[atom - 0xC000];
+    unsigned n = 0;
+    if (name) { while (name[n] && (int)n + 1 < cap) { out[n] = name[n]; n++; } out[n] = 0; }
+    pthread_mutex_unlock(&atom_lock);
+    if (!name) vx_set_last_error(6);
+    return n;
+}
+static const vx_export kernel32_mfc[] = {
+    VX_EXPORT(GlobalHandle), VX_EXPORT(GlobalReAlloc), VX_EXPORT(GlobalFlags), VX_EXPORT(LocalLock), VX_EXPORT(LocalUnlock),
+    VX_EXPORT(lstrcpyA), VX_EXPORT(GetSystemDefaultUILanguage), VX_EXPORT(GetStringTypeExW), VX_EXPORT(WritePrivateProfileStringW),
+    VX_EXPORT(GlobalAddAtomW), VX_EXPORT(GlobalFindAtomW), VX_EXPORT(GlobalDeleteAtom), VX_EXPORT(GlobalGetAtomNameW),
+    { "AddAtomW", (void *)GlobalAddAtomW }, { "FindAtomW", (void *)GlobalFindAtomW }, { "DeleteAtom", (void *)GlobalDeleteAtom },
+    { "GetAtomNameW", (void *)GlobalGetAtomNameW },
+};
+static const vx_export kernel32_cp[] = {
+    VX_EXPORT(SetThreadStackGuarantee), VX_EXPORT(GetPhysicallyInstalledSystemMemory), VX_EXPORT(RaiseFailFastException),
+    VX_EXPORT(GetSystemCpuSetInformation), VX_EXPORT(SetThreadSelectedCpuSets), VX_EXPORT(GetThreadUILanguage),
+    VX_EXPORT(GetThreadErrorMode), VX_EXPORT(CreateDirectoryExW), VX_EXPORT(GetFinalPathNameByHandleA),
+    VX_EXPORT(GetStringTypeA), VX_EXPORT(LCMapStringA), VX_EXPORT(QueryActCtxW),
+};
+static const vx_export user32_cp[] = { VX_EXPORT(DisableProcessWindowsGhosting) };
+static const vx_export advapi32_cp[] = { VX_EXPORT(RegDeleteKeyValueA) };
+static const vx_export crypt32_cp[] = { VX_EXPORT(CryptStringToBinaryW) };
+static const vx_export wininet_cp[] = { VX_EXPORT(InternetGetConnectedState) };
+static const vx_export dxgi_cp[] = { VX_EXPORT(DXGIGetDebugInterface1) };
+
 static const vx_export ntdll_ed[] = { VX_EXPORT(NtSetInformationThread) };
 static const vx_export kernel32_ed[] = { VX_EXPORT(GetVolumeNameForVolumeMountPointA), VX_EXPORT(GetVolumeNameForVolumeMountPointW), VX_EXPORT(GetTempPath2W), VX_EXPORT(VirtualAlloc2), VX_EXPORT(GetProcessMitigationPolicy), VX_EXPORT(SetProcessMitigationPolicy), VX_EXPORT(NormalizeString), VX_EXPORT(SearchPathW), VX_EXPORT(VirtualUnlock), VX_EXPORT(GetFinalPathNameByHandleW) };
 static const vx_export user32_ed[] = { VX_EXPORT(ToAsciiEx), VX_EXPORT(UnloadKeyboardLayout), VX_EXPORT(RegisterHotKey), VX_EXPORT(UnregisterHotKey) };
@@ -666,6 +938,7 @@ static const vx_export ucrtbase[] = {
     { "scalblnf", (void *)ms_scalblnf }, { "_filelengthi64", (void *)ms_filelengthi64 }, { "__stdio_common_vsprintf_p", (void *)ms_vsprintf_p },
     { "freopen", (void *)ms_freopen }, { "__initialize_lconv_for_unsigned_char", (void *)ms_initialize_lconv },
     { "_msize", (void *)ms_msize }, { "_expand", (void *)ms_expand }, { "_itoa_s", (void *)ms_itoa_s },
+    { "_recalloc", (void *)ms_recalloc },
 };
 static const vx_export user32[] = { VX_EXPORT(CreateDialogParamW), VX_EXPORT(SetDlgItemTextW), VX_EXPORT(RemoveMenu), VX_EXPORT(LoadStringW) };
 static const vx_export winmm[] = { VX_EXPORT(waveInStop) };
@@ -806,7 +1079,22 @@ static WINAPI void *PFXImportCertStore(void *blob, const WCHAR *password, DWORD 
 }
 static const vx_export kernel32_nms[] = { VX_EXPORT(GetProcessIdOfThread) };
 static const vx_export user32_nms[] = { VX_EXPORT(VkKeyScanA), VX_EXPORT(ToAscii) };
-static const vx_export shell32_nms[] = { VX_EXPORT(DragQueryPoint), VX_EXPORT(SHCreateDirectoryExW), VX_EXPORT(SHCreateDirectoryExA) };
+// win.ini (GetProfile*): not there; the defaults, as on a Windows whose win.ini does not have the key.
+static WINAPI unsigned GetProfileIntW(const WCHAR *app, const WCHAR *key, int def) { (void)app; (void)key; return (unsigned)def; }
+static WINAPI unsigned GetProfileIntA(const char *app, const char *key, int def) { (void)app; (void)key; return (unsigned)def; }
+static WINAPI DWORD GetProfileStringW(const WCHAR *app, const WCHAR *key, const WCHAR *def, WCHAR *out, DWORD cap) {
+    (void)app; (void)key;
+    if (!out || !cap) return 0;
+    DWORD n = 0;
+    while (def && def[n] && n + 1 < cap) { out[n] = def[n]; n++; }
+    out[n] = 0;
+    return n;
+}
+// SHCreateDirectory (shell32 #165): SHCreateDirectoryExW without security attributes.
+static WINAPI int SHCreateDirectory(void *wnd, const WCHAR *path) { return SHCreateDirectoryExW(wnd, path, NULL); }
+static const vx_export shell32_nms[] = { VX_EXPORT(DragQueryPoint), VX_EXPORT(SHCreateDirectoryExW), VX_EXPORT(SHCreateDirectoryExA),
+                                         VX_EXPORT(SHCreateDirectory), { "#165", (void *)SHCreateDirectory } };
+static const vx_export kernel32_profile[] = { VX_EXPORT(GetProfileIntW), VX_EXPORT(GetProfileIntA), VX_EXPORT(GetProfileStringW) };
 static const vx_export shlwapi_nms[] = { VX_EXPORT(PathAppendW), VX_EXPORT(PathStripToRootW), VX_EXPORT(PathMakePrettyW) };
 static const vx_export advapi32_nms[] = { VX_EXPORT(IsTextUnicode) };
 static const vx_export crypt32_nms[] = { VX_EXPORT(PFXImportCertStore) };
@@ -918,6 +1206,9 @@ void vx_extras_init(void) {
     MORE("iphlpapi.dll", iphlpapi_ed); MORE("setupapi.dll", setupapi_ed); MORE("dbghelp.dll", dbghelp_ed); MORE("normaliz.dll", normaliz_ed);
     MORE("ws2_32.dll", ws2_32_ed); MORE("ws2_32.dll", ws2_32_proto); MORE("advapi32.dll", advapi32_ed); MORE("crypt32.dll", crypt32_ed);
     MORE("secur32.dll", secur32_ed); MORE("wldap32.dll", wldap32_ed); MORE("ntdll.dll", ntdll_ed);
+    MORE("kernel32.dll", kernel32_cp); MORE("kernelbase.dll", kernel32_cp); MORE("kernel32.dll", kernel32_profile);
+    MORE("kernel32.dll", kernel32_actctx); MORE("kernelbase.dll", kernel32_actctx); MORE("kernel32.dll", kernel32_mfc); MORE("user32.dll", user32_cp);
+    MORE("advapi32.dll", advapi32_cp); MORE("crypt32.dll", crypt32_cp); MORE("wininet.dll", wininet_cp); MORE("dxgi.dll", dxgi_cp);
 #undef MORE
 }
 

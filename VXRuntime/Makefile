@@ -10,6 +10,7 @@ SRC    += src/filestate.c
 SRC    += src/inherit.c
 SRC    += src/icons.c src/menus.m src/tray.m
 SRC    += src/present.c
+SRC    += src/stereo.m
 SRC    += src/shlock.c
 SRC    += src/tcptable.c
 SRC    += src/winprops.c
@@ -17,10 +18,12 @@ SRC    += src/a11y.c
 SRC    += src/mfplat.c
 SRC    += src/imagehlp.c src/spellcheck.c src/ime.c src/clipboard.m
 SRC    += src/shader_progress.m src/shader_cache.m
+SRC    += src/npu_interp.m src/warp_core.m
+SRC    += src/upscale_core.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
-all: build/vxrt tests
+all: build/vxrt build/vxrt-npu tests
 
 # Keep test shaders out of the player's cache, including when a cache override was inherited.
 check runtime-tests shader-progress-check:
@@ -73,17 +76,45 @@ shader-progress-check-run:
 	VXRT_SHADER_PROGRESS_FILE=$(abspath build/draw-shader-progress.json) VXRT_SHADER_PROGRESS_EXE=draw.exe $(VXRT) build/draw.exe
 	$(VXRT) build/compute.exe
 
-build/vxrt: $(SRC) src/vx.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h src/aes_gcm.h
+build/vxrt: $(SRC) src/vx.h src/npu_interp.h src/warp_core.h src/npu_proto.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/stereo.h src/upscale_core.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h src/aes_gcm.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Ithird_party/vulkan -fobjc-arc -o $@.tmp $(SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -Wl,-pagezero_size,0x10000 -licucore -lz && mv -f $@.tmp $@
+	$(CC) $(CFLAGS) -Ithird_party/vulkan -fobjc-arc -o $@.tmp $(SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework MetalFX -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -Wl,-pagezero_size,0x10000 -licucore -lz && mv -f $@.tmp $@
+
+# NPU mode's frame interpolator (src/npu_interp.m, VXRT_NPU_INTERP=1): a native arm64 process, since VideoToolbox's
+# frame interpolation is unsupported under Rosetta.
+build/vxrt-npu: tools/vxrt_npu.m src/npu_proto.h
+	@mkdir -p build
+	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0 -fobjc-arc -o $@ tools/vxrt_npu.m -framework Foundation -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework IOSurface
 
 # The ARM64 build (phase 4, TRANSLATOR.md): the same runtime as ARM64 code, the program run by the translator's
 # engine in the process. Thunks for every ms_abi function come from the sources' C signatures (tools/vx_thunks.py).
-ARM64_SRC = $(filter-out src/context.S,$(SRC)) src/arm64.c src/context_arm64.S translator/xlat.c translator/x87.c translator/x86dec.c translator/engine.c translator/vcpu.c
+ARM64_SRC = $(filter-out src/context.S,$(SRC)) src/arm64.c src/context_arm64.S translator/xlat.c translator/x87.c translator/x86dec.c translator/engine.c translator/vcpu.c translator/aot.c
 build/thunks/stamp: $(filter %.c %.m,$(SRC)) src/vx.h tools/vx_thunks.py tools/vx_abi_scan.py
 	@mkdir -p build/thunks
 	python3 tools/vx_thunks.py build/thunks $(filter %.c %.m,$(SRC))
 	@touch $@
+# The static recompiler's tool (RECOMP.md, tools/vxrt_aot.c): native ARM64, built from the translator's sources.
+AOT_TOOL_SRC = tools/vxrt_aot.c translator/xlat.c translator/x87.c translator/x86dec.c
+build/vxrt-aot: $(AOT_TOOL_SRC) translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/x87.h translator/x86dec.h translator/aot.h translator/cpuid_table.h
+	@mkdir -p build
+	$(CC) -arch arm64 -O2 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0 -Itranslator -o $@ $(AOT_TOOL_SRC)
+# Stage 1 (RECOMP.md): tests/recomp/suite.cpp for the MSVC ABI (clang, MinGW's ld, no C runtime), recompiled by route B
+# into build/aot and run with no fallback to the translator, its output compared with Rosetta's: `make aot-suite`.
+build/recomp/suite.exe: tests/recomp/suite.cpp tests/recomp/suite_d3d.c tests/recomp/vcruntime140.def tests/msvc/start.c
+	@mkdir -p build/recomp
+	x86_64-w64-mingw32-dlltool -d tests/recomp/vcruntime140.def -l build/recomp/libvcruntime140.a -m i386:x86-64
+	clang -target x86_64-pc-windows-msvc -O2 -fexceptions -fcxx-exceptions -fms-extensions -c tests/recomp/suite.cpp -o build/recomp/suite.obj
+	clang --target=x86_64-w64-mingw32 -O2 -isystem $(shell $(MINGW) -print-sysroot)/x86_64-w64-mingw32/include -c tests/recomp/suite_d3d.c -o build/recomp/suite_d3d.o
+	clang -target x86_64-pc-windows-msvc -O1 -c tests/msvc/start.c -o build/recomp/start.obj
+	$(MINGW) -nostdlib -e mainCRTStartup -o $@ build/recomp/suite.obj build/recomp/suite_d3d.o build/recomp/start.obj -Lbuild/recomp -lvcruntime140 -lkernel32 -lucrtbase -ld3d11
+aot-suite: build/vxrt build/vxrt-arm64 build/vxrt-aot build/recomp/suite.exe
+	@mkdir -p build/aot
+	build/vxrt-aot gen build/recomp/suite.exe build/recomp/suite_b.s
+	clang -arch arm64 -dynamiclib -o build/aot/$$(build/vxrt-aot name build/recomp/suite.exe) build/recomp/suite_b.s
+	tools/aot_compare.sh build/recomp/suite.exe
+	@# the same split into parts of 20 KB (a large image's dylibs, branching to each other through veneers)
+	VXRT_AOT_PART_MB=0.02 tools/aot_build.sh build/recomp/suite.exe build/aotp > /dev/null
+	AOT_DIR=build/aotp tools/aot_compare.sh build/recomp/suite.exe
 # Code that runs inside the vCPU guest (translator/guest.c): no calls, no globals, no stack protector.
 GUEST_CFLAGS = -arch arm64 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-stack-check -mmacosx-version-min=14.0 -Itranslator
 build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator/xvheap.h
@@ -92,8 +123,8 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
-	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore -lz
+build/vxrt-arm64: $(ARM64_SRC) src/npu_interp.h src/npu_proto.h build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/stereo.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h translator/aot.h
+	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework MetalFX -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore -lz
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
@@ -858,7 +889,7 @@ build/vulkan_features.exe: tests/vulkan_features.c build/libvulkan-1.a third_par
 build/vulkan_win.exe: tests/vulkan_win.c src/vx_vulkan.h build/libvulkan-1.a build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(MINGW) -O1 -Wall -o $@ $< -Lbuild -lvulkan-1
 
-build/d3d12.exe: tests/d3d12.c tests/shaders12/sum_cs.dxil tests/shaders12/tri_vs.dxil tests/shaders12/tri_ps.dxil tests/shaders12/cmp_ps.dxil tests/shaders12/gather_ps.dxil tests/shaders12/gather_cmp_ps.dxil tests/shaders12/dim_ps.dxil tests/shaders12/dim1da_ps.dxil tests/shaders12/typed_buffer_cs.dxil tests/shaders12/typed_sint_buffer_cs.dxil tests/shaders12/integer_minmax_buffer_cs.dxil tests/shaders12/integer_mad_buffer_cs.dxil tests/shaders12/float_mad_buffer_cs.dxil tests/shaders12/float_minmax_buffer_cs.dxil tests/shaders12/signed_conversion_cs.dxil tests/shaders12/typed_float_buffer_cs.dxil tests/shaders12/texture_dimensions_cs.dxil tests/shaders12/texture_dimensions_msaa_cs.dxil tests/shaders12/texture_load_msaa_cs.dxil tests/shaders12/atomic_resources_cs.dxil tests/shaders12/texload_bounds_cs.dxil tests/shaders12/texload_array_bounds_cs.dxil tests/shaders12/texload_sint_bounds_cs.dxil tests/shaders12/texload_array_sint_bounds_cs.dxil tests/shaders12/texload_float_bounds_cs.dxil tests/shaders12/wave_ops_cs.dxil tests/shaders12/wave_ops_partial_cs.dxil
+build/d3d12.exe: tests/d3d12.c tests/shaders12/sum_cs.dxil tests/shaders12/tri_vs.dxil tests/shaders12/tri_ps.dxil tests/shaders12/cmp_ps.dxil tests/shaders12/gather_ps.dxil tests/shaders12/gather_cmp_ps.dxil tests/shaders12/dim_ps.dxil tests/shaders12/dim1da_ps.dxil tests/shaders12/typed_buffer_cs.dxil tests/shaders12/typed_sint_buffer_cs.dxil tests/shaders12/integer_minmax_buffer_cs.dxil tests/shaders12/integer_mad_buffer_cs.dxil tests/shaders12/float_mad_buffer_cs.dxil tests/shaders12/float_minmax_buffer_cs.dxil tests/shaders12/signed_conversion_cs.dxil tests/shaders12/typed_float_buffer_cs.dxil tests/shaders12/texture_dimensions_cs.dxil tests/shaders12/texture_dimensions_msaa_cs.dxil tests/shaders12/texture_load_msaa_cs.dxil tests/shaders12/atomic_resources_cs.dxil tests/shaders12/texload_bounds_cs.dxil tests/shaders12/texload_array_bounds_cs.dxil tests/shaders12/texload_sint_bounds_cs.dxil tests/shaders12/texload_array_sint_bounds_cs.dxil tests/shaders12/texload_float_bounds_cs.dxil tests/shaders12/wave_ops_cs.dxil tests/shaders12/wave_ops_partial_cs.dxil tests/shaders12/half_ops_cs.dxil
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi -lm
 
@@ -866,7 +897,7 @@ build/d3d12_engine.exe: tests/d3d12_engine.c tests/shaders12/tri_vs.dxil tests/s
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi
 
-build/d3d12_fxc.exe: tests/d3d12_fxc.c tests/shaders/tex_vs.dxbc tests/shaders/tex_ps.dxbc tests/shaders/sum_cs.dxbc tests/shaders/append_cs.dxbc tests/shaders/color_vs.dxbc tests/shaders/quad_gs.dxbc tests/shaders/color_ps.dxbc
+build/d3d12_fxc.exe: tests/d3d12_fxc.c tests/shaders12/tess_vs.dxil tests/shaders12/tess_hs.dxil tests/shaders12/tess_ds.dxil tests/shaders12/passcolor_vs.dxil tests/shaders12/quad_gs.dxil tests/shaders12/passcolor_ps.dxil tests/shaders/tex_vs.dxbc tests/shaders/tex_ps.dxbc tests/shaders/sum_cs.dxbc tests/shaders/append_cs.dxbc tests/shaders/color_vs.dxbc tests/shaders/quad_gs.dxbc tests/shaders/color_ps.dxbc
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d12
 
@@ -971,7 +1002,7 @@ shaders: build/vxrt build/hlslc.exe
 # beside SteamVR's vrwebhelper), with dxcompiler's own disassembly of each as the reference tools/dxil_check.py reads
 # src/dxil.c's reading against. tests/shaders12/*.dxil and *.dis.txt are kept in the repository; regenerate with
 #   make shaders12 DXCOMPILER='Z:\path\to\dxcompiler.dll'
-SHADERS12 = color_ps:ps_6_0 tex_ps:ps_6_0 sum_cs:cs_6_0 color_vs:vs_6_0 bindless_ps:ps_6_6 tri_vs:vs_6_0 tri_ps:ps_6_0 texq_vs:vs_6_0 texq_ps:ps_6_0 cmp_ps:ps_6_0 gather_ps:ps_6_0 gather_cmp_ps:ps_6_0 dim_ps:ps_6_0 dim1da_ps:ps_6_0 vector_math_ps:ps_6_0 samplegrad_ps:ps_6_0 atomic_resources_cs:cs_6_0 texload_bounds_cs:cs_6_0 texload_array_bounds_cs:cs_6_0 texload_sint_bounds_cs:cs_6_0 texload_array_sint_bounds_cs:cs_6_0 texload_float_bounds_cs:cs_6_0 signed_conversion_cs:cs_6_0 typed_sint_buffer_cs:cs_6_0 typed_float_buffer_cs:cs_6_0 texture_dimensions_cs:cs_6_0 texture_dimensions_msaa_cs:cs_6_0 texture_load_msaa_cs:cs_6_0 integer_minmax_buffer_cs:cs_6_0 integer_mad_buffer_cs:cs_6_0 float_mad_buffer_cs:cs_6_0 float_minmax_buffer_cs:cs_6_0 wave_ops_cs:cs_6_5 wave_ops_partial_cs:cs_6_5
+SHADERS12 = color_ps:ps_6_0 tex_ps:ps_6_0 sum_cs:cs_6_0 color_vs:vs_6_0 bindless_ps:ps_6_6 tri_vs:vs_6_0 tri_ps:ps_6_0 texq_vs:vs_6_0 texq_ps:ps_6_0 cmp_ps:ps_6_0 gather_ps:ps_6_0 gather_cmp_ps:ps_6_0 dim_ps:ps_6_0 dim1da_ps:ps_6_0 vector_math_ps:ps_6_0 samplegrad_ps:ps_6_0 atomic_resources_cs:cs_6_0 texload_bounds_cs:cs_6_0 texload_array_bounds_cs:cs_6_0 texload_sint_bounds_cs:cs_6_0 texload_array_sint_bounds_cs:cs_6_0 texload_float_bounds_cs:cs_6_0 signed_conversion_cs:cs_6_0 typed_sint_buffer_cs:cs_6_0 typed_float_buffer_cs:cs_6_0 texture_dimensions_cs:cs_6_0 texture_dimensions_msaa_cs:cs_6_0 texture_load_msaa_cs:cs_6_0 integer_minmax_buffer_cs:cs_6_0 integer_mad_buffer_cs:cs_6_0 float_mad_buffer_cs:cs_6_0 float_minmax_buffer_cs:cs_6_0 wave_ops_cs:cs_6_5 wave_ops_partial_cs:cs_6_5 half_ops_cs:cs_6_2+16 sm66_misc_ps:ps_6_6+16 cmp_level_zero_cs:cs_6_0 passcolor_vs:vs_6_0 quad_gs:gs_6_0 passcolor_ps:ps_6_0 minprec_ps:ps_6_0 tess_vs:vs_6_0 tess_hs:hs_6_0 tess_ds:ds_6_0
 shaders12: build/vxrt build/dxc.exe
 	@for s in $(SHADERS12); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/dxc.exe '$(DXCOMPILER)' tests/shaders12/$$n.hlsl main $$p tests/shaders12/$$n.h $$n || exit 1; \
@@ -1199,6 +1230,34 @@ build/pe_test: src/pe.c src/pe.h tests/pe.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ src/pe.c tests/pe.c
 
+# stereo.m's DIBR pass on the GPU (tests/stereo.m): a made-up scene, or a dumped game frame
+build/stereo_test: src/stereo.m src/stereo.h tests/stereo.m
+	@mkdir -p build
+	$(HOSTCC) -fobjc-arc -Isrc -o $@ tests/stereo.m src/stereo.m -framework Foundation -framework Metal -framework CoreGraphics -framework ImageIO
+
+# The warp core (src/warp_core.m: prediction from motion vectors, reprojection, stereo eyes in one warp) on synthetic
+# frames; and, when the visionOS SDK is installed, the core compiled for visionOS (it must stay Metal + Foundation).
+build/warp_core_test: src/warp_core.m src/warp_core.h tests/warp_core_test.m
+	@mkdir -p build
+	$(HOSTCC) -arch arm64 -O1 -fobjc-arc -Isrc -o $@ tests/warp_core_test.m src/warp_core.m -framework Foundation -framework Metal
+# The upscale core (src/upscale_core.m: MetalFX in place of FSR2) on synthetic frames shaped as Cyberpunk's.
+build/upscale_core_test: src/upscale_core.m src/upscale_core.h tests/upscale_core_test.m
+	@mkdir -p build
+	$(HOSTCC) -arch arm64 -O1 -fobjc-arc -Isrc -o $@ tests/upscale_core_test.m src/upscale_core.m -framework Foundation -framework Metal -framework MetalFX
+check: build/warp_core_test build/upscale_core_test xros-check
+xros-check: src/warp_core.m src/warp_core.h src/upscale_core.m src/upscale_core.h
+	@if xcrun --sdk xros --show-sdk-path >/dev/null 2>&1; then \
+	  mkdir -p build && xcrun -sdk xros clang -target arm64-apple-xros2.0 -fobjc-arc -Wall -Wextra -Werror -c -o build/warp_core_xros.o src/warp_core.m && \
+	  echo "xros-check: src/warp_core.m builds for visionOS ($$(xcrun --sdk xros --show-sdk-version))" && \
+	  xcrun -sdk xros clang -target arm64-apple-xros2.0 -fobjc-arc -Wall -Wextra -Werror -c -o build/upscale_core_xros.o src/upscale_core.m && \
+	  echo "xros-check: src/upscale_core.m builds for visionOS (spatial scaler only: the temporal one is API_UNAVAILABLE(visionos))"; \
+	else echo "xros-check: no visionOS SDK, skipped"; fi
+	@if xcrun --sdk xrsimulator --show-sdk-path >/dev/null 2>&1; then \
+	  mkdir -p build && xcrun -sdk xrsimulator clang -target arm64-apple-xros2.0-simulator -fobjc-arc -Wall -Wextra -Werror -c -o build/warp_core_xrsim.o src/warp_core.m && \
+	  echo "xros-check: src/warp_core.m builds for the visionOS simulator ($$(xcrun --sdk xrsimulator --show-sdk-version))"; \
+	else echo "xros-check: no visionOS simulator SDK, skipped"; fi
+.PHONY: xros-check
+
 build/aes_gcm_test: src/aes_gcm.c src/aes_gcm.h tests/aes_gcm.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ tests/aes_gcm.c src/aes_gcm.c
@@ -1236,6 +1295,7 @@ check: export VXRT_NO_ACTIVATE = 1
 check: build/iphlp_notify_test
 check: build/vulkan_spirv_atomic_compare_exchange_fixture.spv
 check: build/aes_gcm_test
+check: build/stereo_test
 check: build/vulkan_spirv_atomic_rmw_fixture.spv
 check: build/spirv_graphics_separate_image_sampler.air
 check: build/spirv_graphics_sampled_image_implicit.air
@@ -1353,6 +1413,9 @@ check-run:
 	build/d3d12_view_test
 	build/pe_test
 	build/aes_gcm_test
+	build/stereo_test
+	build/warp_core_test
+	build/upscale_core_test
 	build/dotnet_metadata_test
 	build/dotnet_eh_test | tail -1
 	build/dotnet_resources_test
@@ -1362,7 +1425,9 @@ check-run:
 	build/vulkan_test build/vulkan_spirv_fixture.spv build/vulkan_spirv_array_fixture.spv build/vulkan_spirv_uniform_fixture.spv build/vulkan_spirv_push_fixture.spv build/vulkan_spirv_storage_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampler_fixture.spv build/vulkan_spirv_separate_sampler_fixture.spv build/vulkan_spirv_high_texture_fixture.spv build/vulkan_spirv_combined_image_array_fixture.spv build/vulkan_spirv_separate_image_sampler_array_fixture.spv build/vulkan_spirv_dynamic_array_fixture.spv build/vulkan_spirv_dynamic_storage_image_array_fixture.spv build/vulkan_spirv_dynamic_sampled_image_array_fixture.spv build/vulkan_spirv_dynamic_separate_image_sampler_array_fixture.spv build/vulkan_spirv_dynamic_nonuniform_sampled_image_array_fixture.spv build/vulkan_spirv_image_size_fixture.spv build/vulkan_spirv_image_size_lod_fixture.spv build/vulkan_spirv_atomic_add_fixture.spv build/vulkan_spirv_atomic_compare_exchange_fixture.spv build/vulkan_spirv_atomic_rmw_fixture.spv build/vulkan_spirv_image_levels_fixture.spv build/vulkan_spirv_image_levels_storage_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv
 	build/vulkan_test build/vulkan_spirv_fixture.spv build/vulkan_spirv_array_fixture.spv build/vulkan_spirv_uniform_fixture.spv build/vulkan_spirv_push_fixture.spv build/vulkan_spirv_storage_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampler_fixture.spv build/vulkan_spirv_separate_sampler_fixture.spv build/vulkan_spirv_high_texture_fixture.spv build/vulkan_spirv_combined_image_array_fixture.spv build/vulkan_spirv_separate_image_sampler_array_fixture.spv build/vulkan_spirv_dynamic_array_fixture.spv build/vulkan_spirv_dynamic_storage_image_array_fixture.spv build/vulkan_spirv_dynamic_sampled_image_array_fixture.spv build/vulkan_spirv_dynamic_separate_image_sampler_array_fixture.spv build/vulkan_spirv_dynamic_nonuniform_sampled_image_array_fixture.spv build/vulkan_spirv_image_size_fixture.spv build/vulkan_spirv_image_size_lod_fixture.spv build/vulkan_spirv_atomic_add_fixture.spv build/vulkan_spirv_atomic_compare_exchange_fixture.spv build/vulkan_spirv_atomic_rmw_fixture.spv build/vulkan_spirv_image_levels_fixture.spv build/vulkan_spirv_image_levels_storage_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv
 	build/vulkan_test build/vulkan_spirv_fixture.spv build/vulkan_spirv_array_fixture.spv build/vulkan_spirv_uniform_fixture.spv build/vulkan_spirv_push_fixture.spv build/vulkan_spirv_storage_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampler_fixture.spv build/vulkan_spirv_separate_sampler_fixture.spv build/vulkan_spirv_high_texture_fixture.spv build/vulkan_spirv_combined_image_array_fixture.spv build/vulkan_spirv_separate_image_sampler_array_fixture.spv build/vulkan_spirv_dynamic_array_fixture.spv build/vulkan_spirv_dynamic_storage_image_array_fixture.spv build/vulkan_spirv_dynamic_sampled_image_array_fixture.spv build/vulkan_spirv_dynamic_separate_image_sampler_array_fixture.spv build/vulkan_spirv_dynamic_nonuniform_sampled_image_array_fixture.spv build/vulkan_spirv_image_size_fixture.spv build/vulkan_spirv_image_size_lod_fixture.spv build/vulkan_spirv_atomic_add_fixture.spv build/vulkan_spirv_atomic_compare_exchange_fixture.spv build/vulkan_spirv_atomic_rmw_fixture.spv build/vulkan_spirv_image_levels_fixture.spv build/vulkan_spirv_image_levels_storage_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv build/vulkan_spirv_uint_vertex_fixture.spv build/vulkan_spirv_sint_vertex_fixture.spv build/vulkan_spirv_graphics_sampled_image_fixture.spv build/vulkan_spirv_graphics_separate_image_sampler_fixture.spv build/vulkan_spirv_graphics_sampled_image_implicit_fixture.spv build/vulkan_spirv_graphics_separate_image_sampler_implicit_fixture.spv
-	build/dxil2msl $(filter-out tests/shaders12/samplegrad_ps.dxil,$(wildcard tests/shaders12/*.dxil))
+	build/dxil2msl $(filter-out tests/shaders12/samplegrad_ps.dxil tests/shaders12/quad_gs.dxil tests/shaders12/tess_hs.dxil tests/shaders12/tess_ds.dxil,$(wildcard tests/shaders12/*.dxil))
+	build/dxil2msl -vs tests/shaders12/tess_vs.dxil -hs tests/shaders12/tess_hs.dxil tests/shaders12/tess_ds.dxil
+	build/dxil2msl -vs tests/shaders12/passcolor_vs.dxil tests/shaders12/quad_gs.dxil
 	build/dxilrun tests/shaders12
 	build/difftest build/ref_x86 200
 	$(MAKE) runtime-tests VXRT=build/vxrt
@@ -1415,6 +1480,7 @@ runtime-tests-run:
 	$(VXRT) build/regwait.exe
 	$(VXRT) build/tp_callbacks.exe
 	$(VXRT) build/fiber_pool.exe
+	build/vxrt-npu --selftest 2>/dev/null   # NPU mode's interpolator and optical flow (skipped where unsupported)
 	$(VXRT) build/shellexec.exe
 	$(VXRT) build/file_io_ex.exe
 	$(VXRT) build/tcptable.exe

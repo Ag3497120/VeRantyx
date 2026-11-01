@@ -1,3 +1,4 @@
+#include <objc/runtime.h>
 // The AppKit side of windows: the macOS main thread runs NSApplication; Windows windows are NSWindows whose
 // content view shows the window's client-area bitmap and turns keyboard and mouse events into Windows messages.
 //
@@ -137,8 +138,25 @@ int vx_cocoa_title_height(void) {
 }
 @end
 @implementation VXNSWindow
-- (BOOL)canBecomeKeyWindow { return [super canBecomeKeyWindow] || (w && w->frameless); }
-- (BOOL)canBecomeMainWindow { return [super canBecomeMainWindow] || (w && w->frameless); }
+// A popup takes it too when it is a program's own window (a borderless game window, WS_POPUP filling the screen),
+// not a menu, tooltip or other window Windows never activates (WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, an owned popup).
+static int takes_keys(vx_window *w) {
+    if (!w) return 0;
+    if (w->frameless) return 1;
+    return (w->style & WS_POPUP) && !(w->style & WS_CHILD) && !(w->exstyle & (0x08000000 /* WS_EX_NOACTIVATE */ | 0x80 /* WS_EX_TOOLWINDOW */)) && !w->parent;
+}
+- (BOOL)canBecomeKeyWindow { return [super canBecomeKeyWindow] || takes_keys(w); }
+- (BOOL)canBecomeMainWindow { return [super canBecomeMainWindow] || takes_keys(w); }
+// (VXRT_TRACE_INPUT: the Mac's keys as the window gets them, with whom AppKit gives them to)
+- (void)sendEvent:(NSEvent *)e {
+    if ((e.type == NSEventTypeKeyDown || e.type == NSEventTypeKeyUp) && getenv("VXRT_TRACE_INPUT")) {
+        static volatile int n;
+        if (__sync_add_and_fetch(&n, 1) <= 30)
+            vx_log("input: Mac key %s code %u, key window %d, app active %d, first responder %s", e.type == NSEventTypeKeyDown ? "down" : "up",
+                   e.keyCode, self.isKeyWindow, NSApp.isActive, self.firstResponder ? object_getClassName(self.firstResponder) : "none");
+    }
+    [super sendEvent:e];
+}
 @end
 
 // ---- the view ------------------------------------------------------------------------------------------------------------
@@ -190,6 +208,18 @@ static WPARAM mouse_keys(NSEvent *e) {
     return (POINT){ o.x + (LONG)p.x, o.y + (LONG)p.y };
 }
 - (void)button:(NSEvent *)e message:(uint32_t)msg vk:(int)vk down:(int)down {
+    // A click in the window gives it the keyboard, as on Windows: the app active, the window key, this view its
+    // first responder (a click AppKit let through to an inactive app, or a window it would not make key, kept the
+    // keys away from the program while its mouse worked).
+    if (down) {
+        NSWindow *win = self.window;
+        if (getenv("VXRT_TRACE_INPUT"))
+            vx_log("input: Mac click: key window %d, app active %d, first responder %s", win.isKeyWindow, NSApp.isActive,
+                   win.firstResponder ? object_getClassName(win.firstResponder) : "none");
+        if (!NSApp.isActive) [NSApp activateIgnoringOtherApps:YES];
+        if (!win.isKeyWindow && win.canBecomeKeyWindow) [win makeKeyWindow];
+        if (win.firstResponder != self && !marked) [win makeFirstResponder:self];
+    }
     vx_mouse_button(vk, down);
     // RI_MOUSE_*_BUTTON_DOWN/UP: left 0x1/0x2, right 0x4/0x8, middle 0x10/0x20.
     int shift = vk == 1 ? 0 : vk == 2 ? 2 : 4;

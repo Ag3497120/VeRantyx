@@ -61,7 +61,8 @@ D3D12 = {
                 "ID3D12CommandQueue", "ID3D12RootSignature", "ID3D12PipelineState", "ID3D12Fence", "ID3D12Fence1",
                 "ID3D12CommandAllocator", "ID3D12Device", "ID3D12Device1", "ID3D12Device2", "ID3D12Device3",
                 "ID3D12Device4", "ID3D12Device5", "ID3D12Device6", "ID3D12Device7", "ID3D12Device8", "ID3D12Device9",
-                "ID3D12Device10", "ID3D12RootSignatureDeserializer", "ID3D12VersionedRootSignatureDeserializer"],
+                "ID3D12Device10", "ID3D12RootSignatureDeserializer", "ID3D12VersionedRootSignatureDeserializer",
+                "ID3D12PipelineLibrary", "ID3D12PipelineLibrary1"],
     "d3d12sdklayers.h": ["ID3D12Debug", "ID3D12Debug1", "ID3D12Debug2", "ID3D12Debug3", "ID3D12Debug4", "ID3D12Debug5"],
     "d3dcommon.h": ["ID3D10Blob"],
 }

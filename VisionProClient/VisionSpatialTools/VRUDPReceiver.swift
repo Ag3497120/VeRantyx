@@ -398,6 +398,13 @@ final class VRUDPReceiver: ObservableObject {
             DispatchQueue.main.async { [weak self] in self?.gameFrameStatus = status }
             return
         }
+        // "SCRN" + 4 floats, once a second: a flat game made stereo on the Mac (VXRT_STEREO): show it on a
+        // world-locked virtual screen (one eye's aspect, the screen's width and distance in metres, version).
+        if data.count == 20, readUInt32LE(data, at: 0) == 0x4E524353 {
+            let values = (0..<4).map { Float(bitPattern: readUInt32LE(data, at: 4 + $0 * 4)) }
+            VRScreenModeStore.shared.update(eyeAspect: values[0], width: values[1], distance: values[2])
+            return
+        }
         // "VTAN" + 8 floats: the eye frustum SteamVR renders with.
         if data.count == 36, readUInt32LE(data, at: 0) == 0x4E415456 {
             let values = (0..<8).map { Float(bitPattern: readUInt32LE(data, at: 4 + $0 * 4)) }

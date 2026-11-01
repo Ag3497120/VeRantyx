@@ -58,9 +58,15 @@ int main(int argc, char **argv) {
     fclose(f);
     DxcBuffer buffer = { src, n, DXC_CP_UTF8 };
     // (no debug information, no reflection in the container: what a game's shipped shaders look like)
-    const wchar_t *args[] = { wide(argv[2]), L"-E", wide(argv[3]), L"-T", wide(argv[4]), L"-Qstrip_debug", L"-Qstrip_reflect", L"-O3" };
+    // A profile ending in "+16" (cs_6_2+16) compiles with native 16-bit types (-enable-16bit-types).
+    char profile[32];
+    snprintf(profile, sizeof profile, "%s", argv[4]);
+    char *plus = strstr(profile, "+16");
+    if (plus) *plus = 0;
+    const wchar_t *args[] = { wide(argv[2]), L"-E", wide(argv[3]), L"-T", wide(profile), L"-Qstrip_debug", L"-Qstrip_reflect", L"-O3",
+                              L"-enable-16bit-types" };
     IDxcResult *result = NULL;
-    hr = compiler->Compile(&buffer, args, sizeof args / sizeof *args, NULL, __uuidof(IDxcResult), (void **)&result);
+    hr = compiler->Compile(&buffer, args, sizeof args / sizeof *args - (plus ? 0 : 1), NULL, __uuidof(IDxcResult), (void **)&result);
     if (FAILED(hr)) { printf("Compile: %#lx\n", hr); return 1; }
     IDxcBlobUtf8 *errors = NULL;
     result->GetOutput(DXC_OUT_ERRORS, __uuidof(IDxcBlobUtf8), (void **)&errors, NULL);

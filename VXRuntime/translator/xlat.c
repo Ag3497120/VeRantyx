@@ -44,6 +44,12 @@ static void mov_imm(xlat_buf *b, int d, uint64_t v) {
     }
     if (first) E(b, a64_movz(d, 0, 0));
 }
+static void reloc(xlat_buf *b, uint32_t kind);
+// A host address into register d: an immediate, or ahead of time (b->aot) a site the generator fills (XR_ABS).
+static void mov_abs(xlat_buf *b, int d, uint64_t v, int which) {
+    if (!b->aot) { mov_imm(b, d, v); return; }
+    reloc(b, XR_ABS); E(b, XA_ABS_WORD(which, d)); E(b, 0); E(b, 0); E(b, 0);
+}
 
 // ---- operands ---------------------------------------------------------------------------------------------------------------
 static int bits(int size) { return size * 8; }
@@ -104,8 +110,11 @@ static int ea_fold(xlat_buf *b, const x86_insn *d, uint64_t next, int size, int3
 // ones too: compilers use RBP as a register of their own (UnityPlayer's allocator keeps its heap object there); with
 // plain loads and stores, a flag written after data was seen before it (tests/order.c).
 static int shared_access(const xlat_buf *b, const x86_insn *d) { return b->ordered && d->base != 4; }
+// (an ordered access the profile says crosses 16 bytes: DMB ISH, plain, DMB ISH; xlat_buf.plain)
+static int split_plain(const xlat_buf *b, const x86_insn *d) { return shared_access(b, d) && b->plain && b->plain(b->cur_rip); }
 static void rd_rm(xlat_buf *b, const x86_insn *d, int t, int size, uint64_t next) {
     if (d->mod == 3) rd_reg(b, d, t, d->rm, size);
+    else if (split_plain(b, d)) { ea(b, d, next, 0); E(b, 0xD5033BBFu); E(b, a64_ldr(size, t, T_ADDR, 0)); E(b, 0xD5033BBFu); }
     else { ea(b, d, next, 0); E(b, shared_access(b, d) ? a64_ldapr(size, t, T_ADDR) : a64_ldr(size, t, T_ADDR, 0)); }
 }
 // The same for an operand only read (nothing after counts on T_ADDR): the displacement in the load when it fits.
@@ -117,9 +126,10 @@ static void rd_rm_ro(xlat_buf *b, const x86_insn *d, int t, int size, uint64_t n
 // Locked accesses to memory that is not naturally aligned (x86 allows them; ARM atomics fault on them) go through one
 // lock shared by all translated code: taken with SWPAL, released with STLR. x25 holds its address meanwhile.
 static uint64_t xlat_split_lock;
+uint64_t *xlat_split_lock_addr(void) { return &xlat_split_lock; }
 enum { X_LOCK = 25 };
 static void split_lock_take(xlat_buf *b) {
-    mov_imm(b, X_LOCK, (uint64_t)(uintptr_t)&xlat_split_lock);
+    mov_abs(b, X_LOCK, (uint64_t)(uintptr_t)&xlat_split_lock, XA_SPLIT_LOCK);
     E(b, a64_movz(S1, 1, 0)); E(b, a64_swpal(8, S1, S1, X_LOCK)); E(b, a64_cbnz(S1, -2));
 }
 static void split_lock_give(xlat_buf *b) { E(b, a64_stlr(XZR, X_LOCK)); }
@@ -148,6 +158,7 @@ static void wr_rm(xlat_buf *b, const x86_insn *d, int t, int size) {
             patch_b(b, done);
         }
     }
+    else if (split_plain(b, d)) { E(b, 0xD5033BBFu); E(b, a64_str(size, t, T_ADDR, 0)); E(b, 0xD5033BBFu); }
     else E(b, shared_access(b, d) ? a64_stlr_sz(size, t, T_ADDR) : a64_str(size, t, T_ADDR, 0));
 }
 
@@ -250,7 +261,7 @@ static void call_helper_r(xlat_buf *b, uint32_t op, int op_reg, int val) {
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     if (op_reg < 0) { mov_imm(b, S0, op); E(b, a64_str(8, S0, XC, CTX_HELPER_OP)); }
     E(b, a64_mov(0, XC));
-    mov_imm(b, S0, (uint64_t)(uintptr_t)xlat_helper);
+    mov_abs(b, S0, (uint64_t)(uintptr_t)xlat_helper, XA_HELPER);
     E(b, b->vcpu ? a64_hvc(XV_HVC_HELPER) : a64_blr(S0));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
@@ -1504,6 +1515,7 @@ static int mem_compare(xlat_buf *b, const x86_insn *d, uint64_t next, int cc, in
 static void imap_mark(xlat_buf *b, uint64_t rip) {                      // (from here on: rip's code, RSP = x4 + sp_delta)
     if (b->nimap == b->cimap) { b->cimap = b->cimap ? 2 * b->cimap : 64; b->imap = realloc(b->imap, b->cimap * sizeof *b->imap); }
     b->imap[b->nimap].at = (uint32_t)b->n; b->imap[b->nimap].sp = b->sp_delta; b->imap[b->nimap++].rip = rip;
+    b->cur_rip = rip;
 }
 static void sp_apply(xlat_buf *b, int64_t by) {                          // x4 += by
     if (by > 0 && by < 4096) E(b, a64_addi(4, 4, (uint32_t)by));
@@ -1999,7 +2011,7 @@ void xlat_prologue(xlat_buf *b) {
     E(b, a64_stp(25, 26, SP, 64)); E(b, a64_stp(27, 28, SP, 80));
     E(b, a64_stpd(8, 9, SP, 96)); E(b, a64_stpd(10, 11, SP, 112)); E(b, a64_stpd(12, 13, SP, 128)); E(b, a64_stpd(14, 15, SP, 144));
     E(b, a64_mov(XC, 0));
-    mov_imm(b, XP, (uint64_t)(uintptr_t)xlat_parity);
+    mov_abs(b, XP, (uint64_t)(uintptr_t)xlat_parity, XA_PARITY);
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));

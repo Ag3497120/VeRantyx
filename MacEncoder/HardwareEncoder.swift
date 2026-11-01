@@ -1994,7 +1994,9 @@ func resolveOutputSize(sourceWidth: Int, sourceHeight: Int) -> Bool {
     // Preserve the eye frustum's aspect ratio while keeping the same pixel
     // budget as the configured size. This avoids stretching when the headset supplies an
     // asymmetric per-eye projection.
-    let sourceAspect = min(2.5, max(0.5, Double(sourceWidth) / Double(sourceHeight)))
+    // (a flat game in stereo, captureSourceMode 3: two whole 16:10-ish pictures side by side, ~3.1:1)
+    let maximumAspect = dbHeaderPtr.pointee.captureSourceMode == flatStereoSourceMode ? 4.0 : 2.5
+    let sourceAspect = min(maximumAspect, max(0.5, Double(sourceWidth) / Double(sourceHeight)))
     if let previousAspect = outputSourceAspect,
        abs(sourceAspect - previousAspect) / previousAspect < 0.01 {
         return false
@@ -2645,6 +2647,36 @@ let streamStatsMagic: UInt32 = 0x54415453 // "STAT"
 var lastStreamStatsAt: TimeInterval = -.infinity
 var lastStreamStatsCounts = (capture: 0, encode: 0, sent: 0, audio: 0)
 
+// A flat game made stereo by VXRuntime (VXRT_STEREO_STREAM): captureSourceMode 3, both eyes side by side with no
+// head pose. "SCRN" + 4 floats once a second tells the headset to show it on a world-locked virtual screen: the
+// picture's aspect (one eye), the screen's width and distance in metres (VERANTYX_SCREEN_WIDTH/_DISTANCE, default
+// 3 m at 3.5 m: 2 % disparity at infinity is then 6 cm, about the IPD), and the packet's version.
+let flatStereoSourceMode: UInt32 = 3
+let screenModeMagic: UInt32 = 0x4E524353 // "SCRN"
+let screenWidthMeters = Float(ProcessInfo.processInfo.environment["VERANTYX_SCREEN_WIDTH"] ?? "") ?? 3.0
+let screenDistanceMeters = Float(ProcessInfo.processInfo.environment["VERANTYX_SCREEN_DISTANCE"] ?? "") ?? 3.5
+var lastScreenModeSentAt: TimeInterval = -.infinity
+var lastSourceFrameSize = (width: 0, height: 0)
+
+func sendScreenModeIfDue() {
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - lastScreenModeSentAt >= 1, dbHeaderPtr.pointee.captureSourceMode == flatStereoSourceMode,
+          lastSourceFrameSize.width > 0, lastSourceFrameSize.height > 0 else { return }
+    lastScreenModeSentAt = now
+    peerLock.lock()
+    let peer = videoPeer
+    peerLock.unlock()
+    guard let peer else { return }
+    let values: [Float] = [Float(lastSourceFrameSize.width) / 2 / Float(lastSourceFrameSize.height),
+                           screenWidthMeters, screenDistanceMeters, 1]
+    var packet = Data(capacity: 20)
+    withUnsafeBytes(of: screenModeMagic.littleEndian) { packet.append(contentsOf: $0) }
+    for value in values {
+        withUnsafeBytes(of: value.bitPattern.littleEndian) { packet.append(contentsOf: $0) }
+    }
+    peer.send(content: packet, completion: .idempotent)
+}
+
 func sendStreamStatsIfDue() {
     let now = ProcessInfo.processInfo.systemUptime
     let elapsed = now - lastStreamStatsAt
@@ -2687,6 +2719,7 @@ while isEncoding {
         reportDiagnosticsIfDue()
         sendSourceProjectionIfDue()
         sendStreamStatsIfDue()
+        sendScreenModeIfDue()
         let pollTime = ProcessInfo.processInfo.systemUptime
         nativeLoadingMap.poll(now: pollTime)
         let sourceMode = dbHeaderPtr.pointee.captureSourceMode
@@ -2732,6 +2765,7 @@ while isEncoding {
                     return
                 }
 
+                if hasSource { lastSourceFrameSize = (width, height) }   // (the game's frame, not the loading picture)
                 let outputSizeChanged = hasSource && resolveOutputSize(sourceWidth: width, sourceHeight: height)
                 if outputSizeChanged, let oldSession = compressionSession {
                     // SteamVR can switch to the headset's measured frustum after

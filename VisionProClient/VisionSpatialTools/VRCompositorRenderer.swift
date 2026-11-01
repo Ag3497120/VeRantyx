@@ -93,6 +93,38 @@ final class VRSourceProjectionStore {
     }
 }
 
+/// A flat game made stereo on the Mac (VXRuntime's VXRT_STEREO, the encoder's "SCRN" packets): the stream's two
+/// halves are the eyes of one picture, shown on a world-locked screen rather than as SteamVR's head-relative views.
+/// Active while the packets keep coming (they are sent once a second).
+final class VRScreenModeStore {
+    struct Screen: Equatable {
+        var eyeAspect: Float
+        var width: Float
+        var distance: Float
+    }
+
+    static let shared = VRScreenModeStore()
+
+    private let lock = NSLock()
+    private var screen: Screen?
+    private var receivedAt: CFTimeInterval = -.infinity
+
+    func update(eyeAspect: Float, width: Float, distance: Float) {
+        guard eyeAspect.isFinite, width.isFinite, distance.isFinite,
+              (0.2...5).contains(eyeAspect), (0.3...30).contains(width), (0.5...50).contains(distance) else { return }
+        lock.lock()
+        screen = Screen(eyeAspect: eyeAspect, width: width, distance: distance)
+        receivedAt = CACurrentMediaTime()
+        lock.unlock()
+    }
+
+    func active(now: CFTimeInterval) -> Screen? {
+        lock.lock()
+        defer { lock.unlock() }
+        return now - receivedAt < 3 ? screen : nil
+    }
+}
+
 final class VRCompositorRenderer {
     private let layerRenderer: LayerRenderer
     private let poseSampler: VRPoseSampler
@@ -131,6 +163,10 @@ final class VRCompositorRenderer {
     // No new frame for this long (a level load, a stalled stream): show the
     // last one head-locked rather than keep reprojecting it.
     private static let maximumFrameHold: CFTimeInterval = 0.5
+    // Screen mode (VRScreenModeStore): where the screen is in the immersive space's origin frame, fixed when the
+    // mode starts, in front of the head at its height and facing it.
+    private var screen: VRScreenModeStore.Screen?
+    private var originFromScreen: simd_float4x4?
     private var eyeCenter = SIMD3<Float>.zero
     private var eyeSeparation: Float = 0
     private let statisticsLock = NSLock()
@@ -282,7 +318,17 @@ final class VRCompositorRenderer {
             // was rendered from a newer viewpoint, which warps head motion.
             var anchor: DeviceAnchor?
             var headLocked = HeadLockReason.noFrame
-            if let videoFrame {
+            screen = VRScreenModeStore.shared.active(now: CACurrentMediaTime())
+            if screen == nil { originFromScreen = nil }
+            if let screen {
+                // A world-locked screen: the display-time pose, the picture drawn where the screen is (no
+                // reprojection from a game pose: the Mac sends none).
+                anchor = poseSampler.queryDeviceAnchor(at: Self.seconds(timing.trackableAnchorTime))
+                if originFromScreen == nil, let anchor {
+                    originFromScreen = Self.placeScreen(head: anchor.originFromAnchorTransform, distance: screen.distance)
+                    print("Screen mode: \(screen.width) m wide at \(screen.distance) m, one eye's aspect \(screen.eyeAspect)")
+                }
+            } else if let videoFrame {
                 let source = videoFrame.timestamp > 0
                     ? cachedSource ?? poseSampler.history.sample(for: videoFrame.timestamp) : nil
                 if videoFrame.timestamp <= 0 {
@@ -465,8 +511,15 @@ final class VRCompositorRenderer {
         encoder.setRenderPipelineState(pipelineState)
         encoder.setDepthStencilState(depthState)
         encoder.setCullMode(.none)
-        var corners = Self.videoCorners(drawable: drawable, source: VRSourceProjectionStore.shared.snapshot(),
+        var corners: [SIMD4<Float>]
+        if let screen, let originFromScreen, let anchor = drawable.deviceAnchor {
+            corners = Self.screenCorners(drawable: drawable, originFromDevice: anchor.originFromAnchorTransform,
+                                         originFromScreen: originFromScreen, width: screen.width,
+                                         height: screen.width / screen.eyeAspect)
+        } else {
+            corners = Self.videoCorners(drawable: drawable, source: VRSourceProjectionStore.shared.snapshot(),
                                         eyeCenter: eyeCenter)
+        }
         encoder.setVertexBytes(&corners, length: MemoryLayout<SIMD4<Float>>.stride * corners.count, index: 0)
         encoder.setViewports(drawable.views.map { $0.textureMap.viewport })
 
@@ -538,6 +591,42 @@ final class VRCompositorRenderer {
             for (u, v) in [(tangents.x, tangents.z), (tangents.y, tangents.z), (tangents.x, tangents.w), (tangents.y, tangents.w)] {
                 let point = eye + SIMD3<Float>(u, v, -1) * distance
                 corners.append(projection * viewFromDevice * SIMD4<Float>(point, 1))
+            }
+        }
+        while corners.count < 8 { corners.append(SIMD4<Float>(0, 0, 0, 1)) }
+        return corners
+    }
+
+    /// The screen's pose in the origin frame: `distance` in front of the head (its heading, level), at the
+    /// head's height, facing it (the screen's +z towards the head).
+    private static func placeScreen(head: simd_float4x4, distance: Float) -> simd_float4x4 {
+        let position = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
+        var forward = -SIMD3<Float>(head.columns.2.x, 0, head.columns.2.z)
+        if simd_length(forward) < 0.001 { forward = SIMD3<Float>(0, 0, -1) }
+        forward = simd_normalize(forward)
+        let back = -forward
+        let right = simd_normalize(simd_cross(SIMD3<Float>(0, 1, 0), back))
+        let center = position + forward * distance
+        return simd_float4x4(SIMD4<Float>(right, 0), SIMD4<Float>(0, 1, 0, 0), SIMD4<Float>(back, 0), SIMD4<Float>(center, 1))
+    }
+
+    /// Clip-space corners of the virtual screen for each eye (bottom-left, bottom-right, top-left, top-right), the
+    /// same quad for both: each eye samples its own half of the stream, so the picture's disparity puts the scene
+    /// behind (and a little in front of) the screen.
+    private static func screenCorners(
+        drawable: LayerRenderer.Drawable,
+        originFromDevice: simd_float4x4,
+        originFromScreen: simd_float4x4,
+        width: Float,
+        height: Float
+    ) -> [SIMD4<Float>] {
+        let deviceFromScreen = originFromDevice.inverse * originFromScreen
+        var corners: [SIMD4<Float>] = []
+        for index in 0..<min(drawable.views.count, 2) {
+            let projection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index)
+            let clipFromScreen = projection * drawable.views[index].transform.inverse * deviceFromScreen
+            for (u, v) in [(-width / 2, -height / 2), (width / 2, -height / 2), (-width / 2, height / 2), (width / 2, height / 2)] {
+                corners.append(clipFromScreen * SIMD4<Float>(u, v, 0, 1))
             }
         }
         while corners.count < 8 { corners.append(SIMD4<Float>(0, 0, 0, 1)) }
