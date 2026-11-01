@@ -74,13 +74,16 @@ static id<MTLFunction> dual_source_function(d3d_device *dev, d3d_shader *s) {
     return (__bridge id<MTLFunction>)s->dual;
 }
 static void start_compile(d3d_shader *s);
-// VXRT_LAZY_SHADERS=1 (EXPERIMENT, off by default): a shader the cache does not have is compiled when a draw first
-// needs it, not when the game creates it. Half-Life: Alyx creates some 10000 at its start and a level draws with a few hundred: on a first
-// start (or after the translator changed) compiling them all kept it on its loading picture for about 4 minutes on
-// an M1 Max.
+// Lazy shaders (on by default since 0.3.3; VXRT_LAZY_SHADERS=0 compiles every shader when the game creates it, as
+// before): a shader the cache does not have is compiled when a draw first needs it, not when the game creates it.
+// Half-Life: Alyx creates some 10000 at its start and a level draws with a few hundred: on a first start (or after the
+// translator changed) compiling them all kept it on its loading picture for about 4 minutes on an M1 Max; lazily it
+// reached the level as fast as a warm start (harness runs 20261101T160229Z, 161350Z). The cost: new shaders compile
+// mid-play, the longest in-level stop on a warm cache about 0.5 s against 0.2 s. Measured on one Mac only: on by
+// default so that players' Macs can show which is better.
 static int lazy_shaders(void) {
     static int lazy = -1;
-    if (lazy < 0) lazy = getenv("VXRT_LAZY_SHADERS") && !strcmp(getenv("VXRT_LAZY_SHADERS"), "1");
+    if (lazy < 0) lazy = !(getenv("VXRT_LAZY_SHADERS") && !strcmp(getenv("VXRT_LAZY_SHADERS"), "0"));
     return lazy;
 }
 static id<MTLFunction> shader_function(d3d_shader *s) {
