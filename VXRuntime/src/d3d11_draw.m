@@ -44,7 +44,7 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
 // works on many at once, and a game creating thousands while it loads would otherwise wait for each in turn; the
 // first draw (or dispatch) that needs one waits for it.
 // so: a geometry shader made with stream output (so_layout), else NULL.
-typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; gpu_ir_pipeline *compute_ir; uint32_t id, hash; volatile int ready; void *dual; int dual_tried; void *variant; int variant_tried; void *so; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
+typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; gpu_ir_pipeline *compute_ir; uint32_t id, hash; volatile int ready, started; uint64_t translate_ns; void *dual; int dual_tried; void *variant; int variant_tried; void *so; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
 // Stream output (stream 0): which output register components go where in the target buffers. An entry copies
 // count components from register reg, component comp on, to dword dword of each vertex's record in buffer slot.
 typedef struct { uint32_t reg, comp, count, slot_dword; } so_entry;   // slot_dword: slot << 24 | dword
@@ -73,8 +73,19 @@ static id<MTLFunction> dual_source_function(d3d_device *dev, d3d_shader *s) {
     pthread_mutex_unlock(&g_variant_lock);
     return (__bridge id<MTLFunction>)s->dual;
 }
+static void start_compile(d3d_shader *s);
+// VXRT_LAZY_SHADERS=1 (EXPERIMENT, off by default): a shader the cache does not have is compiled when a draw first
+// needs it, not when the game creates it. Half-Life: Alyx creates some 10000 at its start and a level draws with a few hundred: on a first
+// start (or after the translator changed) compiling them all kept it on its loading picture for about 4 minutes on
+// an M1 Max.
+static int lazy_shaders(void) {
+    static int lazy = -1;
+    if (lazy < 0) lazy = getenv("VXRT_LAZY_SHADERS") && !strcmp(getenv("VXRT_LAZY_SHADERS"), "1");
+    return lazy;
+}
 static id<MTLFunction> shader_function(d3d_shader *s) {
     if (!s) return nil;
+    if (!__atomic_load_n(&s->ready, __ATOMIC_ACQUIRE) && !__atomic_exchange_n(&s->started, 1, __ATOMIC_ACQ_REL)) start_compile(s);
     if (!__atomic_load_n(&s->ready, __ATOMIC_ACQUIRE)) {
         uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         pthread_mutex_lock(&g_compile_lock);
@@ -159,14 +170,24 @@ static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int
     s->hash = (uint32_t)digest[0] << 24 | (uint32_t)digest[1] << 16 | (uint32_t)digest[2] << 8 | digest[3];
     if (!out) { d3d_release(&s->base); return S_FALSE; }   // only checking: translated is enough
     s->id = __sync_fetch_and_add(&g_next_id, 1);
-    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    s->translate_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    // (lazily, the ones an earlier run drew with are still loaded now, from the cache, while the game loads: else each
+    //  first draw waits for its shader, 233 waits a run)
+    if ((!lazy_shaders() || vx_shader_cache_known((__bridge id<MTLDevice>)dev->mtl, @(s->info.msl), @[@"vx_main"]))
+        && !__atomic_exchange_n(&s->started, 1, __ATOMIC_ACQ_REL)) start_compile(s);
+    *out = s;
+    return S_OK;
+}
+static void start_compile(d3d_shader *s) {
+    d3d_device *dev = s->base.dev;
+    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), translate_ns = s->translate_ns;
     NSString *source = @(s->info.msl);
     static int sync = -1;                              // VXRT_SYNC_SHADERS=1: compile before returning, as before
     if (sync < 0) sync = getenv("VXRT_SYNC_SHADERS") != NULL;
     d3d_addref(&s->base);                              // kept until its compile is done
     void (^done)(id<MTLLibrary>, NSError *) = ^(id<MTLLibrary> lib, NSError *err) {
         id<MTLFunction> fn = vx_metal_function(lib, @"vx_main");
-        if (vx_trace) shader_stats(t1 - t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t1);
+        if (vx_trace) shader_stats(translate_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t1);
         if (!fn) {
             vx_log("Direct3D: translated shader %08x did not compile: %s", s->hash, err.localizedDescription.UTF8String);
             if (vx_trace) vx_log("%s", s->info.msl);
@@ -183,8 +204,6 @@ static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int
         id<MTLLibrary> lib = vx_metal_library((__bridge id<MTLDevice>)dev->mtl, source, &err);
         done(lib, err);
     } else vx_metal_library_async((__bridge id<MTLDevice>)dev->mtl, source, done);
-    *out = s;
-    return S_OK;
 }
 static WINAPI HRESULT device_create_vs(void *this, const void *code, size_t size, void *linkage, void **out) {
     (void)linkage; return create_shader(this, code, size, DXBC_VERTEX, g_vs_vtbl, out);

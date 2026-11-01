@@ -124,6 +124,12 @@ static id<MTLLibrary> load_library(id<MTLDevice> device, VXShaderInfo *info) {
     count(&g_disk_hits);
     return lib;
 }
+BOOL vx_shader_cache_known(id<MTLDevice> device, NSString *source, NSArray<NSString *> *entries) {
+    NSString *root = entries.count ? cache_root(device) : nil;
+    if (!root) return NO;
+    NSString *index = [root stringByAppendingPathComponent:[hash_object(@[source, entries]) stringByAppendingString:@".index"]];
+    return [NSFileManager.defaultManager fileExistsAtPath:index];
+}
 static VXShaderRequest *request(id<MTLDevice> device, NSString *source, NSArray<NSString *> *entries, BOOL *owner) {
     NSString *root = entries.count ? cache_root(device) : nil;
     if (!root) return nil;

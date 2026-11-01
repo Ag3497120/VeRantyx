@@ -39,6 +39,7 @@ VXRT_SHADER_PROGRESS_FILE=/scratch/shader-progress.json ... # D3D11 library/pipe
 VXRT_SHADER_PROGRESS_EXE=hlvr.exe ...      # only this program publishes the JSON; inherited helper processes do not
 VXRT_SHADER_CACHE=0 ...                   # disable D3D11's persistent Metal cache (enabled by default)
 VXRT_SHADER_CACHE_DIR=/scratch/shaders ... # override ~/Library/Caches/VeRantyx/shaders
+VXRT_LAZY_SHADERS=1 ...                    # experiment: a D3D11 shader not in the cache compiles at its first draw (see d3d11_draw.m)
 VXRT_STATS=1 ...                           # keyed mutex waits and hold times, Map waits, GPU busy time, every few seconds
 VXRT_LOG_TIME=1 ...                        # log lines carry the time of day (the same clock in every process)
 VXRT_LOG_REPEAT=0 ...                      # every copy of a repeated line (default: 20, then one every 10 s)

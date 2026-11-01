@@ -8,5 +8,7 @@ id<MTLFunction> vx_metal_function(id<MTLLibrary> library, NSString *name);
 id<MTLRenderPipelineState> vx_shader_cache_render(id<MTLDevice> device, MTLRenderPipelineDescriptor *desc, NSError **error);
 id<MTLComputePipelineState> vx_shader_cache_compute(id<MTLDevice> device, MTLComputePipelineDescriptor *desc, NSError **error);
 id<MTLComputePipelineState> vx_shader_cache_compute_function(id<MTLDevice> device, id<MTLFunction> function, NSError **error);
+// Whether a library for this source is on disk (a pipeline used it in an earlier run).
+BOOL vx_shader_cache_known(id<MTLDevice> device, NSString *source, NSArray<NSString *> *entries);
 NSDictionary *vx_shader_cache_snapshot(void);
 void vx_shader_cache_flush(void);
