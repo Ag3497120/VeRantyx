@@ -284,5 +284,6 @@
  "Steam for Mac was not signed in when the game started.": "游戏启动时 Steam for Mac 未登录。",
  "ALVR's setting (72 Hz unless changed)": "ALVR 的设置（未更改时为 72 Hz）",
  "Refresh rate": "刷新率",
- "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 60 Hz on a headset that has it (Quest 1); at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "头显屏幕的刷新率。60 fps 的游戏在 120 Hz 下最流畅（每帧显示两次），支持 60 Hz 的头显（Quest 1）用 60 Hz 也一样；在 72 Hz 下有的帧显示两次、有的一次，会造成卡顿。头显会使用它支持的最接近的刷新率。下次游玩时生效。"
+ "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 60 Hz on a headset that has it (Quest 1); at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "头显屏幕的刷新率。60 fps 的游戏在 120 Hz 下最流畅（每帧显示两次），支持 60 Hz 的头显（Quest 1）用 60 Hz 也一样；在 72 Hz 下有的帧显示两次、有的一次，会造成卡顿。头显会使用它支持的最接近的刷新率。下次游玩时生效。",
+ "The headset's field of view changed after the game started (ALVR's FoV setting?): stop and start the game again, or the eyes do not line up.": "游戏开始后头显的视野变了（ALVR 的 FoV 设置？）：请停止游戏后重新开始，否则左右眼画面对不上。"
 }

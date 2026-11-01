@@ -759,6 +759,24 @@ func saveHeadsetFrustum(_ tangents: UnsafeRawPointer) {
     print("ALVR headset eye frustum saved for SteamVR's next start: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
 }
 
+// SteamVR keeps the frustum it read at its start. A headset whose field of view changed since (ALVR's FoV setting,
+// issue #10: double vision at 0.9, gone after a restart at 1.0) is told so in the log, which the app shows: the
+// eyes do not line up until the game is started again.
+var frustumMismatchChecks = 0
+var frustumMismatchReported = false
+func checkHeadsetFrustumAgainstSteamVR() {
+    guard savedFrustum.count == 8, let used = readSourceProjection() else { frustumMismatchChecks = 0; return }
+    let differs = zip(savedFrustum, used).contains { abs($0 - $1) > 0.03 }
+    frustumMismatchChecks = differs ? frustumMismatchChecks + 1 : 0
+    if differs && frustumMismatchChecks == 4 && !frustumMismatchReported {
+        frustumMismatchReported = true
+        print("ALVR headset field of view differs from the one SteamVR started with (headset \(savedFrustum.map { String(format: "%.3f", $0) }.joined(separator: " ")), SteamVR \(used.map { String(format: "%.3f", $0) }.joined(separator: " "))): stop and start the game again so both eyes line up")
+    } else if !differs && frustumMismatchReported {
+        frustumMismatchReported = false
+        print("ALVR headset field of view matches SteamVR's again")
+    }
+}
+
 // MARK: - A game's prompt over the picture
 
 struct GameLoadingState: Decodable {
@@ -1789,6 +1807,7 @@ if let alvr {
                     OSMemoryBarrier()
                     handsMapPtr.advanced(by: 320).storeBytes(of: UInt32(0x4450_4956), as: UInt32.self)
                 }
+                if alvr.connected() { checkHeadsetFrustumAgainstSteamVR() }
                 if alvr.restartNeeded() {                               //  encoder again, which connects with them;
                                                                         //  also when ALVR's handshake hung: lib.rs)
                     print("ALVR: the headset brought other display settings (stored), or its handshake hung: the encoder starts again")

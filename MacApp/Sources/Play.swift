@@ -370,6 +370,7 @@ enum Quality: String, CaseIterable, Identifiable {
         }
         let launcher = Play.tail(launcherLog, 6000)
         if let hint = Play.hint(launcher) { problem = hint }   // (the scripts' own messages)
+        if headset.usesALVR, let hint = Play.fieldOfViewHint(encoder) { problem = hint }
         // a first ALVR headset: SteamVR waits for it (scripts/launch_vxrt_steamvr.sh), so the player connects it now
         let firstWait = launcher.range(of: "First start with this ALVR headset", options: .backwards)?.lowerBound
         let waitOver = launcher.range(of: "starting SteamVR", options: .backwards)?.lowerBound ?? launcher.range(of: "No ALVR headset connected yet", options: .backwards)?.lowerBound
@@ -551,6 +552,15 @@ enum Quality: String, CaseIterable, Identifiable {
     }
 
     /// What a log says went wrong, in words a player can act on (nil: nothing known).
+    /// The encoder's word that the headset's field of view changed after SteamVR started (HardwareEncoder.swift,
+    /// checkHeadsetFrustumAgainstSteamVR), unless a later line says it matches again.
+    nonisolated static func fieldOfViewHint(_ encoderLog: String) -> String? {
+        guard let differs = encoderLog.range(of: "field of view differs from the one SteamVR started with", options: .backwards) else { return nil }
+        if let again = encoderLog.range(of: "field of view matches SteamVR's again", options: .backwards), again.lowerBound > differs.lowerBound { return nil }
+        return T("The headset's field of view changed after the game started (ALVR's FoV setting?): stop and start the game again, or the eyes do not line up.",
+                 "ゲームの開始後にヘッドセットの視野が変わりました（ALVR の FoV 設定？）。ゲームを止めてもう一度始めてください。そうしないと左右の目がずれます。")
+    }
+
     nonisolated static func hint(_ log: String) -> String? {
         if log.contains("Start Steam on the Mac and sign in first") || log.contains("Mac Steam is not running") {
             return T("Steam for Mac is not running: open Steam, sign in, and try again.", "Steam for Mac が起動していません。Steam を開いてサインインしてから、もう一度。")
