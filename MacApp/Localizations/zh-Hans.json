@@ -281,5 +281,8 @@
  "Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.": "无法连接 Steam for Mac：无法加载其客户端。请打开 Steam，等待更新完成并登录，然后重试。",
  " The game's launcher may then say your account does not own the game: quit it and press Play again.": "因此游戏的启动器可能会显示你的账户未拥有该游戏：请退出启动器，再按一次“游玩”。",
  "Couldn't reach Steam for Mac: it was not running when the game started.": "无法连接 Steam for Mac：游戏启动时 Steam 未运行。",
- "Steam for Mac was not signed in when the game started.": "游戏启动时 Steam for Mac 未登录。"
+ "Steam for Mac was not signed in when the game started.": "游戏启动时 Steam for Mac 未登录。",
+ "ALVR's setting (72 Hz unless changed)": "ALVR 的设置（未更改时为 72 Hz）",
+ "Refresh rate": "刷新率",
+ "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice; at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "头显屏幕的刷新率。60 fps 的游戏在 120 Hz 下最流畅，每帧显示两次；在 72 Hz 下有的帧显示两次、有的一次，会造成卡顿。头显会使用它支持的最接近的刷新率。下次游玩时生效。"
 }

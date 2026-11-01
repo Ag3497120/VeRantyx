@@ -281,5 +281,8 @@
  "Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.": "Не удалось связаться со Steam для Mac: не удалось загрузить его клиент. Откройте Steam, дождитесь окончания обновления, войдите в аккаунт и попробуйте снова.",
  " The game's launcher may then say your account does not own the game: quit it and press Play again.": " Поэтому лаунчер игры может сообщить, что ваш аккаунт не владеет игрой: закройте его и снова нажмите «Играть».",
  "Couldn't reach Steam for Mac: it was not running when the game started.": "Не удалось связаться со Steam для Mac: он не был запущен, когда стартовала игра.",
- "Steam for Mac was not signed in when the game started.": "Steam для Mac не был авторизован, когда стартовала игра."
+ "Steam for Mac was not signed in when the game started.": "Steam для Mac не был авторизован, когда стартовала игра.",
+ "ALVR's setting (72 Hz unless changed)": "Настройка ALVR (72 Гц, если не меняли)",
+ "Refresh rate": "Частота обновления",
+ "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice; at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "Частота экрана гарнитуры. Игра с 60 fps выглядит плавнее всего на 120 Гц, где каждый кадр показывается дважды; на 72 Гц одни кадры показываются дважды, а другие один раз, и картинка дёргается. Гарнитура берёт ближайшую частоту, которая у неё есть. Действует со следующего запуска."
 }

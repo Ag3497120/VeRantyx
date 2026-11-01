@@ -93,6 +93,11 @@ struct Job {
         didSet { if savingPreferences { UserDefaults.standard.set(headset.rawValue, forKey: "headset") }; if !sessionQualityChoices.contains(quality) { quality = .standard } }
     }
     var wired: Bool = UserDefaults.standard.bool(forKey: "wired") { didSet { if savingPreferences { UserDefaults.standard.set(wired, forKey: "wired") } } }
+    /// The display rate asked of an ALVR headset (ALVR's preferred_fps; it takes the nearest it has), 0: ALVR's own
+    /// default (72 Hz). Kept in the setting "alvrRefreshHz".
+    var alvrRefreshHz: Int = UserDefaults.standard.integer(forKey: "alvrRefreshHz") {
+        didSet { if savingPreferences { UserDefaults.standard.set(alvrRefreshHz, forKey: "alvrRefreshHz") } }
+    }
     var quality: Quality = Quality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .standard {
         didSet { if savingPreferences { UserDefaults.standard.set(quality.rawValue, forKey: "quality") } }
     }
@@ -696,7 +701,7 @@ struct Job {
         if !Play.dryRun, !canStart(game, flat: flat) { error = backend(forID: game.id) == .nativeARM64 ? game.title.flatMap { nativeReason(for: $0) } ?? T("Open Steam and sign in: the games need it.", "Steam を開いてサインインしてください。ゲームに必要です。") : T("Finish Get started first.", "先に「はじめに」を済ませてください。"); return }
         error = nil
         do {
-            play = try Play(title: game.name, appID: game.id, exe: game.alyx ? nil : game.exe, headset: headset(for: game), wired: wired,
+            play = try Play(title: game.name, appID: game.id, exe: game.alyx ? nil : game.exe, headset: headset(for: game), wired: wired, refreshHz: alvrRefreshHz,
                             quality: quality(for: game), known: game.title, flat: flat && game.title?.flat == true,
                             backend: backend(forID: game.id))
         } catch {

@@ -127,6 +127,12 @@ if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     ALVR_SESSION="$HOME/Library/Application Support/VeRantyx/ALVR/session.json"
     ALVR_HZ="$("$HELPER" json-get "$ALVR_SESSION" openvr_config.refresh_rate 2>/dev/null || echo 90)"
     ALVR_HZ="${ALVR_HZ%.*}"
+    # (VERANTYX_ALVR_FPS, the rate the app's Headset page asks of the headset: SteamVR runs at it until a headset has
+    #  answered that request once, then at what the headset took, its nearest rate; ALVRBridge/src/lib.rs)
+    if [[ -n "${VERANTYX_ALVR_FPS:-}" ]]; then
+        ASKED="$("$HELPER" json-get "$ALVR_SESSION" session_settings.video.preferred_fps 2>/dev/null || true)"
+        [[ "${ASKED%.*}" == "${VERANTYX_ALVR_FPS%.*}" ]] || ALVR_HZ="${VERANTYX_ALVR_FPS%.*}"
+    fi
     export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-$ALVR_HZ}"
     # SteamVR does not hold the game back by whole frames when it misses the headset's rate (as with the 3k preset):
     # on a MacBook Air M5, Half-Life: Alyx at ALVR's defaults ran some 31 fps either way, and the user found it

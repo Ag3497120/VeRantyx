@@ -123,7 +123,7 @@ enum Quality: String, CaseIterable, Identifiable {
     /// its arguments and the settings given to it) is written to launcher-dry-run.log instead.
     nonisolated static var dryRun: Bool { ProcessInfo.processInfo.environment["VERANTYX_DRY_RUN"] == "1" }
 
-    init(title: String, appID: String? = nil, exe: URL?, headset: Headset, wired: Bool, quality: Quality, known: Title? = nil,
+    init(title: String, appID: String? = nil, exe: URL?, headset: Headset, wired: Bool, refreshHz: Int = 0, quality: Quality, known: Title? = nil,
          flat: Bool = false, backend: GameBackend = .vxrt) throws {
         self.title = title
         self.appID = appID
@@ -149,6 +149,9 @@ enum Quality: String, CaseIterable, Identifiable {
             env["VXRT_STATS"] = "1"                         // (the game's frame rate, "present: N/s", in its log)
         } else if headset.usesALVR {
             if wired && headset == .quest { env["VERANTYX_ALVR_WIRED"] = "1" }
+            // (the rate asked of the headset, Headset page; ALVR's 72 Hz when not chosen. A game at 60 fps on a 72 Hz
+            //  headset shows some frames twice and some once, issue #8; 120 Hz shows each twice)
+            if refreshHz > 0 && headset == .quest { env["VERANTYX_ALVR_FPS"] = String(refreshHz) }
             if quality == .sharp {
                 // (the game renders more pixels, not only the stream: with ALVR's defaults SteamVR's 0.55 supersampling
                 //  leaves some 850x920 per eye whatever the stream's size, so a 3680x1840 stream only stretched them,

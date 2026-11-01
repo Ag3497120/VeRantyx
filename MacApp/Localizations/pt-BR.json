@@ -281,5 +281,8 @@
  "Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.": "Não foi possível acessar o Steam para Mac: o cliente não pôde ser carregado. Abra o Steam, deixe a atualização terminar, entre na sua conta e tente de novo.",
  " The game's launcher may then say your account does not own the game: quit it and press Play again.": " O inicializador do jogo pode então dizer que sua conta não possui o jogo: feche-o e pressione Jogar de novo.",
  "Couldn't reach Steam for Mac: it was not running when the game started.": "Não foi possível acessar o Steam para Mac: ele não estava aberto quando o jogo começou.",
- "Steam for Mac was not signed in when the game started.": "O Steam para Mac não estava com a conta conectada quando o jogo começou."
+ "Steam for Mac was not signed in when the game started.": "O Steam para Mac não estava com a conta conectada quando o jogo começou.",
+ "ALVR's setting (72 Hz unless changed)": "Ajuste do ALVR (72 Hz se não alterado)",
+ "Refresh rate": "Taxa de atualização",
+ "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice; at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "A taxa da tela do headset. Um jogo a 60 fps fica mais suave a 120 Hz, em que cada quadro é mostrado duas vezes; a 72 Hz alguns quadros aparecem duas vezes e outros uma, o que causa trancos. O headset usa a taxa mais próxima que tiver. Vale a partir da próxima partida."
 }

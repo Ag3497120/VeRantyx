@@ -281,5 +281,8 @@
  "Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.": "Mac용 Steam에 연결할 수 없습니다: 클라이언트를 불러오지 못했습니다. Steam을 열고 업데이트가 끝나면 로그인한 뒤 다시 시도하세요.",
  " The game's launcher may then say your account does not own the game: quit it and press Play again.": " 그 때문에 게임 런처가 계정이 게임을 소유하지 않았다고 표시할 수 있습니다. 런처를 종료하고 다시 플레이를 누르세요.",
  "Couldn't reach Steam for Mac: it was not running when the game started.": "Mac용 Steam에 연결할 수 없습니다: 게임이 시작될 때 Steam이 실행 중이 아니었습니다.",
- "Steam for Mac was not signed in when the game started.": "게임이 시작될 때 Mac용 Steam에 로그인되어 있지 않았습니다."
+ "Steam for Mac was not signed in when the game started.": "게임이 시작될 때 Mac용 Steam에 로그인되어 있지 않았습니다.",
+ "ALVR's setting (72 Hz unless changed)": "ALVR 설정 (바꾸지 않았다면 72 Hz)",
+ "Refresh rate": "주사율",
+ "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice; at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "헤드셋 화면의 주사율입니다. 60 fps 게임은 각 프레임을 두 번씩 보여 주는 120 Hz에서 가장 부드럽습니다. 72 Hz에서는 두 번 보이는 프레임과 한 번 보이는 프레임이 섞여 끊겨 보입니다. 헤드셋은 지원하는 주사율 중 가장 가까운 것을 씁니다. 다음 플레이부터 적용됩니다."
 }

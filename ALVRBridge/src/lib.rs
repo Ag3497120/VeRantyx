@@ -88,6 +88,11 @@ pub fn prepare_session(layout: &alvr_filesystem::Layout) {
         ss["connection"][key]["variant"] = "Custom".into();
         ss["connection"][key]["Custom"] = 4_000_000.into();
     }
+    // (VERANTYX_ALVR_FPS: the display rate asked of the headset, which takes the nearest one it has; ALVR's 72 when
+    //  not set. A headset that then differs from the last one asks for the restart below, vx_alvr_restart_needed.)
+    if let Some(fps) = env::var("VERANTYX_ALVR_FPS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|f| (50.0..=144.0).contains(f)) {
+        ss["video"]["preferred_fps"] = fps.into();
+    }
     ss["video"]["preferred_codec"]["variant"] = "Hevc".into();
     ss["video"]["foveated_encoding"]["enabled"] = false.into();
     fs::write(&path, serde_json::to_string_pretty(&s).unwrap()).unwrap();
