@@ -41,6 +41,7 @@ VXRT_SHADER_CACHE=0 ...                   # disable D3D11's persistent Metal cac
 VXRT_SHADER_CACHE_DIR=/scratch/shaders ... # override ~/Library/Caches/VeRantyx/shaders
 VXRT_STATS=1 ...                           # keyed mutex waits and hold times, Map waits, GPU busy time, every few seconds
 VXRT_LOG_TIME=1 ...                        # log lines carry the time of day (the same clock in every process)
+VXRT_LOG_REPEAT=0 ...                      # every copy of a repeated line (default: 20, then one every 10 s)
 VXRT_TRACE_KEYED=1 VXRT_TRACE_MAPS=1 ...   # every AcquireSync/ReleaseSync (and waits made while holding one); staging Maps
 VXRT_PROFILE=report.txt ...                # sampling profiler through Rosetta: hottest functions (Windows ones by .pdata), every 10 s
 VXRT_GPU_TIMESTAMPS=1 ...                  # timestamp queries are the GPU's end times (default: the CPU's, on the same clock)
