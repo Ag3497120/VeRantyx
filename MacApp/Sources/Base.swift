@@ -226,10 +226,35 @@ enum Steam {
     /// Steam for Mac has been installed and has run once (it puts its client here when it updates itself).
     static var installed: Bool { appURL != nil && FileManager.default.fileExists(atPath: Paths.steamClient.path) }
     static func running() async -> Bool { !(await pgrep("Steam.AppBundle/Steam/Contents/MacOS/steam_osx")).isEmpty }
+    /// What a game started now would get from Steam for Mac. Running is not enough: a game started while Steam is
+    /// still signing in (or offline) runs without it, and a launcher that signs in through Steam then shows its own
+    /// error, as Elite Dangerous's does ("this Frontier account does not own Elite Dangerous", issue #10). Asked of
+    /// Steam's own client library, the one the game's Steam bridge loads, by VXRuntime (`vxrt --vxrt-steam-check`:
+    /// a pipe to the client and its signed-in user, let go at once); nothing of Steam's files is read or written.
+    static func readiness() async -> SteamReadiness {
+        guard await running() else { return .notRunning }
+        let vxrt = Paths.runtime.appendingPathComponent("VXRuntime/build/vxrt")
+        guard FileManager.default.isExecutableFile(atPath: vxrt.path) else { return .ready }   // (no runtime to ask: as before)
+        let r = await run(vxrt.path, ["--vxrt-steam-check"])
+        return SteamReadiness(checkOutput: r.text)
+    }
     static func open() {
         if let url = appURL { NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) }
         else { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/about/")!) }
     }
+}
+
+/// Steam for Mac as a game would find it (Steam.readiness()).
+enum SteamReadiness: String, Equatable {
+    case ready, offline, notSignedIn = "not-signed-in", notRunning = "not-running", unavailable
+    /// The check's answer: its last word (its log lines come before), or, when it could not run at all, "ready" (the
+    /// game starts as it did before there was a check; its own log then says what went wrong).
+    init(checkOutput: String) {
+        let word = checkOutput.split(whereSeparator: \.isWhitespace).last.map(String.init) ?? ""
+        self = SteamReadiness(rawValue: word) ?? .ready
+    }
+    /// Whether a game may start now: signed in; online too for one that signs in through Steam (a launcher).
+    func allowsStart(needsOnline: Bool) -> Bool { self == .ready || (self == .offline && !needsOnline) }
 }
 
 /// The Windows Steam client on VXRuntime (Paths.windowsSteam). The player installs it and signs in to it in its own

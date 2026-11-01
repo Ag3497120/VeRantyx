@@ -411,6 +411,21 @@ static NSString *header_value(winhttp_handle *h, NSString *name) {
     return nil;
 }
 
+// VXRT_TRACE_HTTP=1: each request's method, URL and status, with the start of what was sent and received (2: up to
+// 16 KB of each). For finding out what a program asks a web service and what it is told; the log holds whatever
+// the service sends (tickets, account names): keep it to yourself.
+static int trace_http(void) { static int on = -1; if (on < 0) on = getenv("VXRT_TRACE_HTTP") ? atoi(getenv("VXRT_TRACE_HTTP")) : 0; return on; }
+static void trace_body(const char *what, const void *data, size_t size) {
+    size_t cap = trace_http() >= 2 ? 16384 : 1024, n = size < cap ? size : cap;
+    char *text = malloc(n + 1);
+    if (!text) return;
+    for (size_t i = 0; i < n; i++) { char c = ((const char *)data)[i]; text[i] = (c >= 32 && c < 127) || c == '\n' ? c : '.'; }
+    text[n] = 0;
+    for (size_t at = 0; at < n || at == 0; at += 1500)             // (in pieces: a log line has a limit of its own)
+        vx_log("winhttp:   %s (%zu bytes%s)%s: %.1500s", what, size, size > n ? ", cut" : "", at ? " cont." : "", text + at);
+    free(text);
+}
+
 static BOOL perform_request(winhttp_handle *h) {
     @autoreleasepool {
         if (h->upload_expected && h->upload_size != h->upload_expected) {
@@ -462,7 +477,7 @@ static BOOL perform_request(winhttp_handle *h) {
         if (error || !response) {
             if (error.code == NSURLErrorTimedOut) vx_set_last_error(ERROR_WINHTTP_TIMEOUT);
             else vx_set_last_error(ERROR_WINHTTP_CANNOT_CONNECT);
-            if (vx_trace) vx_log("winhttp: %s %s failed: %s", h->verb, url.absoluteString.UTF8String,
+            if (vx_trace || trace_http()) vx_log("winhttp: %s %s failed: %s", h->verb, url.absoluteString.UTF8String,
                                  error.localizedDescription.UTF8String);
             return NO;
         }
@@ -482,8 +497,15 @@ static BOOL perform_request(winhttp_handle *h) {
         }];
         h->response_headers = headers;
         h->received = 1;
-        if (vx_trace) vx_log("winhttp: %s %s: %u, %zu bytes", h->verb, url.absoluteString.UTF8String,
+        if (vx_trace || trace_http()) vx_log("winhttp: %s %s: %u, %zu bytes", h->verb, url.absoluteString.UTF8String,
                              h->status, h->body_size);
+        if (trace_http()) {
+            if (h->headers) trace_body("request headers", h->headers, strlen(h->headers));
+            if (h->upload_size) trace_body("sent", h->upload, h->upload_size);
+            const char *rh = h->response_headers.UTF8String;
+            if (rh) trace_body("response headers", rh, strlen(rh));
+            trace_body("received", h->body, h->body_size);
+        }
         return YES;
     }
 }

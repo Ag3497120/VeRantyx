@@ -392,9 +392,14 @@ struct Job {
         return Quality.choices(for: headset(forID: id)).contains(quality) ? quality : .standard
     }
 
-    /// Whether a game can start now, on the Mac's screen or in the headset.
-    func canStart(_ game: Game, flat: Bool) -> Bool {
-        guard game.playable, isInstalled(game.id), play?.running != true, job == nil, !setupDownloading, !(flat && !game.flat) else { return false }
+    /// Whether its Play button can be pressed: a game that waits for Steam for Mac (start) can be, before Steam is up.
+    func canPress(_ game: Game, flat: Bool) -> Bool { canStart(game, flat: flat, assumingSteam: waitsForSteam(game)) }
+
+    /// Whether a game can start now, on the Mac's screen or in the headset (assumingSteam: as if Steam for Mac were
+    /// running, for a start that will wait for it).
+    func canStart(_ game: Game, flat: Bool, assumingSteam: Bool = false) -> Bool {
+        guard game.playable, isInstalled(game.id), play?.running != true, steamWait == nil, job == nil, !setupDownloading, !(flat && !game.flat) else { return false }
+        let steamRunning = self.steamRunning || assumingSteam
         if backend(forID: game.id) == .nativeARM64 {
             return appleSilicon && macOSOK && steamRunning && game.title.map { nativeReason(for: $0) == nil } == true && elsewhere.isEmpty && !flat
         }
@@ -591,7 +596,7 @@ struct Job {
         guard let game = games.first(where: { $0.id == f.title.id }) else {
             stopFlow(TF("%@ is not installed yet.", "%@ はまだ入っていません。", f.title.name)); return
         }
-        guard canStart(game, flat: f.flat) else {
+        guard canPress(game, flat: f.flat) else {
             let why = game.viaWindowsSteam && !windowsSteamRunning
                 ? T("It is installed. Open Windows Steam and sign in, then press Play.", "入っています。Windows 版 Steam を開いてサインインしてから、プレイを押してください。")
                 : T("It is installed but cannot start yet: finish what the Play page asks (Steam open, Get started, nothing else running), then press Play.",
@@ -617,7 +622,76 @@ struct Job {
         return env
     }
 
+    /// A start waiting for Steam for Mac to be ready (Steam.readiness()): the game, and what Steam is doing meanwhile.
+    struct SteamWait: Equatable {
+        var gameID: String
+        var name: String
+        var flat: Bool
+        /// nil while the first answer is awaited.
+        var state: SteamReadiness?
+    }
+    var steamWait: SteamWait? = nil
+    @ObservationIgnored private var steamWaitTask: Task<Void, Never>?
+    /// How Steam for Mac is asked (tests answer for it).
+    @ObservationIgnored var steamReadiness: () async -> SteamReadiness = { await Steam.readiness() }
+    @ObservationIgnored var steamPollNanoseconds: UInt64 = 2_000_000_000
+
+    /// Whether a game's start waits for Steam for Mac to be signed in: the games VXRuntime runs with Mac Steam (not
+    /// those Windows Steam starts, not the native ARM64 ones, which have their own bridge).
+    func waitsForSteam(_ game: Game) -> Bool { !Play.dryRun && backend(forID: game.id) == .vxrt && !game.viaWindowsSteam }
+
+    /// Play: once Steam for Mac is signed in (online, for a game whose launcher signs in through Steam), the game
+    /// starts; meanwhile the Play page says what it waits for (steamWait), and the player can cancel.
     func start(_ game: Game, flat: Bool = false) {
+        guard play?.running != true, steamWait == nil else { return }
+        guard waitsForSteam(game) else { launch(game, flat: flat); return }
+        if !canStart(game, flat: flat, assumingSteam: true) { launch(game, flat: flat); return }   // (says why it cannot)
+        steamWait = SteamWait(gameID: game.id, name: game.name, flat: flat, state: nil)
+        steamWaitTask = Task { @MainActor in await waitForSteam(game, flat: flat) }
+    }
+
+    /// What the Play page says while a start waits for Steam for Mac.
+    var steamWaitText: String? {
+        guard let wait = steamWait else { return nil }
+        switch wait.state {
+        case nil, .ready?: return TF("Checking Steam for Mac before starting %@…", "%@ を起動する前に Steam for Mac を確認しています…", wait.name)
+        case .notRunning?: return TF("Steam for Mac is not running. Open it and sign in: %@ starts when it is ready.", "Steam for Mac が起動していません。開いてサインインしてください。準備ができると %@ が起動します。", wait.name)
+        case .notSignedIn?: return TF("Waiting for Steam to sign in… %@ starts when it has.", "Steam のサインインを待っています… 済むと %@ が起動します。", wait.name)
+        case .offline?: return TF("Waiting for Steam to go online… %@ signs in through Steam, which needs Steam's servers.", "Steam がオンラインになるのを待っています… %@ は Steam 経由でサインインするので、Steam のサーバーへの接続が必要です。", wait.name)
+        case .unavailable?: return SteamWaitText.unavailable
+        }
+    }
+
+    func cancelSteamWait() {
+        steamWaitTask?.cancel()
+        steamWaitTask = nil
+        steamWait = nil
+    }
+
+    private func waitForSteam(_ game: Game, flat: Bool) async {
+        let needsOnline = game.title?.launcher == true
+        while !Task.isCancelled, steamWait?.gameID == game.id {
+            let state = await steamReadiness()
+            guard !Task.isCancelled, steamWait?.gameID == game.id else { return }
+            if state.allowsStart(needsOnline: needsOnline) {
+                steamRunning = true                       // (seen just now: the 4-second refresh may not have yet)
+                steamWait = nil
+                steamWaitTask = nil
+                launch(game, flat: flat)
+                return
+            }
+            if state == .unavailable {
+                steamWait = nil
+                steamWaitTask = nil
+                error = SteamWaitText.unavailable
+                return
+            }
+            steamWait?.state = state
+            try? await Task.sleep(nanoseconds: steamPollNanoseconds)
+        }
+    }
+
+    private func launch(_ game: Game, flat: Bool) {
         guard play?.running != true else { return }
         if !Play.dryRun, !canStart(game, flat: flat) { error = backend(forID: game.id) == .nativeARM64 ? game.title.flatMap { nativeReason(for: $0) } ?? T("Open Steam and sign in: the games need it.", "Steam を開いてサインインしてください。ゲームに必要です。") : T("Finish Get started first.", "先に「はじめに」を済ませてください。"); return }
         error = nil
@@ -711,5 +785,12 @@ struct Job {
                         URLQueryItem(name: "command", value: "VeRantyx app: \(play?.backend.rawValue ?? effectivePreference.rawValue), \(headset.rawValue)\(headset == .quest && wired ? ", USB cable" : ""), \(quality.rawValue)")]
         c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")   // (a "+" is a space to GitHub)
         return c.url!
+    }
+}
+
+enum SteamWaitText {
+    static var unavailable: String {
+        T("Couldn't reach Steam for Mac: its client could not be loaded. Open Steam, let it finish updating, sign in, and try again.",
+          "Steam for Mac に接続できませんでした（Steam のクライアントを読み込めません）。Steam を開いて更新を終え、サインインしてから、もう一度。")
     }
 }

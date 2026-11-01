@@ -50,7 +50,7 @@ static void *mac_lib(void) {
         sigaction(i, NULL, &now);
         if (now.sa_sigaction != before[i].sa_sigaction) { vx_log("Steam bridge: steamclient replaced the handler of signal %d; restored", i); sigaction(i, &before[i], NULL); }
     }
-    if (!g_lib) vx_log("Steam bridge: cannot load %s: %s", path, dlerror());
+    if (!g_lib) vx_log("Steam bridge: cannot load %s, so the program runs without Steam (its sign-in through Steam fails): %s", path, dlerror());
     else if (g_trace) vx_log("Steam bridge: loaded %s", path);
     return g_lib;
 }
@@ -214,6 +214,14 @@ static u64 call_method(proxy *p, int k, u64 *a) {
     if (!strncmp(p->name, "SteamClient", 11))
         for (int i = 1; i < 3 && !name && r; i++) name = version_string(a[i], ver, sizeof ver);
     if (name && r) r = (u64)(uintptr_t)wrap((void *)(uintptr_t)r, name);
+    // A program whose Steam sign-in fails says little about why (the Frontier launcher shows "this Frontier account does
+    // not own Elite Dangerous", issue #10): no pipe or no user from the Mac client is said in the log, always.
+    if (!strncmp(p->name, "SteamClient", 11) && !r && (k == 0 || k == 2)) {
+        static int said[3];
+        if (!said[k]++) vx_log("Steam bridge: Mac Steam %s; the program runs without Steam (its sign-in through Steam fails)",
+                              k == 0 ? "is not reachable (CreateSteamPipe failed: is Steam for Mac running?)"
+                                     : "has no signed-in user (ConnectToGlobalUser failed: is Steam for Mac signed in, and not still starting?)");
+    }
     if (g_trace > 2) { Dl_info di; if (dladdr((void *)fn, &di)) vx_log("Steam bridge: %s method %d is %s+%#lx", p->name, k, di.dli_fname, (unsigned long)((char *)fn - (char *)di.dli_fbase)); }
     if (g_trace && (first || g_trace > 1)) vx_log("Steam bridge: %s method %d (%#llx, %#llx, %#llx, %#llx) = %#llx%s%s", p->name, k,
                                  (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2], (unsigned long long)a[3],
@@ -390,6 +398,37 @@ int vx_steambridge_enabled(void) {
     static int on = -1;
     if (on < 0) on = getenv("VXRT_STEAM_BRIDGE") && atoi(getenv("VXRT_STEAM_BRIDGE"));
     return on;
+}
+
+// "vxrt --vxrt-steam-check": whether a game started now would get Steam, asked of the same steamclient.dylib (and the
+// same slice) the bridge loads, the way steam_api does: a pipe to the running client, its signed-in user, and whether
+// that user is online (a game's sign-in through Steam needs Steam's servers: Elite's Frontier launcher shows "does not
+// own Elite Dangerous" without them, issue #10). Then both are let go. Nothing of Steam's files is read or written.
+// One word on stdout and the exit status: ready 0, unavailable 2 (no client library), not-running 3 (no pipe),
+// not-signed-in 4 (no user), offline 5 (a user, not connected to Steam).
+int vx_steam_check(void) {
+    if (!mac_lib()) { puts("unavailable"); return 2; }
+    typedef SYSV int (*pipe_fn)(void);
+    typedef SYSV int (*user_fn)(int);
+    typedef SYSV int (*logged_fn)(int, int);
+    typedef SYSV void (*release_user_fn)(int, int);
+    typedef SYSV int (*release_pipe_fn)(int);
+    pipe_fn create = (pipe_fn)dlsym(g_lib, "Steam_CreateSteamPipe");
+    user_fn connect = (user_fn)dlsym(g_lib, "Steam_ConnectToGlobalUser");
+    logged_fn logged = (logged_fn)dlsym(g_lib, "Steam_BLoggedOn");
+    release_user_fn release_user = (release_user_fn)dlsym(g_lib, "Steam_ReleaseUser");
+    release_pipe_fn release_pipe = (release_pipe_fn)dlsym(g_lib, "Steam_BReleaseSteamPipe");
+    if (!create || !connect || !logged || !release_user || !release_pipe) { puts("unavailable"); return 2; }
+    int pipe = create();
+    if (!pipe) { puts("not-running"); return 3; }
+    int user = connect(pipe), status = 0;
+    if (!user) { puts("not-signed-in"); status = 4; }
+    else if (!logged(user, pipe)) { puts("offline"); status = 5; }
+    else puts("ready");
+    if (user) release_user(pipe, user);
+    release_pipe(pipe);
+    fflush(stdout);
+    return status;
 }
 
 void vx_steambridge_init(void) {
