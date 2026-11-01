@@ -1221,6 +1221,56 @@
           }
         }
       }
+    },
+    "Direct Wi-Fi link to the Mac, not through the router (applies at the next connection)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ルーターを通さず Mac と直接 Wi-Fi でつなぐ（次の接続から）"
+          }
+        }
+      }
+    },
+    "Connected to the Mac, %@. Waiting for video from the encoder.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mac に接続済み（%@）。エンコーダーからの映像を待っています。"
+          }
+        }
+      }
+    },
+    "direct Wi-Fi link (%@)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "直接の Wi-Fi（%@）"
+          }
+        }
+      }
+    },
+    "through the router (%@)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ルーター経由（%@）"
+          }
+        }
+      }
+    },
+    "unknown link": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "不明な経路"
+          }
+        }
+      }
     }
   }
 }
