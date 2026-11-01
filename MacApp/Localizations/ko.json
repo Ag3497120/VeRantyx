@@ -284,5 +284,5 @@
  "Steam for Mac was not signed in when the game started.": "게임이 시작될 때 Mac용 Steam에 로그인되어 있지 않았습니다.",
  "ALVR's setting (72 Hz unless changed)": "ALVR 설정 (바꾸지 않았다면 72 Hz)",
  "Refresh rate": "주사율",
- "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice; at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "헤드셋 화면의 주사율입니다. 60 fps 게임은 각 프레임을 두 번씩 보여 주는 120 Hz에서 가장 부드럽습니다. 72 Hz에서는 두 번 보이는 프레임과 한 번 보이는 프레임이 섞여 끊겨 보입니다. 헤드셋은 지원하는 주사율 중 가장 가까운 것을 씁니다. 다음 플레이부터 적용됩니다."
+ "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 60 Hz on a headset that has it (Quest 1); at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "헤드셋 화면의 주사율입니다. 60 fps 게임은 각 프레임을 두 번씩 보여 주는 120 Hz, 또는 60 Hz를 지원하는 헤드셋(Quest 1)에서는 60 Hz가 가장 부드럽습니다. 72 Hz에서는 두 번 보이는 프레임과 한 번 보이는 프레임이 섞여 끊겨 보입니다. 헤드셋은 지원하는 주사율 중 가장 가까운 것을 씁니다. 다음 플레이부터 적용됩니다."
 }
