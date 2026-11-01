@@ -285,5 +285,6 @@
  "ALVR's setting (72 Hz unless changed)": "Ajuste de ALVR (72 Hz si no se cambió)",
  "Refresh rate": "Frecuencia de actualización",
  "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 60 Hz on a headset that has it (Quest 1); at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "La frecuencia de la pantalla del visor. Un juego a 60 fps se ve más fluido a 120 Hz, donde cada fotograma se muestra dos veces, o a 60 Hz en un visor que la tenga (Quest 1); a 72 Hz unos fotogramas se muestran dos veces y otros una, lo que produce tirones. El visor usa la frecuencia más cercana que tenga. Se aplica en la próxima partida.",
- "The headset's field of view changed after the game started (ALVR's FoV setting?): stop and start the game again, or the eyes do not line up.": "El campo de visión del visor cambió después de empezar el juego (¿el ajuste FoV de ALVR?): detén el juego y vuelve a empezarlo, o los ojos no coincidirán."
+ "The headset's field of view changed after the game started (ALVR's FoV setting?): stop and start the game again, or the eyes do not line up.": "El campo de visión del visor cambió después de empezar el juego (¿el ajuste FoV de ALVR?): detén el juego y vuelve a empezarlo, o los ojos no coincidirán.",
+ "Stream over UDP (try it if the picture lags on Wi-Fi)": "Transmitir por UDP (pruébalo si la imagen se retrasa por Wi-Fi)"
 }

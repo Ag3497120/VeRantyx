@@ -981,6 +981,8 @@ struct HeadsetView: View {
                         Numbered(2, T("Connect it to the Mac with a USB-C cable (USB 3 if you can), put it on and allow USB debugging for this Mac.", "USB-C ケーブル（できれば USB 3）で Mac につなぎ、ヘッドセットを着けて、この Mac の USB デバッグを許可します。"))
                         Numbered(3, T("ALVR opens on the headset by itself when a game starts. The first time, Google's Android tools (adb) are downloaded once, unless Homebrew's are installed.", "ゲームを始めるとヘッドセットの ALVR が自動で開きます。初回だけ Google の Android ツール（adb）をダウンロードします（Homebrew のものがあればそれを使います）。"))
                     } else {
+                        Toggle(T("Stream over UDP (try it if the picture lags on Wi-Fi)", "UDP で配信する（Wi-Fi で映像が遅れる時に試す）"), isOn: $model.alvrUDP)
+                            .disabled(model.configurationLocked)
                         Text(T("Use 5 GHz Wi-Fi (an 80 MHz channel if your router has it), with the Mac close to the router or wired to it. On 2.4 GHz the picture stutters and smears; if the picture blurs or the controllers lag, try the USB cable.",
                                "5 GHz の Wi-Fi（できれば 80 MHz のチャンネル）を使い、Mac はルーターの近くか有線で。2.4 GHz だとカクついて滲みます。画質が落ちたりコントローラが遅れる時は USB ケーブルを。"))
                             .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
