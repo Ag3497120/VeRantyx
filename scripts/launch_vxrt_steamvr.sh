@@ -52,6 +52,11 @@ mkdir -p "$LOG_DIR" "$VXRT_VR_OVERLAY/config"
 export VERANTYX_GAME_PROMPT_FILE="${VERANTYX_GAME_PROMPT_FILE:-$LOG_DIR/game-prompt.txt}"
 export VERANTYX_GAME_STATE_FILE="${VERANTYX_GAME_STATE_FILE:-$LOG_DIR/game-state.json}"
 export VERANTYX_SHADER_PROGRESS_FILE="${VERANTYX_SHADER_PROGRESS_FILE:-$LOG_DIR/shader-progress.json}"
+if [[ "${VERANTYX_LOADING_MAP:-0}" == 1 ]]; then
+    export VERANTYX_LOADING_FILE="$LOG_DIR/loading-map.json"
+    export VERANTYX_LOADING_STAGE_FILE="$VXRT_VR_ROOT/drive_c/vr_loading_stage.json"
+    rm -f "$VERANTYX_LOADING_FILE" "$VERANTYX_LOADING_STAGE_FILE" "$VERANTYX_LOADING_STAGE_FILE.ready" "$VERANTYX_LOADING_STAGE_FILE.tmp"
+fi
 rm -f "$VERANTYX_GAME_PROMPT_FILE" "$VERANTYX_GAME_STATE_FILE"
 if [[ -s "$VERANTYX_SHADER_PROGRESS_FILE" ]]; then
     mv -f "$VERANTYX_SHADER_PROGRESS_FILE" "${VERANTYX_SHADER_PROGRESS_FILE%.json}.prev.json"
@@ -200,6 +205,9 @@ cleanup() {
     pkill -TERM -f "^$ENCODER\$" 2>/dev/null || true             # (the encoder itself: ENCODER_PID is its restart loop)
     [[ -n "${WEBUI_PID:-}" ]] && kill -TERM "$WEBUI_PID" 2>/dev/null || true
     rm -f "$VERANTYX_GAME_PROMPT_FILE" "$VERANTYX_GAME_STATE_FILE"
+    if [[ "${VERANTYX_LOADING_MAP:-0}" == 1 ]]; then
+        rm -f "$VERANTYX_LOADING_FILE" "$VERANTYX_LOADING_STAGE_FILE" "$VERANTYX_LOADING_STAGE_FILE.ready" "$VERANTYX_LOADING_STAGE_FILE.tmp"
+    fi
     [[ -n "${VR_PID:-}" ]] && kill -TERM "$VR_PID" 2>/dev/null || true
     pkill -TERM -f "$VXRT_PATTERN" 2>/dev/null || true   # vrserver and vrcompositor outlive vrcmd, as on Windows
     sleep 1

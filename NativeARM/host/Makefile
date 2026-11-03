@@ -18,7 +18,7 @@ RUNTIME := $(filter-out runtime/media/kl_phonon_hrtf.S runtime/media/kl_menu_fon
 INC := -I$(KL)/runtime -I$(KL)/runtime/jni -I$(KL)/runtime/libc -I$(KL)/runtime/gfx \
        -I$(KL)/runtime/xr -I$(KL)/runtime/media -I$(KL)/runtime/guest -I$(KL)/runtime/diag \
        -I$(KL)/vendor-moltenvk/out/include
-CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(INC)
+CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(INC) $(SANITIZE)
 LDLIBS := -lz -lresolv -liconv -framework AudioToolbox -framework CoreAudio \
           -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
           -framework CoreFoundation -framework AVFoundation -framework Foundation
@@ -31,7 +31,7 @@ VRRT_DIR  := ../vrruntime
 VRRT_SRCS := $(notdir $(wildcard $(VRRT_DIR)/*.cpp))
 VRRT_OBJS := $(patsubst %,$(OUT)/vrrt/%.o,$(VRRT_SRCS))
 VRRT_HDRS := $(wildcard $(VRRT_DIR)/*.h) $(wildcard $(VRRT_DIR)/*.inc) $(wildcard $(VRRT_DIR)/openvr/*.h)
-CXXFLAGS  := -std=c++17 -g -O1 -Wall -Wno-unused-parameter -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -I$(VRRT_DIR) -I$(KL)/vendor-moltenvk/out/include
+CXXFLAGS  := -std=c++17 -g -O1 -Wall -Wno-unused-parameter -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -I$(VRRT_DIR) -I$(KL)/vendor-moltenvk/out/include $(SANITIZE)
 MVK_DIR   := $(abspath $(KL)/vendor-moltenvk/out/macos)
 HDRS      := $(wildcard $(KL)/runtime/*.h) $(wildcard $(KL)/runtime/*/*.h) $(wildcard *.h)
 
@@ -41,7 +41,7 @@ all: $(OUT)/alyx_host
 # under 4 GB, and vm_map_min is 4 GB anyway — see kl_luafix.c for how Valve's
 # low-2 GB LuaJIT arena is handled instead.)
 $(OUT)/alyx_host: $(RT_OBJS) $(HOST_OBJS) $(VRRT_OBJS)
-	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -g -o $@ $^ $(LDLIBS)
+	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -g $(SANITIZE) -o $@ $^ $(LDLIBS)
 
 $(OUT)/vrrt/%.o: $(VRRT_DIR)/% $(VRRT_HDRS)
 	@mkdir -p $(dir $@)
@@ -72,10 +72,17 @@ $(OUT)/host_files.o: ../tests/host_files.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
 $(OUT)/host_files: $(OUT)/host_files.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS)
-	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -o $@ $^ $(LDLIBS)
+	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(SANITIZE) -o $@ $^ $(LDLIBS)
 
-check: $(OUT)/host_files
+$(OUT)/host_sync.o: ../tests/host_sync.c
+	$(CC) $(CFLAGS) -I. -c $< -o $@
+
+$(OUT)/host_sync: $(OUT)/host_sync.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS)
+	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(SANITIZE) -o $@ $^ $(LDLIBS)
+
+check: $(OUT)/host_files $(OUT)/host_sync
 	@mkdir -p $(OUT)/file-test
 	$(OUT)/host_files $(abspath $(OUT)/file-test)
+	$(OUT)/host_sync
 
 .PHONY: all probe clean check

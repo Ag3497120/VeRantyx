@@ -32,6 +32,14 @@ def digest(path):
         return hashlib.file_digest(source, 'sha256').hexdigest()
 
 
+def controller_input(packet, elapsed, menu_times, menu_hold=.25):
+    # Continue loading with trigger pulses, then leave menu interaction alone.
+    trigger = 255 if elapsed % 15 < .2 and all(elapsed < at for at in menu_times) else 0
+    packet[192:196] = bytes([1,1,0,trigger])
+    left = 2 << 8 if any(at <= elapsed < at+menu_hold for at in menu_times) else 0
+    struct.pack_into('<II',packet,196,0,left)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--installation', type=Path, required=True, help='version with lib/ and game-root/')
@@ -43,9 +51,13 @@ def main():
     ap.add_argument('--allow-force-kill', action='store_true',
                     help='explicitly allow SIGKILL after the normal quit timeout')
     ap.add_argument('--sample', action='store_true', help='sample native stacks across late head turns')
+    ap.add_argument('--audio', action='store_true', help='enable game audio through the Mac output')
     ap.add_argument('--load', help='save name to copy into the private overlay and load')
     ap.add_argument('--hold-yaw', type=float, help='hold a fixed yaw in radians')
     ap.add_argument('--head-pitch', type=float, default=0, help='head pitch in degrees, negative looks down')
+    ap.add_argument('--menu-at', type=positive_seconds, action='append', default=[],
+                    help='pulse the left secondary button at this elapsed second (repeat to open/close the game menu)')
+    ap.add_argument('--menu-hold', type=positive_seconds, default=.25, help='duration of each menu-button press in seconds')
     ap.add_argument('--burst', help='START:DURATION:HZ of small consecutive frame captures')
     ap.add_argument('--set', action='append', default=[])
     args = ap.parse_args()
@@ -120,13 +132,14 @@ def main():
     command = [str(args.host.resolve()), '--libdir', str(source/'lib'), '--game', str(overlay), '--',
                '-vr', '-steam', '-noasserts', '-nopassiveasserts', '-vulkan', '-nowindow',
                '-noautofidelity', '+vr_fidelity_level', '3', '+map', args.map,
-               '+hlvr_pause_after_realmap', '0', '-nosound']
+               '+hlvr_pause_after_realmap', '0']
+    if not args.audio: command.append('-nosound')
     if args.load:
         if not re.fullmatch(r'[A-Za-z0-9_/-]+',args.load) or args.load.startswith('/'):
             raise ValueError('save name must stay inside the private save directory')
         command+=['+load',args.load]
         result['load_save']=args.load
-    result.update(command=command, seconds=args.seconds, environment={k:v for k,v in env.items()
+    result.update(command=command, seconds=args.seconds, menu_press_schedule_s=args.menu_at, menu_press_duration_s=args.menu_hold, environment={k:v for k,v in env.items()
                   if k.startswith(('VERANTYX_', 'KL_', 'MVK_CONFIG_', 'XDG_'))},
                   commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(),
                   host_sha256=digest(args.host))
@@ -184,7 +197,7 @@ def main():
                 if args.hold_yaw is not None: yaw=args.hold_yaw
                 packet = bytearray(312)
                 struct.pack_into('<48f', packet, 0, *(matrix(yaw,0,1.6,0,math.radians(args.head_pitch))+matrix(yaw,-.2,1.2,-.4)+matrix(yaw,.2,1.2,-.4)))
-                packet[192:196] = bytes([1,1,0,255 if elapsed%15<.2 else 0])
+                controller_input(packet,elapsed,args.menu_at,args.menu_hold)
                 struct.pack_into('<d8f', packet, 244, time.monotonic(), *([-1.2798622,1.2798622,-1.2798622,1.2798622]*2))
                 packet[286] = 1
                 publish_pose()
@@ -218,6 +231,7 @@ def main():
             measurement_duration = time.monotonic()-start
             natural_exit = process.poll()
             packet[194:196] = bytes(2)
+            packet[196:204] = bytes(8)
             shutdown = wait_for_game(process, quit_request, args.quit_timeout, args.allow_force_kill,
                                      progress=checkpoint, tick=publish_pose)
             if profiler is not None:
@@ -229,7 +243,9 @@ def main():
     log = final_log
     observe('exited_early', natural_exit is not None, log)
     observe('published_frame_samples', len(samples), series)
+    if args.menu_at: observe('menu_press_schedule_s',args.menu_at,run/'command.json')
     observe('last_frame_sequence', last_seq, series)
+    observe('final_frame_age_s', measurement_duration-samples[-1]['t'] if samples else None, series)
     observe('sampled_publication_max_gap_s', max((s['gap_s'] for s in samples[1:]),default=None),series)
     observe('head_turn_window_30s_max_sample_gap_s',max((s['gap_s'] for s in samples if s['t']>=30),default=None),series)
     observe('head_turn_window_30s_sample_gaps_over_100ms',sum(s['gap_s']>.1 for s in samples if s['t']>=30),series)

@@ -361,6 +361,20 @@ struct NativeViewSnapshot: Codable {
     var tangents: [Float]
 }
 
+struct NativeTrackingActivity {
+    private var previous: (sequence: UInt32, timestamp: Double)?
+    private var advancedAt: Date?
+    mutating func observe(_ snapshot: NativeViewSnapshot?, now: Date) -> Bool {
+        if let snapshot, snapshot.timestamp.isFinite, snapshot.timestamp > 0 {
+            if let old = previous, snapshot.timestamp >= old.timestamp {
+                if snapshot.sequence != old.sequence && snapshot.timestamp > old.timestamp { advancedAt = now }
+            } else { advancedAt = nil }
+            previous = (snapshot.sequence,snapshot.timestamp)
+        }
+        return advancedAt.map { (0..<3).contains(now.timeIntervalSince($0)) } ?? false
+    }
+}
+
 enum NativeIPC {
     static let block = 88 + 4096 * 4096 * 8
     static let hands = 64 + 2 * block

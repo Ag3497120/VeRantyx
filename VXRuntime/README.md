@@ -74,6 +74,23 @@ The trigger prompt requires the game's explicit `Press Trigger To Start` message
 from the live game process, and an empty compiler queue for one second. Continuing, another load or a disconnect
 clears that input wait. No whole-game percentage is shown: the game can request further shader batches.
 
+Alyx's later loads use the encoder's shared city-map renderer, including the side
+point field and stable depth shell. The web UI mailbox supplies map/text state;
+the capture proxy mirrors successful `SetStageOverride_Async` and clear calls
+for the surrounding room, preserving SteamVR's calls and ready events. Both
+paths read the owner's installed OBJ/DDS assets. The initial startup retains the
+graphics notice. The map's trigger hint follows the same fresh, idle compiler
+policy as that notice, including the observed Russian start message. Standing
+height uses the driver's pose-history correction. `VERANTYX_LOADING_MAP=0`
+selects the earlier text-only path. `make loading-stage-check` and
+`../tests/webui_prompt_test.sh` exercise the Windows bridge; the native loading-map
+selftest checks identical room rendering from Windows-relative/native-absolute
+paths, delayed hints, side points and depth stability. The harness records actual
+map frames accepted by the encoder separately from normal game frames.
+`tools/vxrt_run.py alyx loading_map --quality 3k --stream --runtime-root
+<app>/Contents/Resources/runtime` checks the packaged launchers and binaries in
+isolated harness roots and records their hashes, without rebuilding the app.
+
 D3D11 automatically saves Metal IR and GPU binaries in `~/Library/Caches/VeRantyx/shaders`. The first use of a
 render or compute pipeline records an `MTLBinaryArchive`; a later process loads its IR as an `MTLLibrary`, then
 reuses the GPU code with `MTLPipelineOptionFailOnBinaryArchiveMiss`. A counted archive hit therefore cannot hide

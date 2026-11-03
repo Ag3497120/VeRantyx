@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -236,6 +237,27 @@ class QuitTests(unittest.TestCase):
         status, result = self.probe(broken=True)
         self.assertEqual((status, result['status']), (1, 'error'))
         self.assertIn('synthetic collection error', result['collection_error'])
+
+
+class ControllerProbeTests(unittest.TestCase):
+    def test_menu_button_layout_and_trigger_suppression(self):
+        packet = bytearray(312)
+        render_probe.controller_input(packet, 0, [62,82])
+        self.assertEqual(packet[192:196], bytes([1,1,0,255]))
+        render_probe.controller_input(packet, 62.1, [62,82])
+        right,left = struct.unpack_from('<II',packet,196)
+        self.assertEqual((right,left>>8), (0,2))
+        self.assertEqual(left&255, 0)
+        render_probe.controller_input(packet, 75, [62,82])
+        self.assertEqual(packet[194:204], bytes(10))
+        render_probe.controller_input(packet, 82.1, [62,82])
+        self.assertEqual(struct.unpack_from('<I',packet,200)[0], 512)
+        render_probe.controller_input(packet, 82.3, [62,82])
+        self.assertEqual(struct.unpack_from('<I',packet,200)[0], 0)
+        render_probe.controller_input(packet, 63, [62], 1.5)
+        self.assertEqual(struct.unpack_from('<I',packet,200)[0], 512)
+        render_probe.controller_input(packet, 63.5, [62], 1.5)
+        self.assertEqual(struct.unpack_from('<I',packet,200)[0], 0)
 
 
 if __name__ == '__main__':

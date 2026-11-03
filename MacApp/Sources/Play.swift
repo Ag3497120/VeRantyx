@@ -69,6 +69,7 @@ enum Quality: String, CaseIterable, Identifiable {
     @ObservationIgnored private(set) var nativeSession: URL?
     @ObservationIgnored private var nativeConfig: URL?
     @ObservationIgnored private var nativeFrameRate = NativeFrameRate()
+    @ObservationIgnored private var nativeTracking = NativeTrackingActivity()
     var nativeQuitTimedOut = false
     /// On the Mac's screen, without SteamVR or a headset.
     let flat: Bool
@@ -383,7 +384,7 @@ enum Quality: String, CaseIterable, Identifiable {
             : launcherNotice
     }
 
-    private func pollNative() {
+    func pollNative(now: Date = Date()) {
         guard let nativeSession else { return }
         let game = Play.tail(gameLog, 10000)
         gameLines = game.split(separator: "\n").suffix(14).map(String.init)
@@ -407,9 +408,17 @@ enum Quality: String, CaseIterable, Identifiable {
         if let line = game.split(separator: "\n").last(where: { $0.contains("frame sample:") }) {
             if let rate = nativeFrameRate.read(String(line)) { fps = rate }
         }
+        let encoderLog = nativeSession.appendingPathComponent("hardware-encoder.log")
+        if Play.modificationDate(encoderLog) > now.addingTimeInterval(-12),
+           let line = Play.tail(encoderLog, 6000).split(separator: "\n").last(where: { $0.hasPrefix("Pipeline ") }),
+           let rate = Play.number(in: line, after: "capture=") { fps = rate }
         let log = Play.tail(Paths.alvrLog, 6000)
-        headsetConnected = Play.alvrConnected(log, modifiedAt: Play.modificationDate(Paths.alvrLog), since: startedAt)
-        readHeadset(log)
+        // ALVR's frame reports stop when the game stalls. Advancing pose
+        // packets still prove the headset is present, independently of frames.
+        let tracking = nativeTracking.observe(NativeIPC.snapshot(nativeSession.appendingPathComponent("frame.dat")), now: now)
+        let reports = Play.alvrConnected(log, modifiedAt: Play.modificationDate(Paths.alvrLog), since: startedAt, now: now)
+        headsetConnected = tracking || reports
+        readHeadset(reports ? log : "")
     }
 
     /// The newest "VeRantyx: headset:" line: what the headset shows, against the frames the Mac makes.

@@ -1072,3 +1072,145 @@ feature errors (`o19`), then exits normally (`o560`). Newly encountered material
 can still appear progressively during a turn, as specified by the existing
 pipeline policy. These captures remain an isolated diagnostic, not a headset
 playtest or proof of all viewpoints.
+
+### Loading-map styling and frame continuity (2026-11-02)
+
+Compared the native interstitial with the user's `Untitled.mov`. The renderer
+now includes the installed map's sparse `voxel_cubes` point field, brighter
+background city outlines and the wider, translucent amber header. The loading
+callout uses the installed spinner SVGs, animated dots, a smaller label facing
+the viewer and an elbow on its leader. Game assets remain read-only and are
+not bundled. Fresnel inputs and opacity are clamped to keep the composite valid.
+
+A blocked-worker regression reproduced mailbox updates discarding the cached
+stereo image. Updates and unsuccessful renders now retain the last complete
+image with its original head pose and timestamp; before the first image is
+ready, the encoder skips the empty frame. Hidden/finished loads still clear
+immediately. `check-loading-map` covers stationary repeatability, delayed
+updates, failed renders, head motion and cleanup, using synthetic fixtures.
+Installed-asset renders were also inspected without starting the game. Native
+checks and encoder typechecking pass. The full Windows check still fails on the
+previously recorded translator differential cases (10 forms, 272 cases).
+Actual level transitions and the reported blinking need a headset retest;
+no gameplay baseline or playtest level changes.
+
+### Loading-map depth stability and a menu stall (2026-11-03)
+
+The user still observed buildings flashing after the cached-frame fix. Identical
+stationary renders missed a separate depth conflict: the invisible occlusion
+shell and the coloured/wire surfaces rounded coincident depths differently.
+Only the occlusion shell now moves slightly away from the eye in view space;
+visible geometry and its stereo position stay unchanged. DDS uploads retain
+every available mip below the existing size cap, with trilinear filtering, to
+reduce shimmering of the small wire/AO details.
+
+`check-loading-map` now renders a wholly synthetic city before and after a
+0.0001-radian head turn. Removing the depth adjustment reproduces a connected
+flashing patch of 391 pixels; the corrected renderer's largest patch is three
+pixels (limit 16). It also checks a complete bounded mip chain and rejection of
+a truncated one. Installed-asset renders and the packaged encoder pass the
+same checks. Headset level transitions still require verification.
+
+The reported menu freeze is visible in user session
+`2AD27821-07F6-419F-816B-226C8070B7E0`, rather than a new harness measurement.
+After the final `paused the game`, game frame publication and input polling
+stop, while the encoder initially continues receiving fresh tracking packets.
+A read-only process sample places the main thread in a resource-loading path
+through Panorama and `CThreadRWLock_FastRead::HandleFirstWriteLockTransition`;
+the render thread waits in `UnlockRead_LockForWrite`. The sampled shader
+workers are idle. A resource-lock deadlock is a suspicion, not an established
+cause: the lock objects and their ownership were not captured.
+
+The Mac app previously inferred headset presence solely from ALVR's video
+reports, which also stop during a game stall. It now accepts advancing coherent
+tracking packets as independent evidence of a connected headset, expires them
+after three seconds without progress and uses fresh encoder capture rates
+instead of retaining the game's last nonzero frame rate. Stale ALVR statistics
+are cleared. Synthetic app integration covers a video stall with live tracking,
+tracking loss and reconnect. This corrects the misleading headset-wait spinner;
+it does not repair the game's resource wait.
+
+The native probe accepts scheduled left-secondary presses (`--menu-at`,
+`--menu-hold`) and stops automatic trigger pulses before the first press, so
+they cannot dismiss the menu. Short 0.25-second presses reached the input path
+but did not open it. With 1.5-second holds, run
+`20261103T054318Z-alyx-native-startup` captures the open menu (`o18`–`o19`),
+then closes it and retains subsequent frames (`o21`–`o22`). It records no early
+exit (`o1`), zero fatal diagnostics (`o23`) and acknowledged normal shutdown,
+exit code zero (`o28`). The menu stall did not reproduce in this isolated
+105-second, silent, simulated-head run; real headset/audio behaviour and the
+intermittent resource wait remain unverified.
+
+### Menu-stall reproduction and mutex identity (2026-11-03 follow-up)
+
+The user confirms the left Y/B button. Enabling audio (`render_probe --audio`),
+turning the simulated head and holding that button reproduces the stall in
+`20261103T060248Z-alyx-native-startup`: the final frame arrives at 90.327 s of
+the 260-second collection. The captured CPU profile (`o25`) has the same main
+write-lock transition and render-thread upgrade waits as the user session;
+normal quit is not delivered or acknowledged (`o26`). The condition-variable
+addresses place both waiters in the same resource lock. This supersedes the
+earlier failure to reproduce with a silent, stationary-head probe.
+
+Klepton's address-keyed mutex map erased keys on `pthread_mutex_destroy`,
+breaking linear-probe chains. A lookup of a different, still-live mutex could
+then create a second host mutex at the hole. The old and new objects no longer
+excluded one another, permitting lost state updates/wakes. Destroy now retains
+the address key and unlocked host object, consistent with the existing pooled
+init/condition-variable policy. The existing table bound is unchanged.
+
+The actual-host regression initializes a dispersed synthetic mutex pool, keeps
+half locked, destroys the other half and attempts acquisition from another
+thread. Before the fix, 54 held mutexes admit another owner; afterward, none
+do. `make -C NativeARM/host check` includes it. Entire-host ASan/UBSan and TSan
+builds also pass (`OUT=../build/host-asan SANITIZE=-fsanitize=address,undefined`
+and `OUT=../build/host-tsan SANITIZE=-fsanitize=thread`). Use separate output
+directories so instrumented objects cannot be reused in the normal host.
+
+With the same audio, head motion and six 1.5-second button holds, fixed-host run
+`20261103T061021Z-alyx-native-startup` completes 260 seconds (`o1`), has a final
+frame age of 0.019 s (`o5`), zero fatal diagnostics (`o43`) and acknowledged
+normal exit (`o48`). Three menu open/close cycles were inspected in its captures
+and pause/unpause log. Headset transport, physical controls, audio quality and
+longer gameplay still require user verification; no baseline or playtest level
+changed. The probe now records the final frame age, including a stall that
+extends to the end of collection rather than only gaps followed by a new frame.
+
+The mutex identity fix is **not sufficient to repair the menu stall**. Repeat
+old-host run `20261103T061550Z-alyx-native-startup` exits normally (`o31`),
+demonstrating that the failure is intermittent. Packaged fixed-host run
+`20261103T061922Z-alyx-native-startup` reproduces it: final frame age 169.666 s
+(`o5`), the same resource-wait CPU profile (`o26`) and unacknowledged quit
+followed by explicitly allowed harness force (`o27`). The validated identity
+fix remains, but the game's underlying resource wait is still unresolved.
+
+Read-only monitor run `20261103T062451Z-alyx-native-startup` samples the
+installed renderer's resource-lock counters without modifying the game. It
+completes normally, so it captures a healthy baseline rather than the stalled
+owner/counter state. The monitor exists only in the diagnostic host; it is not
+included in the app. Comparison `20261103T063123Z-alyx-native-menu-comparison`
+seals all five follow-up probes and the actual-host regression/sanitizer logs.
+Its `d1` and `d4` retain stalls before and after the identity fix, while `d2`,
+`d3` and `d5` retain healthy repeats. There is no established menu-stall fix.
+
+### Side-point filtering follow-up (2026-11-03)
+
+The user confirms that map flicker is gone and the menu opened during the
+latest headset session (`A949276E-9445-49F6-A96D-E83F9780C986`), but the side
+points disappeared. This is a user report, not a formal playtest or a new
+baseline; the intermittent menu issue above remains open.
+
+Installed-asset renders reproduce the point regression: the grid mesh still
+loads, but filtering its sparse authored mip chain removes its visible ink.
+Both point materials now sample the base image, retaining bilinear filtering
+and the existing colour, opacity, geometry and stereo placement. City and room
+materials retain mip filtering and the depth-shell adjustment. At the stream's
+2880x1620 size, an isolated installed point field has no pixels above red code
+24 before this correction and 1,670 afterward, matching its previous appearance.
+
+The loading-map selftest now uses a synthetic sparse point atlas with fading
+mips and checks visible contrast at both sides of both eyes, at 1536x864 and
+2880x1620, with a small head turn. This checks the rendered feature rather than
+only the presence of its mesh. The existing building-depth jitter check still
+passes with a largest changing patch of three pixels. Restored points need a
+headset confirmation; the user's no-flicker confirmation is preserved.

@@ -980,6 +980,8 @@ static void CaptureSubmit(vr::EVREye eye, const vr::Texture_t* texture,
 typedef vr::EVRCompositorError (VR_CALLTYPE *SubmitFn)(void*, vr::EVREye, const vr::Texture_t*, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags);
 typedef vr::EVRCompositorError (VR_CALLTYPE *WaitGetPosesFn)(void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
 typedef void (VR_CALLTYPE *PostPresentHandoffFn)(void*);
+typedef vr::EVRCompositorError (VR_CALLTYPE *SetStageFn)(void*, const char*, const vr::HmdMatrix34_t*, const vr::Compositor_StageRenderSettings*, uint32_t);
+typedef void (VR_CALLTYPE *ClearStageFn)(void*);
 
 struct CompositorHook {
     void** vtable;
@@ -988,6 +990,8 @@ struct CompositorHook {
     WaitGetPosesFn waitGetPoses;
     SubmitFn submit;
     PostPresentHandoffFn postPresentHandoff;
+    SetStageFn setStage;
+    ClearStageFn clearStage;
 };
 
 static vr::EVRCompositorError VR_CALLTYPE HookedSubmit(void* self, vr::EVREye eye,
@@ -1005,6 +1009,100 @@ static CompositorHook* FindCompositorHook(void* self) {
         if (g_compositorHooks[i].vtable == vtable) return &g_compositorHooks[i];
     }
     return nullptr;
+}
+
+// SteamVR's room and the web UI city are composed by the same Mac renderer as
+// native Alyx. Keep SteamVR's asynchronous call/events intact; only mirror its
+// successful requests, using an asset-relative path rather than a Windows drive.
+static SRWLOCK g_stageLock = SRWLOCK_INIT;
+static uint64_t g_stageToken = 0;
+static const char* kStageFile = "C:\\vr_loading_stage.json";
+static const char* kStageTemporary = "C:\\vr_loading_stage.json.tmp";
+
+static bool LoadingMapEnabled() {
+    char value[8] = {};
+    return GetEnvironmentVariableA("VERANTYX_LOADING_MAP", value, sizeof(value)) == 1 && value[0] == '1';
+}
+
+static bool StageModel(const char* path, char* relative, size_t capacity) {
+    if (!path) return false;
+    const size_t length = strnlen(path, 4097);
+    if (length > 4096) return false;
+    char normalized[4097];
+    for (size_t i = 0; i <= length; ++i) normalized[i] = path[i] == '\\' ? '/' : path[i];
+    const char* folder = "models/ui/dioramas/";
+    const char* leaf = nullptr;
+    for (const char* p = normalized; *p; ++p) {
+        if ((p == normalized || p[-1] == '/') && _strnicmp(p, folder, strlen(folder)) == 0) {
+            leaf = p + strlen(folder); break;
+        }
+    }
+    if (!leaf) return false;
+    const size_t nameLength = strlen(leaf);
+    if (nameLength <= 4 || nameLength > 100 || _stricmp(leaf + nameLength - 4, ".obj") != 0) return false;
+    for (size_t i = 0; i < nameLength - 4; ++i) {
+        const char c = leaf[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+    }
+    return snprintf(relative, capacity, "%s%s", folder, leaf) < (int)capacity;
+}
+
+static void PublishStage(const char* model, const vr::HmdMatrix34_t* transform,
+                         const vr::Compositor_StageRenderSettings* requested, uint32_t size) {
+    char relative[128];
+    if (!StageModel(model, relative, sizeof(relative)) || (requested && size < sizeof(*requested))) {
+        DeleteFileA(kStageFile); return;
+    }
+    vr::HmdMatrix34_t matrix = {};
+    matrix.m[0][0] = matrix.m[1][1] = matrix.m[2][2] = 1;
+    if (transform) matrix = *transform;
+    const auto settings = requested ? *requested : vr::DefaultStageRenderSettings();
+    const float values[] = {settings.m_PrimaryColor.r, settings.m_PrimaryColor.g, settings.m_PrimaryColor.b, settings.m_PrimaryColor.a,
+        settings.m_SecondaryColor.r, settings.m_SecondaryColor.g, settings.m_SecondaryColor.b, settings.m_SecondaryColor.a,
+        settings.m_flVignetteInnerRadius, settings.m_flVignetteOuterRadius, settings.m_flFresnelStrength};
+    for (int row = 0; row < 3; ++row) for (float value : matrix.m[row]) {
+        if (!std::isfinite(value)) { DeleteFileA(kStageFile); return; }
+    }
+    for (float value : values) if (!std::isfinite(value)) { DeleteFileA(kStageFile); return; }
+    FILE* file = fopen(kStageTemporary, "wb");
+    if (!file) return;
+    const uint64_t token = ++g_stageToken;
+    fprintf(file, "{\"model\":\"%s\",\"transform\":[", relative);
+    for (int i = 0; i < 12; ++i) fprintf(file, "%s%.9g", i ? "," : "", matrix.m[i / 4][i % 4]);
+    fprintf(file, "],\"settings\":[");
+    for (int i = 0; i < 11; ++i) fprintf(file, "%s%.9g", i ? "," : "", values[i]);
+    fprintf(file, "],\"cull\":%d,\"greyscale\":%d,\"wireframe\":%d,\"token\":%llu}",
+        settings.m_bBackfaceCulling, settings.m_bGreyscale, settings.m_bWireframe, (unsigned long long)token);
+    const bool written = !ferror(file);
+    const int closed = fclose(file);
+    if (!written || closed || !MoveFileExA(kStageTemporary, kStageFile, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(kStageTemporary); return;
+    }
+    char message[256];
+    snprintf(message, sizeof(message), "Loading stage mirrored token=%llu model=%s", (unsigned long long)token, relative);
+    Log(message);
+}
+
+static vr::EVRCompositorError VR_CALLTYPE HookedSetStage(void* self, const char* model,
+    const vr::HmdMatrix34_t* transform, const vr::Compositor_StageRenderSettings* settings, uint32_t size) {
+    CompositorHook* hook = FindCompositorHook(self);
+    if (!hook || !hook->setStage) return vr::VRCompositorError_RequestFailed;
+    AcquireSRWLockExclusive(&g_stageLock);
+    const auto result = hook->setStage(self, model, transform, settings, size);
+    if (result == vr::VRCompositorError_None) PublishStage(model, transform, settings, size);
+    ReleaseSRWLockExclusive(&g_stageLock);
+    return result;
+}
+
+static void VR_CALLTYPE HookedClearStage(void* self) {
+    CompositorHook* hook = FindCompositorHook(self);
+    if (!hook || !hook->clearStage) return;
+    AcquireSRWLockExclusive(&g_stageLock);
+    hook->clearStage(self);
+    DeleteFileA(kStageFile);
+    Log("Loading stage cleared");
+    ReleaseSRWLockExclusive(&g_stageLock);
 }
 
 static void ColumnMajorToHmdMatrix(const float* m, vr::HmdMatrix34_t* out) {
@@ -1566,7 +1664,10 @@ static bool InstallSubmitHook(void* compositor, const char* version) {
     const size_t submitIndex = interfaceNumber >= 27 ? 6 : 5;
     const size_t postPresentHandoffIndex = interfaceNumber >= 29 ? 9 :
         (interfaceNumber >= 27 ? 8 : 7);
-    const size_t lastHookedIndex = postPresentHandoffIndex;
+    // Tail slots are verified against the public 026 and 029 headers. Unknown
+    // interface revisions keep the existing capture hooks without touching them.
+    const size_t stageIndex = LoadingMapEnabled() ? (interfaceNumber == 26 ? 46 : interfaceNumber == 29 ? 48 : 0) : 0;
+    const size_t lastHookedIndex = stageIndex ? stageIndex + 1 : postPresentHandoffIndex;
     if (!VirtualProtect(&vtable[2], sizeof(void*) * (lastHookedIndex - 2 + 1), PAGE_EXECUTE_READWRITE, &oldProtect)) {
         Log("ERROR: VirtualProtect failed for IVRCompositor capture vtable entries");
         ReleaseSRWLockExclusive(&g_compositorHookLock);
@@ -1578,6 +1679,12 @@ static bool InstallSubmitHook(void* compositor, const char* version) {
     g_compositorHooks[count].waitGetPoses = (WaitGetPosesFn)vtable[2];
     g_compositorHooks[count].submit = (SubmitFn)vtable[submitIndex];
     g_compositorHooks[count].postPresentHandoff = (PostPresentHandoffFn)vtable[postPresentHandoffIndex];
+    if (stageIndex) {
+        g_compositorHooks[count].setStage = (SetStageFn)vtable[stageIndex];
+        g_compositorHooks[count].clearStage = (ClearStageFn)vtable[stageIndex + 1];
+        vtable[stageIndex] = (void*)&HookedSetStage;
+        vtable[stageIndex + 1] = (void*)&HookedClearStage;
+    }
     void* originalSubmit = vtable[submitIndex];
     vtable[2] = (void*)&HookedWaitGetPoses;
     vtable[submitIndex] = (void*)&HookedSubmit;

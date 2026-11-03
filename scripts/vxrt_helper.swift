@@ -15,7 +15,7 @@
 // secret, so this one comes from that origin), where it opens its own mailbox and tells the game's mailbox it is
 // "ready". Alyx gives up after a minute without that message ("Timed out waiting for response from Mongoose"). This
 // does what the page does at start, once per game (a second "ready" during a level load can leave the game paused);
-// the loading screens themselves are not shown. What the page would write over the loading screen (show_message:
+// loading messages also feed the encoder's shared map renderer. What the page would write over the loading screen (show_message:
 // after a level has loaded, Alyx waits, paused, for a trigger pull and says "Press Trigger To Start") goes into the
 // prompt file (VERANTYX_GAME_PROMPT_FILE, set by scripts/launch_vxrt_steamvr.sh), which the encoder draws into both
 // eyes' picture (MacEncoder/HardwareEncoder.swift, GamePromptOverlay); end_loading (the game goes on), the next
@@ -117,32 +117,52 @@ func log(_ text: String) {
 struct GamePrompt {
     private(set) var text: String?
     private(set) var phase = "gone"
+    private var firstLoad = true
+    private var map: [String: Any]?
+    var mapData: Data? {
+        map.flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) }
+    }
+    static func isStart(_ text: String) -> Bool {
+        ["press trigger to start", "press right hand to start", "press left hand to start",
+         "чтобы начать, нажмите: trigger"].contains(text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
     /// The words for a message the page shows: Alyx's start prompt in plain words (the pull has to last a moment:
     /// right after a level loads the game sees its input only a few times a second), in Japanese as well on a Mac
     /// set to Japanese; any other message as it is.
     static func words(_ message: String, japanese: Bool) -> String {
-        guard message.trimmingCharacters(in: .whitespaces).lowercased() == "press trigger to start" else { return message }
+        guard isStart(message) else { return message }
         return japanese ? "Hold the trigger to start\nトリガーを長押しして開始" : "Hold the trigger to start"
     }
     /// Takes one message; true when the text changed.
     mutating func take(_ message: [String: Any], japanese: Bool) -> Bool {
-        let before = (text, phase)
+        let before = (text, phase, mapData)
         switch message["type"] as? String {
         case "show_message":
             let t = (message["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             text = t.isEmpty ? nil : GamePrompt.words(t, japanese: japanese)
             // This is the game's explicit wait for input, not a pause inferred from missing frames.
-            if t.lowercased() == "press trigger to start" { phase = "waiting" }
+            if GamePrompt.isStart(t) { phase = "waiting" }
             else if phase == "waiting" { phase = "loading" }
-        case "begin_loading": text = nil; phase = "loading"
-        case "end_loading": text = nil; phase = "running"
+            if map != nil {
+                map?["messageText"] = t
+                map?["waitingForInput"] = phase == "waiting"
+            }
+        case "begin_loading":
+            text = nil; phase = "loading"
+            // The initial menu keeps its existing graphics/input notices.
+            // Subsequent loads use the same city and room as the native path.
+            map = firstLoad && (message["mapName"] as? String) == "startup" ? nil : message
+            map?["messageText"] = ""; map?["waitingForInput"] = false
+        case "end_loading":
+            if phase != "gone" { firstLoad = false }
+            text = nil; phase = "running"; map = nil
         default: break
         }
-        return text != before.0 || phase != before.1
+        return text != before.0 || phase != before.1 || mapData != before.2
     }
     mutating func clear() -> Bool {
-        let changed = text != nil || phase != "gone"
-        text = nil; phase = "gone"
+        let changed = text != nil || phase != "gone" || map != nil
+        text = nil; phase = "gone"; map = nil; firstLoad = true
         return changed
     }
 }
@@ -162,6 +182,13 @@ func writePrompt(_ text: String?, to path: String?) {
 var gamePrompt = GamePrompt()
 let promptFile = ProcessInfo.processInfo.environment["VERANTYX_GAME_PROMPT_FILE"]
 let stateFile = ProcessInfo.processInfo.environment["VERANTYX_GAME_STATE_FILE"]
+let mapFile = ProcessInfo.processInfo.environment["VERANTYX_LOADING_FILE"]
+
+func writeLoadingMap(to path: String?) {
+    guard let path, !path.isEmpty else { return }
+    if let data = gamePrompt.mapData { try? data.write(to: URL(fileURLWithPath: path), options: .atomic) }
+    else { try? FileManager.default.removeItem(atPath: path) }
+}
 
 func writeGameState(to path: String?) {
     guard let path, !path.isEmpty else { return }
@@ -174,6 +201,7 @@ func writeGameState(to path: String?) {
 func publishGamePrompt() {
     writePrompt(gamePrompt.text, to: promptFile)
     writeGameState(to: stateFile)
+    writeLoadingMap(to: mapFile)
 }
 
 func noteForThePage(_ text: String) {
@@ -185,7 +213,7 @@ func noteForThePage(_ text: String) {
 }
 
 func webuiReplay(_ a: [String]) -> Never {
-    guard a.count == 1 || a.count == 2 else { fail("usage: vxrt-helper webui-replay <prompt file> [state file]") }
+    guard (1...3).contains(a.count) else { fail("usage: vxrt-helper webui-replay <prompt file> [state file] [map file]") }
     while let line = readLine() {
         if line == "gone" {
             if gamePrompt.clear() { writePrompt(nil, to: a[0]) }
@@ -193,7 +221,8 @@ func webuiReplay(_ a: [String]) -> Never {
                   gamePrompt.take(message, japanese: false) {
             writePrompt(gamePrompt.text, to: a[0])
         }
-        if a.count == 2 { writeGameState(to: a[1]) }
+        if a.count >= 2 { writeGameState(to: a[1]) }
+        if a.count == 3 { writeLoadingMap(to: a[2]) }
         print(FileManager.default.contents(atPath: a[0]).map { String(decoding: $0, as: UTF8.self) } ?? "(none)")
     }
     exit(0)
