@@ -407,6 +407,9 @@ public:
     bool m_dropFrame = false;
     bool m_stopping = false;
     vrrt::PoseSet m_framePose = {};
+    float m_submitHead[16] = {};
+    double m_submitTimestamp = 0;
+    unsigned m_poseOverrides = 0, m_poseUnmatched = 0;
     std::mutex m_wmu;
     std::condition_variable m_wcv;
     std::thread m_worker;
@@ -422,6 +425,9 @@ public:
     double m_lastBoundsError = 0;
     uint32_t m_boundsErrors = 0;
     uint32_t m_posePredictionId = 0;
+    struct FramePoses { uint32_t id; double sampledAt; vrrt::PoseSet poses; };
+    std::deque<FramePoses> m_poseHistory;
+    std::mutex m_poseMu;                    // pose queries never wait for render/vsync
     std::mutex m_mu;
     std::mutex m_statsMu;
 
@@ -435,6 +441,7 @@ public:
         m_rb = Readback();
         m_stopping = false; m_submitted = 0; m_dropFrame = false;
         m_startup = true; m_startupClears = 0;
+        { std::lock_guard<std::mutex> poses(m_poseMu); m_poseHistory.clear(); m_posePredictionId = 0; }
         m_eyeDone[0] = m_eyeDone[1] = false;
     }
     // A missing eye is retired without publishing. Its submitted copy still
@@ -495,7 +502,18 @@ public:
         vrrt::set_last_poses(set);
         vrrt::report_inputs(set);
         m_framePose = set;
-        m_posePredictionId++;
+        memcpy(m_submitHead, set.headTransform, sizeof m_submitHead);
+        m_submitTimestamp = set.visionTimestamp;
+        // OpenVR IDs count display intervals, including the ones missed while
+        // loading or rendering. A call counter slows Source 2's frame clock
+        // after a missed vsync and cannot identify an earlier render pose.
+        {
+            std::lock_guard<std::mutex> poses(m_poseMu);
+            m_posePredictionId = (uint32_t)vrrt::frame_counter();
+            const double sampledAt = vrrt::now_seconds();
+            m_poseHistory.push_back({m_posePredictionId, sampledAt, set});
+            while (m_poseHistory.size() > 64 || sampledAt - m_poseHistory.front().sampledAt > .1) m_poseHistory.pop_front();
+        }
         if (render) copy_poses(set, render, nr);
         if (game) copy_poses(set, game, ng);
         return VRCompositorError_None;
@@ -607,6 +625,36 @@ public:
         if (x1 <= x || y1 <= y) return invalid_bounds(eye, d, bounds, flags, "empty pixel rectangle after eye crop");
         const int e = eye == Eye_Left ? 0 : 1;
         if (m_submitted & (1u << e)) return VRCompositorError_AlreadySubmitted;
+        float head[16]; memcpy(head, m_framePose.headTransform, sizeof head);
+        double timestamp = m_framePose.visionTimestamp;
+        if (flags & Submit_TextureWithPose) {
+            const auto &pose = static_cast<const VRTextureWithPose_t *>(tex)->mDeviceToAbsoluteTracking;
+            bool changed = false;
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++) {
+                if (!std::isfinite(pose.m[r][c])) return VRCompositorError_InvalidTexture;
+                changed |= std::fabs(pose.m[r][c] - head[c*4+r]) > 1e-5f;
+                head[c*4+r] = pose.m[r][c];
+            }
+            head[3] = head[7] = head[11] = 0; head[15] = 1;
+            if (changed) {
+                const double matched = vrrt::timestamp_for_head_pose(pose);
+                m_poseOverrides++;
+                if (matched > 0) timestamp = matched;
+                else m_poseUnmatched++;
+                if (m_poseOverrides <= 4 || m_poseOverrides % 600 == 0)
+                    vrrt::log("submitted render pose overrides WaitGetPoses: %u eyes, %u unmatched sample IDs; sample=%.9f x=%.4f waitX=%.4f",
+                              m_poseOverrides, m_poseUnmatched, timestamp, head[12], m_framePose.headTransform[12]);
+            }
+        }
+        if (m_submitted) {
+            // A stereo pair has one render pose. Never relabel the first eye
+            // with a different pose from the second, including async copies.
+            for (int i = 0; i < 16; i++) if (std::fabs(head[i] - m_submitHead[i]) > 1e-5f)
+                return VRCompositorError_InvalidTexture;
+        } else {
+            memcpy(m_submitHead, head, sizeof m_submitHead);
+            m_submitTimestamp = timestamp;
+        }
         m_submitted |= 1u << e;
         if (m_async) return submit_async(e, d, x, y, x1 - x, y1 - y, bpp, layer, flip, flipX);
         const double tr0 = vrrt::now_seconds();
@@ -641,8 +689,8 @@ public:
         }
         { std::lock_guard<std::mutex> l(m_statsMu); m_sumReadback += vrrt::now_seconds() - tr0; m_nReadback++; }
         sl.flip[e] = flip; sl.flipX[e] = flipX;
-        memcpy(sl.head, m_framePose.headTransform, sizeof sl.head);
-        sl.visionTimestamp = m_framePose.visionTimestamp;
+        memcpy(sl.head, m_submitHead, sizeof sl.head);
+        sl.visionTimestamp = m_submitTimestamp;
         if (sl.submitted == 3) retire_slot(true);
         return VRCompositorError_None;
     }
@@ -665,7 +713,7 @@ public:
         }
     }
     void publish() {
-        publish_from(m_rb.eye[0], m_rb.eye[1], m_eyeFlip, m_eyeFlipX, m_framePose.headTransform, m_framePose.visionTimestamp);
+        publish_from(m_rb.eye[0], m_rb.eye[1], m_eyeFlip, m_eyeFlipX, m_submitHead, m_submitTimestamp);
         m_eyeDone[0] = m_eyeDone[1] = false;
     }
     void publish_from(const Readback::Staging &L, const Readback::Staging &R, const bool *flips, const bool *flipX, const float *head, double visionTs) {
@@ -809,8 +857,30 @@ public:
         vrrt::publish_file("VERANTYX_NATIVE_STAGE_FILE", "");
     }
     bool GetCompositorBenchmarkResults(Compositor_BenchmarkResults *, uint32_t) override { return false; }
-    EVRCompositorError GetLastPosePredictionIDs(uint32_t *r, uint32_t *g) override { if (r) *r = m_posePredictionId; if (g) *g = m_posePredictionId; return VRCompositorError_None; }
-    EVRCompositorError GetPosesForFrame(uint32_t, TrackedDevicePose_t *arr, uint32_t n) override { copy_poses(vrrt::last_poses(), arr, n); return VRCompositorError_None; }
+    EVRCompositorError GetLastPosePredictionIDs(uint32_t *r, uint32_t *g) override {
+        std::lock_guard<std::mutex> lock(m_poseMu);
+        static std::atomic<unsigned> calls{0};
+        if (getenv("VERANTYX_TRACE_POSES") && calls.fetch_add(1) % 600 == 0)
+            vrrt::log("pose query: prediction IDs render=%u game=%u vsync=%llu", m_posePredictionId, m_posePredictionId, (unsigned long long)vrrt::frame_counter());
+        if (r) *r = m_posePredictionId; if (g) *g = m_posePredictionId; return VRCompositorError_None;
+    }
+    EVRCompositorError GetPosesForFrame(uint32_t id, TrackedDevicePose_t *arr, uint32_t n) override {
+        std::lock_guard<std::mutex> lock(m_poseMu);
+        static std::atomic<unsigned> calls{0};
+        if (getenv("VERANTYX_TRACE_POSES") && calls.fetch_add(1) % 600 == 0)
+            vrrt::log("pose query: frame requested=%u current=%u vsync=%llu", id, m_posePredictionId, (unsigned long long)vrrt::frame_counter());
+        const double now = vrrt::now_seconds();
+        for (auto it = m_poseHistory.rbegin(); it != m_poseHistory.rend(); ++it) {
+            if (it->id == id && (id == m_posePredictionId || now - it->sampledAt <= .1)) {
+                if (arr) copy_poses(it->poses, arr, n);
+                return VRCompositorError_None;
+            }
+        }
+        if (arr) for (uint32_t i = 0; i < n; i++) {
+            arr[i] = {}; arr[i].eTrackingResult = TrackingResult_Uninitialized;
+        }
+        return VRCompositorError_RequestFailed;
+    }
 };
 
 Compositor g_compositor;

@@ -80,9 +80,17 @@ $(OUT)/host_sync.o: ../tests/host_sync.c
 $(OUT)/host_sync: $(OUT)/host_sync.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS)
 	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(SANITIZE) -o $@ $^ $(LDLIBS)
 
-check: $(OUT)/host_files $(OUT)/host_sync
+$(OUT)/host_memory.o: ../tests/host_memory.c
+	$(CC) $(CFLAGS) -I. -c $< -o $@
+
+$(OUT)/host_memory: $(OUT)/host_memory.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS)
+	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(SANITIZE) -o $@ $^ $(LDLIBS)
+
+check: $(OUT)/host_files $(OUT)/host_sync $(OUT)/host_memory
 	@mkdir -p $(OUT)/file-test
 	$(OUT)/host_files $(abspath $(OUT)/file-test)
 	$(OUT)/host_sync
+	TMPDIR=$(abspath $(OUT)/file-test) $(OUT)/host_memory --default
+	TMPDIR=$(abspath $(OUT)/file-test) $(OUT)/host_memory --limited
 
 .PHONY: all probe clean check

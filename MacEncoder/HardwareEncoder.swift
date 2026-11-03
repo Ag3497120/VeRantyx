@@ -41,6 +41,7 @@ struct FrameContext {
     var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
     // Keep the source image alive until VideoToolbox finishes reading it.
     var pixelBuffer: CVPixelBuffer
+    var submittedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
 }
 struct UDPHeader {
     var magic: UInt32 // 0x5652414E ("VRAN")
@@ -168,6 +169,11 @@ var captureStalls = 0
 var submittedFrameCount = 0
 var posePacketCount = 0
 var lastPoseReceivedAt: TimeInterval = 0
+var encoderDelayCount = 0
+var encoderDelaySum: Double = 0
+var encoderDelayMax: Double = 0
+let encoderProbePath = ProcessInfo.processInfo.environment["VERANTYX_ENCODER_LATENCY_TEST"]
+var encoderProbeDelays: [Double] = []
 
 final class DatagramBatch {
     let completion = DispatchGroup()
@@ -607,6 +613,11 @@ func createCompressionSession(width: Int32, height: Int32, lowLatency: Bool) -> 
             requestKeyFrame()
             return
         }
+        let delay = (ProcessInfo.processInfo.systemUptime - refConPtr.pointee.submittedAt) * 1000
+        encoderDiagnosticLock.lock()
+        encoderDelayCount += 1; encoderDelaySum += delay; encoderDelayMax = max(encoderDelayMax, delay)
+        if encoderProbePath != nil { encoderProbeDelays.append(delay) }
+        encoderDiagnosticLock.unlock()
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
         let isKeyFrame = (attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) != true
         
@@ -617,9 +628,8 @@ func createCompressionSession(width: Int32, height: Int32, lowLatency: Bool) -> 
                                             compressionSessionOut: &compressionSession)
 }
 
-// Lowers the HEVC bitrate while the link loses packets (the headset's
-// incomplete-frame counter, or local send errors) and raises it back
-// slowly once the link has been clean for a while. VERANTYX_BITRATE_MBPS is
+// Lowers the HEVC bitrate for packet loss or ALVR network/decoder pressure,
+// and raises it back slowly once the stream has been healthy for a while. VERANTYX_BITRATE_MBPS is
 // the ceiling, VERANTYX_BITRATE_MIN_MBPS the floor; VERANTYX_ADAPTIVE_BITRATE=0
 // keeps the ceiling fixed.
 final class AdaptiveBitrate {
@@ -677,7 +687,7 @@ final class AdaptiveBitrate {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: current))
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
             value: [NSNumber(value: Double(current) / 8), NSNumber(value: 1)] as CFArray)
-        print(String(format: "HEVC bitrate %@ to %.1f Mbps (%d loss events in the last %.0f s)",
+        print(String(format: "HEVC bitrate %@ to %.1f Mbps (%d stream pressure events in the last %.0f s)",
             lossEvents >= 2 ? "lowered" : "raised", Double(current) / 1_000_000, lossEvents, elapsed))
     }
 }
@@ -718,6 +728,9 @@ func setupEncoder(width: Int32, height: Int32) {
     let quality = Double(ProcessInfo.processInfo.environment["VERANTYX_HEVC_QUALITY"] ?? "0.9") ?? 0.9
     if quality > 0 { set(kVTCompressionPropertyKey_Quality, NSNumber(value: min(quality, 1)), "quality") }
     set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "no B-frames")
+    if let value = ProcessInfo.processInfo.environment["VERANTYX_ENCODER_MAX_DELAY"], let delay = Int(value), (0...3).contains(delay) {
+        set(kVTCompressionPropertyKey_MaxFrameDelayCount, NSNumber(value: delay), "frame delay bound")
+    }
     set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, "speed priority")
     set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: adaptiveBitrate.current), "average bitrate")
     // Hard cap each second at the average: the game runs 15-25 fps and the
@@ -1952,6 +1965,64 @@ if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] ?? 
     exit(0)
 }
 
+// Exercise the real encoder settings and callback without a game, audio,
+// shared map, network listener or headset. JSON only; no per-frame logging.
+if let path = encoderProbePath {
+    precondition(!alvrMode)
+    let width = 3056, height = 1528, count = 180, hz = 72.0
+    setupEncoder(width: Int32(width), height: Int32(height))
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: hz))
+    let pool = makePixelBufferPool(width: width, height: height)!
+    var buffers: [CVPixelBuffer] = []
+    for phase in 0..<8 {
+        var buffer: CVPixelBuffer?
+        precondition(CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer) == kCVReturnSuccess)
+        let pb = buffer!; CVPixelBufferLockBaseAddress(pb, [])
+        let base = CVPixelBufferGetBaseAddress(pb)!, stride = CVPixelBufferGetBytesPerRow(pb)
+        for y in 0..<height {
+            let row = base.advanced(by: y*stride).assumingMemoryBound(to: UInt32.self)
+            for x in 0..<width {
+                let v = UInt32(((x+phase*3)/8*13 + y/8*7) & 255)
+                row[x] = 0xff000000 | (v << 16) | (((v+85)&255) << 8) | ((v+170)&255)
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pb, []); buffers.append(pb)
+    }
+    let began = ProcessInfo.processInfo.systemUptime
+    var calls: [Double] = []
+    for index in 0..<count {
+        let target = began + Double(index)/hz
+        let wait = target - ProcessInfo.processInfo.systemUptime
+        if wait > 0 { usleep(useconds_t(wait*1_000_000)) }
+        precondition(encoderInFlightFrames.wait(timeout: .now()+2) == .success)
+        let submitted = ProcessInfo.processInfo.systemUptime
+        let context = UnsafeMutablePointer<FrameContext>.allocate(capacity: 1)
+        context.initialize(to: FrameContext(sequence: UInt32(index), visionTimestamp: Double(index)/hz,
+            transform: (1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1), pixelBuffer: buffers[index%buffers.count],
+            submittedAt: submitted))
+        let status = VTCompressionSessionEncodeFrame(compressionSession!, imageBuffer: context.pointee.pixelBuffer,
+            presentationTimeStamp: CMTime(value: Int64(index), timescale: 72), duration: .invalid,
+            frameProperties: nil, sourceFrameRefcon: UnsafeMutableRawPointer(context), infoFlagsOut: nil)
+        precondition(status == noErr)
+        calls.append((ProcessInfo.processInfo.systemUptime-submitted)*1000)
+    }
+    let inputDuration = ProcessInfo.processInfo.systemUptime-began
+    VTCompressionSessionCompleteFrames(compressionSession!, untilPresentationTimeStamp: .invalid)
+    for _ in 0..<3 { encoderInFlightFrames.wait() }
+    VTCompressionSessionInvalidate(compressionSession!)
+    encoderDiagnosticLock.lock(); let delays = Array(encoderProbeDelays.dropFirst(16)).sorted(); encoderDiagnosticLock.unlock()
+    func percentile(_ values: [Double], _ fraction: Double) -> Double {
+        let ordered = values.sorted(); return ordered.isEmpty ? 0 : ordered[Int(Double(ordered.count-1)*fraction)]
+    }
+    let report: [String: Any] = ["width": width, "height": height, "frames": count, "callbacks": encoderDelayCount,
+        "input_seconds": inputDuration, "delay_median_ms": percentile(delays,0.5), "delay_p95_ms": percentile(delays,0.95),
+        "encode_call_p95_ms": percentile(calls,0.95), "max_delay": ProcessInfo.processInfo.environment["VERANTYX_ENCODER_MAX_DELAY"] ?? "default"]
+    try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]).write(to: URL(fileURLWithPath: path))
+    precondition(encoderDelayCount == count)
+    print(String(format: "Encoder test: median %.1f ms, p95 %.1f ms, input %.2f s", percentile(delays,0.5),percentile(delays,0.95),inputDuration))
+    exit(0)
+}
+
 let winePrefix = ProcessInfo.processInfo.environment["WINEPREFIX"]
     ?? (NSHomeDirectory() + "/Verantyx_VR_Drive/SteamVR_Prefix")
 // VERANTYX_SHARED_FRAME names the file directly (the native ARM build keeps
@@ -2205,13 +2276,16 @@ func reportDiagnosticsIfDue() {
         errors: videoPacketSendErrorCount, drops: droppedTransportFrames, poses: posePacketCount)
     let poseAge = lastPoseReceivedAt > 0 ? now - lastPoseReceivedAt : -1
     let gap = longestCaptureGap, stalls = captureStalls
+    let encodeMean = encoderDelayCount > 0 ? encoderDelaySum/Double(encoderDelayCount) : 0
+    let encodeMax = encoderDelayMax
+    encoderDelayCount = 0; encoderDelaySum = 0; encoderDelayMax = 0
     longestCaptureGap = 0; captureStalls = 0
     encoderDiagnosticLock.unlock()
     peerLock.lock()
     let endpoint = videoPeer.map { String(describing: $0.endpoint) } ?? "none"
     peerLock.unlock()
     let captureFPS = Double(current.capture - lastDiagnostics.capture) / elapsed
-    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps bitrate=%.1fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs gap=%.0fms stalls=%d peer=%@",
+    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps bitrate=%.1fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs gap=%.0fms stalls=%d encode=%.1f/%.1fms peer=%@",
         elapsed, dbHeaderPtr.pointee.captureSourceMode, captureFPS,
         Double(current.submit - lastDiagnostics.submit) / elapsed,
         Double(current.encode - lastDiagnostics.encode) / elapsed,
@@ -2220,7 +2294,7 @@ func reportDiagnosticsIfDue() {
         Double(adaptiveBitrate.current) / 1_000_000,
         current.packets - lastDiagnostics.packets, current.errors - lastDiagnostics.errors,
         current.drops - lastDiagnostics.drops, droppedEncoderFrames,
-        Double(current.poses - lastDiagnostics.poses) / elapsed, poseAge, gap * 1000, stalls, endpoint))
+        Double(current.poses - lastDiagnostics.poses) / elapsed, poseAge, gap * 1000, stalls, encodeMean, encodeMax, endpoint))
     if videoPeer != nil {
         adaptiveBitrate.update(
             localLossEvents: (current.errors - lastDiagnostics.errors) + (current.drops - lastDiagnostics.drops),
@@ -3172,7 +3246,7 @@ while isEncoding {
                     sequence: outputSequence,
                     visionTimestamp: currentVisionTimestamp,
                     transform: currentTransform,
-                    pixelBuffer: pb
+                    pixelBuffer: pb, submittedAt: now
                 ))
 
                 var frameProps: CFDictionary? = nil

@@ -134,6 +134,9 @@ struct PoseSet {
     bool inputsFresh;
 };
 void sample_poses(PoseSet *out, double predictSeconds);
+// Recover the headset sample ID for an application's submitted render pose.
+// Zero means no matching sample remains in the bounded recent history.
+double timestamp_for_head_pose(const vr::HmdMatrix34_t &pose);
 PoseSet last_poses();                        // a thread-safe copy of the last WaitGetPoses
 void set_last_poses(const PoseSet &p);
 void report_inputs(const PoseSet &p);        // sampled even while action updates fail or stop

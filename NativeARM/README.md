@@ -1214,3 +1214,80 @@ mips and checks visible contrast at both sides of both eyes, at 1536x864 and
 only the presence of its mesh. The existing building-depth jitter check still
 passes with a largest changing patch of three pixels. Restored points need a
 headset confirmation; the user's no-flicker confirmation is preserved.
+
+### Native memory reporting and positional tracking (2026-11-03)
+
+The user reports stutter during room-scale translation, with smooth head turns,
+and an insufficient-system-RAM warning on both 32 and 64 GB Macs. These are
+separate investigations; the positional symptom still needs a headset retest.
+
+The Linux host inherited Klepton's default 6 GiB Android memory budget.
+`Plat_GlobalMemoryStatus` in the installed ARM64 tier0 reads `sysinfo`, so that
+budget reached Alyx's real minimum-memory check. The host now selects the Mac's
+`hw.memsize` before the budget is latched. `sysinfo`, `/proc/meminfo` and glibc
+physical-page counts agree; an explicit diagnostic limit remains supported.
+Available-page queries no longer return an invented half of physical RAM.
+
+In isolated menu control `20261103T160204Z-alyx-native-startup`, restoring the
+6 GiB limit produces the user's Russian warning (`o19`, frame-009.ppm), and the
+actual guest query returns 6144 MiB (`o26`). The default-budget probe of the
+same menu, `20261103T155811Z-alyx-native-startup`, has no warning in the same
+capture (`o19`), and returns 32768 MiB (`o26`). Both exit normally. This is a
+32 GB Mac; no 64 GB machine or physical headset was tested.
+
+The native compositor also violated two OpenVR pose contracts. Prediction IDs
+counted calls rather than display intervals, including missed vsyncs, and
+`GetPosesForFrame(id)` ignored its ID and returned the newest pose. Alyx uses
+both APIs: the diagnostic menu probe above records, for example, ID 601 at
+vsync 1549. IDs now follow the display counter, with a bounded 100 ms history
+for past-frame queries and unavailable results cleared. History reads have
+their own mutex, so a game-thread pose query does not wait for rendering or
+vsync. A regression checks skipped intervals, historical positions, unknown
+IDs and reading poses while the render lock is held.
+
+Alyx also submits `TextureWithMotion`, including its actual render pose. The
+compositor now preserves that pose and recovers its original headset timestamp
+from recent samples for both synchronous and asynchronous readback. It rejects
+non-finite poses and differently posed eyes in one pair. If the engine supplies
+a pose outside the recorded samples, diagnostics count it and retain the
+WaitGetPoses timestamp; matching an arbitrary engine-generated pose to ALVR remains
+unknown. The isolated probes so far submit the same pose as WaitGetPoses, so
+the synthetic older-image regression, which failed before this change, is the
+evidence for that repair. No additional prediction is applied to ALVR's already
+predicted head samples.
+
+`render_probe.py --head-motion translation` moves the head and hands smoothly
+through 30 cm, retaining rendered positions and pose IDs. For an installation
+on another volume, `--read-only-assets` links immutable content and confines
+all game file writes to the run directory using macOS's process policy.
+Configuration and saves remain private copies. An actual-policy regression
+verifies that direct and symlinked installation writes and writes outside the
+run are denied while private settings and saves remain writable. These probes
+start no headset or encoder and do not measure physical motion-to-photon delay.
+
+Native checks, host checks, syntax checks and ASan/UBSan/TSan pass. The full
+Windows runtime check retains the existing 10 translator forms / 272
+differential-case failures. No gameplay baseline, playable level or claim of
+headset stutter elimination is made.
+
+Final packaged-host probe `20261103T161321Z-alyx-native-startup` completes the
+85-second save-loaded scenario with corrected API frame IDs (`o26`), 30 cm
+simulated head translation (`o27`), zero fatal diagnostics (`o20`) and an
+acknowledged normal exit (`o30`). Comparison
+`20261103T161757Z-alyx-native-pose-memory` seals the memory control, API traces,
+regression logs and exact tested host (`d1`–`d4`). Its `i1` explicitly leaves
+physical headset stutter elimination unconfirmed. All 28 file-backed arm64
+MoltenVK sections match the signed bundled copy; signing metadata accounts
+for the differing full-file hashes. The built app is in
+`build/alyx-motion-memory/VeRantyx.app`.
+
+### Positional-stutter follow-up (2026-11-03)
+
+The latest user session still stutters. Its new quick save loads
+`a2_headcrabs_tunnel`; probe `20261103T170932Z-alyx-native-startup` has no late
+sampled publication gaps. The stream detector instead missed decoder saturation
+and TCP delays below 80 ms. It now uses the negotiated display interval,
+excluding game-render time. Five recorded-window regressions and 14 bridge
+tests pass. Compact evidence `20261103T173122Z-alyx-stream-pressure` (`d1`–`d2`).
+The user confirms that lateral head movement is now smooth in the headset.
+This targeted retest does not change the formal playtest level or baselines.

@@ -73,6 +73,9 @@ public:
     // ---- tracking ----
     void GetDeviceToAbsoluteTrackingPose(ETrackingUniverseOrigin, float predict, TrackedDevicePose_t *poses, uint32_t count) override {
         vrrt::PoseSet set; vrrt::sample_poses(&set, predict);
+        static std::atomic<unsigned> calls{0};
+        if (getenv("VERANTYX_TRACE_POSES") && calls.fetch_add(1) % 600 == 0)
+            vrrt::log("pose query: system predict=%.6fs x=%.4f timestamp=%.9f", predict, set.headTransform[12], set.visionTimestamp);
         for (uint32_t i = 0; i < count; i++) {
             if (i < 3) poses[i] = set.dev[i];
             else { memset(&poses[i], 0, sizeof poses[i]); poses[i].eTrackingResult = TrackingResult_Uninitialized; }

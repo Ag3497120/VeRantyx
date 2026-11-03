@@ -49,6 +49,7 @@ static vrrt::PoseSet test_shared_memory() {
     vrrt::sample_poses(&p, 0);
     h.visionTimestamp += .01; send(h); vrrt::sample_poses(&p, 0);
     assert(p.fresh && p.inputsFresh && p.dev[1].bPoseIsValid);
+    assert(vrrt::timestamp_for_head_pose(p.dev[0].mDeviceToAbsoluteTracking) == h.visionTimestamp);
     assert(near(p.dev[1].mDeviceToAbsoluteTracking.m[0][3], -.2f));
     assert(near(p.dev[1].vVelocity.v[0], 2) && near(p.dev[2].vAngularVelocity.v[1], 3));
     h.headTracked = 0; h.visionTimestamp += .01; send(h); vrrt::sample_poses(&p, 0);
@@ -57,6 +58,7 @@ static vrrt::PoseSet test_shared_memory() {
     std::this_thread::sleep_for(std::chrono::milliseconds(510));
     vrrt::sample_poses(&p, 0);
     assert(!p.fresh && !p.inputsFresh && !p.dev[1].bPoseIsValid);
+    assert(vrrt::timestamp_for_head_pose(p.dev[0].mDeviceToAbsoluteTracking) == 0);
     h.visionTimestamp = 1; send(h); vrrt::sample_poses(&p, 0);
     assert(!p.fresh); // a restarted ALVR clock needs another advancing sample
     h.visionTimestamp += .01; send(h); vrrt::sample_poses(&p, 0);
@@ -592,6 +594,47 @@ static void test_compositor() {
     uint8_t pixels[2][2][64] = {};
     {
         Compositor c;
+        auto h = vrrt::last_poses().hands;
+        h.headTracked = 1; h.visionTimestamp += 1;
+        identity(h.headTransform, -.08f, 1.6f, 0); send(h);
+        vrrt::PoseSet first; vrrt::sample_poses(&first, 0);
+        h.visionTimestamp += .01; send(h);
+        c.WaitGetPoses(first.dev, 3, nullptr, 0);
+        uint32_t render, game;
+        c.GetLastPosePredictionIDs(&render, &game);
+        const uint32_t firstId = render;
+        const uint64_t firstVsync = vrrt::frame_counter();
+        assert(render == game && render == uint32_t(firstVsync));
+        std::this_thread::sleep_for(std::chrono::milliseconds(35));
+        h.headTransform[12] = .08f; h.visionTimestamp += .04; send(h);
+        c.WaitGetPoses(nullptr, 0, nullptr, 0);
+        c.GetLastPosePredictionIDs(&render, &game);
+        assert(render-firstId == vrrt::frame_counter()-firstVsync && render-firstId > 1);
+        TrackedDevicePose_t historical[4] = {};
+        assert(c.GetPosesForFrame(firstId, historical, 4) == VRCompositorError_None);
+        assert(near(historical[0].mDeviceToAbsoluteTracking.m[0][3], -.08f));
+        assert(!historical[3].bPoseIsValid);
+        assert(c.GetPosesForFrame(render+1, historical, 4) == VRCompositorError_RequestFailed);
+        assert(!historical[0].bPoseIsValid);
+        // The render thread may be waiting for vsync or the GPU. The game
+        // thread must still be able to retrieve an already recorded pose.
+        c.m_mu.lock();
+        std::atomic<bool> started{false}, finished{false};
+        std::thread reader([&] {
+            started = true;
+            c.GetLastPosePredictionIDs(&render, &game);
+            assert(c.GetPosesForFrame(render, historical, 4) == VRCompositorError_None);
+            finished = true;
+        });
+        while (!started) std::this_thread::yield();
+        const double deadline = vrrt::now_seconds() + .05;
+        while (!finished && vrrt::now_seconds() < deadline) std::this_thread::yield();
+        const bool readWhileRendering = finished;
+        c.m_mu.unlock(); reader.join();
+        assert(readWhileRendering);
+    }
+    {
+        Compositor c;
         uint8_t pink[64], black[64] = {}, scene[64];
         for (int i = 0; i < 16; i++) {
             pink[4*i] = pink[4*i+2] = pink[4*i+3] = 255; pink[4*i+1] = 0;
@@ -637,6 +680,35 @@ static void test_compositor() {
     VRVulkanTextureData_t image = {}; image.m_nImage = 100; image.m_pDevice = (VkDevice)1; image.m_pQueue = (VkQueue)2;
     image.m_nWidth = image.m_nHeight = 4; image.m_nFormat = VK_FORMAT_R8G8B8A8_UNORM; image.m_nSampleCount = 1;
     Texture_t texture = { &image, TextureType_Vulkan, ColorSpace_Auto };
+    for (bool async : {true, false}) {
+        Compositor c; fake_queue(c, pixels); c.m_async = async;
+        if (!async) for (int e = 0; e < 2; e++) c.m_rb.eye[e] = c.m_rb.slot[0].eye[e];
+        auto h = vrrt::last_poses().hands;
+        h.headTracked = 1; h.visionTimestamp += 1;
+        identity(h.headTransform, -.12f, 1.6f, 0);
+        send(h); vrrt::PoseSet old; vrrt::sample_poses(&old, 0);
+        h.visionTimestamp += .01; send(h);
+        c.WaitGetPoses(&old.dev[0], 1, nullptr, 0);
+        const double renderedTime = h.visionTimestamp;
+        h.headTransform[12] = .12f; h.visionTimestamp += .01; send(h);
+        c.WaitGetPoses(nullptr, 0, nullptr, 0);
+        // Alyx submits TextureWithMotion, whose prefix includes the actual
+        // render pose. A newer WaitGetPoses must not relabel an older image.
+        VRTextureWithMotion_t posed = {};
+        static_cast<Texture_t &>(posed) = texture;
+        posed.mDeviceToAbsoluteTracking = old.dev[0].mDeviceToAbsoluteTracking;
+        auto invalid = posed;
+        invalid.mDeviceToAbsoluteTracking.m[0][3] = std::numeric_limits<float>::infinity();
+        assert(c.Submit(Eye_Left, &invalid, nullptr, Submit_TextureWithMotion) == VRCompositorError_InvalidTexture);
+        assert(c.Submit(Eye_Left, &posed, nullptr, Submit_TextureWithMotion) == VRCompositorError_None);
+        auto differentEye = posed;
+        differentEye.mDeviceToAbsoluteTracking.m[0][3] += .05f;
+        assert(c.Submit(Eye_Right, &differentEye, nullptr, Submit_TextureWithMotion) == VRCompositorError_InvalidTexture);
+        assert(c.Submit(Eye_Right, &posed, nullptr, Submit_TextureWithMotion) == VRCompositorError_None);
+        c.shutdown();
+        assert(c.m_published == 1 && near(frame()->renderHeadTransform[12], -.12f));
+        assert(frame()->visionTimestamp == renderedTime && inFlight.empty());
+    }
     {
         Compositor c; fake_queue(c, pixels);
         VRTextureBounds_t edge = {-1e-7f, 0, 1.0000001f, 1};

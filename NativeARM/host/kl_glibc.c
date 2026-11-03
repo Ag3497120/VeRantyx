@@ -861,6 +861,20 @@ static long sysctl_long(const char *name, long dflt) {
     int64_t v = 0; size_t n = sizeof v;
     return sysctlbyname(name, &v, &n, NULL, 0) == 0 ? (long)v : dflt;
 }
+static int klg_sysinfo(void *out) {
+    int result = ((int (*)(void *))B("sysinfo"))(out);
+    static int reported;
+    if (result == 0 && !__atomic_exchange_n(&reported, 1, __ATOMIC_RELAXED)) {
+        // Linux LP64 sysinfo: totalram/freeram at 32/40, mem_unit at 104.
+        uint64_t total, free; uint32_t unit;
+        memcpy(&total, (char *)out + 32, sizeof total);
+        memcpy(&free, (char *)out + 40, sizeof free);
+        memcpy(&unit, (char *)out + 104, sizeof unit);
+        fprintf(stderr, "  [glibc] guest sysinfo: total=%llu MiB free=%llu MiB\n",
+                (unsigned long long)((total * unit) >> 20), (unsigned long long)((free * unit) >> 20));
+    }
+    return result;
+}
 static long klg_sysconf(int name) {
     switch (name) {
     case 0: return sysconf(_SC_ARG_MAX);
@@ -891,8 +905,11 @@ static long klg_sysconf(int name) {
     case 76: return sysconf(_SC_THREAD_THREADS_MAX);
     case 83: return sysconf(_SC_NPROCESSORS_CONF);
     case 84: return sysconf(_SC_NPROCESSORS_ONLN);
-    case 85: return sysconf(_SC_PHYS_PAGES);
-    case 86: return sysconf(_SC_PHYS_PAGES) / 2;         // _SC_AVPHYS_PAGES
+    case 85: return (long)(kl_mem_budget_bytes() / getpagesize()); // _SC_PHYS_PAGES
+    case 86: {                                           // _SC_AVPHYS_PAGES
+        uint64_t available = kl_mem_available_bytes(), total = kl_mem_budget_bytes();
+        return (long)((available < total ? available : total) / getpagesize());
+    }
     case 149: return 200809L;                            // _SC_MONOTONIC_CLOCK
     case 180: return 255;                                // _SC_HOST_NAME_MAX
     case 185: return sysctl_long("hw.l1icachesize", 131072);   // _SC_LEVEL1_ICACHE_SIZE
@@ -1355,7 +1372,7 @@ static struct { const char *name; void *fn; } g_table[] = {
     E("pthread_rwlock_clockrdlock", klg_pthread_rwlock_clockrdlock), E("pthread_rwlock_clockwrlock", klg_pthread_rwlock_clockwrlock),
     E("sem_clockwait", klg_sem_clockwait), E("pthread_tryjoin_np", klg_pthread_tryjoin_np), E("pthread_timedjoin_np", klg_pthread_timedjoin_np),
     E("pthread_setname_np", klg_pthread_setname_np), E("pthread_getname_np", klg_pthread_getname_np), E("pthread_yield", klg_pthread_yield),
-    E("sysconf", klg_sysconf), E("__sysconf", klg_sysconf), E("_exit", klg__exit), E("_Exit", klg__exit), E("exit", klg_exit),
+    E("sysinfo", klg_sysinfo), E("sysconf", klg_sysconf), E("__sysconf", klg_sysconf), E("_exit", klg__exit), E("_Exit", klg__exit), E("exit", klg_exit),
     E("dlsym", klg_dlsym), E("dlopen", klg_dlopen), E("pthread_cancel", pthread_cancel),
     E("open", klg_open), E("open64", klg_open), E("openat", klg_openat), E("openat64", klg_openat), E("access", klg_access),
     E("semctl", klg_semctl), E("semget", klg_semget), E("semop", klg_semop), E("semtimedop", klg_semtimedop),
@@ -1474,6 +1491,18 @@ static void *klg_lookup(const char *name) {
 }
 
 void kl_glibc_install(const char *argv0) {
+    // Klepton defaults to a Quest's 6 GiB budget. This Linux guest runs on the
+    // Mac: sysinfo and /proc/meminfo must see its RAM before any query latches
+    // that budget. Keep an explicit smaller budget available for diagnostics.
+    if (!getenv("KL_MEM_TOTAL_MB")) {
+        long bytes = sysctl_long("hw.memsize", 0);
+        if (bytes > 0) {
+            char mib[32]; snprintf(mib, sizeof mib, "%ld", bytes >> 20);
+            setenv("KL_MEM_TOTAL_MB", mib, 0);
+        }
+    }
+    fprintf(stderr, "  [glibc] Linux memory budget: %llu MiB (Mac RAM, unless KL_MEM_TOTAL_MB overrides it)\n",
+            (unsigned long long)(kl_mem_budget_bytes() >> 20));
     if (argv0 && *argv0) {
         g_argv0 = argv0;
         const char *b = strrchr(argv0, '/');
