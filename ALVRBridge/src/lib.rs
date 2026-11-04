@@ -194,8 +194,24 @@ static HEADSET: Mutex<HeadsetLog> = Mutex::new(HeadsetLog {
 // (the same, since the encoder last asked: vx_alvr_link_trouble)
 static LINK: Mutex<HeadsetLog> = Mutex::new(HeadsetLog {
     frames: 0, total_s: 0.0, mac_s: 0.0, network_s: 0.0, decode_s: 0.0, headset_s: 0.0, idr_requests: 0, bytes: 0, sent: 0, reported: false });
+static STREAM_HZ_BITS: AtomicU32 = AtomicU32::new(72.0f32.to_bits());
 fn headset_logs(f: impl Fn(&mut HeadsetLog)) { f(&mut HEADSET.lock().unwrap()); f(&mut LINK.lock().unwrap()); }
 impl HeadsetLog {
+    fn pressure_events(&self, hz: f32) -> u32 {
+        let events = self.idr_requests.min(u32::MAX as u64 - 2) as u32;
+        if self.sent < 30 { return events; }
+        if self.frames == 0 { return events + 2; }
+        let hz = if hz.is_finite() && (50.0..=144.0).contains(&hz) { hz as f64 } else { 72.0 };
+        let period = 1.0 / hz;
+        let network = self.network_s / self.frames as f64;
+        let decode = self.decode_s / self.frames as f64;
+        // TCP can deliver every packet after its display deadline. Leave room
+        // for arrival jitter and the compositor instead of waiting for loss.
+        let late_network = network.is_finite() && network > period.max(0.008);
+        let busy_decoder = decode.is_finite() && decode > period * 0.85;
+        events + if late_network || busy_decoder { 2 } else { 0 }
+    }
+
     fn line(&mut self, seconds: f64) -> String {
         let n = self.frames.max(1) as f64;
         let shown = if self.frames > 0 {
@@ -454,6 +470,7 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
                 let settings = alvr_server_core::settings();
                 lead_settings = (settings.headset.controllers.as_option().map_or(0.0, |c| c.steamvr_pipeline_frames),
                     openvr_config(&bridge.layout)["refresh_rate"].as_f64().unwrap_or(90.0) as f32, settings.headset.max_prediction_ms);
+                STREAM_HZ_BITS.store(lead_settings.1.to_bits(), Ordering::Relaxed);
                 LATENCY_WINDOW.store(settings.connection.statistics_history_size as u64, Ordering::Relaxed);
                 LATENCIES.lock().unwrap().clear();
                 alvr_common::info!("VeRantyx: {:?} connected; the controllers' velocities come from {}", headsets,
@@ -594,23 +611,16 @@ pub extern "C" fn vx_alvr_restart_needed() -> bool {
     BRIDGE.get().is_some_and(|b| (!b.connected.load(Ordering::SeqCst) && openvr_config(&b.layout) != b.started_with) || handshake_hung(b))
 }
 
-/// The link's trouble since the last call, as loss events for the encoder's adaptive bitrate (HardwareEncoder.swift,
-/// AdaptiveBitrate, which lowers the bitrate at two in a period): the video lost (IDRs asked for), and two more when the
-/// frames spent over 80 ms on the network (some 20-40 ms over a home Wi-Fi), or the headset showed none of them. A link
-/// slower than the bitrate loses nothing over TCP: the frames queue (ALVR keeps up to 1024) and the stream falls behind,
-/// until they are too late to be counted at all. (Not the share of the frames shown: a client drops some of its own when
-/// they come in bursts, and that is no reason for a lower bitrate.)
+/// Stream pressure since the last call: lost video, or network/decoder work
+/// exceeding the negotiated display budget. TCP delays need no packet loss.
+/// Render time and displayed FPS alone do not lower bitrate: a slow game must
+/// not be mistaken for an overloaded link or decoder.
 #[no_mangle]
 pub extern "C" fn vx_alvr_link_trouble() -> u32 {
     let mut l = LINK.lock().unwrap();
     let reported = l.reported;
     let t = std::mem::replace(&mut *l, HeadsetLog { reported, ..Default::default() });
-    let mut events = t.idr_requests as u32;
-    if t.sent >= 30 {
-        let network = if t.frames > 0 { t.network_s / t.frames as f64 } else { 1.0 };
-        if network > 0.08 { events += 2; }
-    }
-    events
+    t.pressure_events(f32::from_bits(STREAM_HZ_BITS.load(Ordering::Relaxed)))
 }
 
 /// The client's display rate (ALVR's session, as negotiated at the last connection), 0 before any.
@@ -697,6 +707,35 @@ mod tests {
     use super::*;
 
     const HZ72: f64 = 1.0 / 72.0;
+
+    #[test]
+    fn stream_pressure_follows_display_deadlines_without_packet_loss() {
+        let window = |network, decode| HeadsetLog { sent: 360, frames: 360,
+            network_s: network * 360.0, decode_s: decode * 360.0, ..Default::default() };
+        assert_eq!(window(0.007, 0.007).pressure_events(72.0), 0);
+        assert_eq!(window(0.022, 0.007).pressure_events(72.0), 2);
+        assert_eq!(window(0.007, 0.014).pressure_events(72.0), 2);
+        assert_eq!(window(0.007, 0.010).pressure_events(72.0), 0);
+        assert_eq!(window(0.007, 0.010).pressure_events(90.0), 2);
+        let mut slow_game = window(0.007, 0.007);
+        slow_game.mac_s = 20.0 * slow_game.frames as f64;
+        assert_eq!(slow_game.pressure_events(72.0), 0);
+        slow_game.idr_requests = 2;
+        assert_eq!(slow_game.pressure_events(72.0), 2);
+        assert_eq!(HeadsetLog { sent: 29, ..Default::default() }.pressure_events(72.0), 0);
+        assert_eq!(HeadsetLog { sent: 360, ..Default::default() }.pressure_events(72.0), 2);
+    }
+
+    #[test]
+    fn replay_positional_stutter_stream_windows() {
+        for line in include_str!("../tests/fixtures/positional-stutter.csv").lines().filter(|l| !l.starts_with('#')) {
+            let v: Vec<f64> = line.split(',').map(|n| n.parse().unwrap()).collect();
+            let window = HeadsetLog { sent: 360, frames: 360, network_s: v[1]*0.001*360.0,
+                decode_s: v[2]*0.001*360.0, idr_requests: v[3] as u64, ..Default::default() };
+            let previous = window.idr_requests + if v[1] > 80.0 { 2 } else { 0 };
+            assert!(previous < 2 && window.pressure_events(v[0] as f32) >= 2);
+        }
+    }
 
     fn close(a: Vec3, b: Vec3, tolerance: f32) -> bool { (a - b).length() <= tolerance }
 

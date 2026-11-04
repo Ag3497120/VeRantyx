@@ -184,6 +184,17 @@ import Darwin
         try check(rate.read("frame sample: t=15 pairs=250") == 30, "stereo FPS from frame differences")
         try check(rate.read("frame sample: t=15 pairs=250") == nil, "duplicate FPS sample")
         try check(rate.read("frame sample: t=20 pairs=1") == nil, "frame counter reset")
+        var tracking = NativeTrackingActivity()
+        let trackedAt = Date(timeIntervalSince1970: 2000)
+        func pose(_ sequence: UInt32, _ timestamp: Double) -> NativeViewSnapshot {
+            NativeViewSnapshot(sequence: sequence,timestamp: timestamp,ipd: 0.064,tangents: [-1,1,-1,1,-1,1,-1,1])
+        }
+        try check(!tracking.observe(pose(2,1), now: trackedAt), "tracking needs timestamp progress")
+        try check(tracking.observe(pose(4,2), now: trackedAt.addingTimeInterval(1)), "tracking without video frames")
+        try check(tracking.observe(nil, now: trackedAt.addingTimeInterval(2)), "one incoherent pose read is tolerated")
+        try check(!tracking.observe(pose(6,2), now: trackedAt.addingTimeInterval(4)), "sequence alone cannot refresh old tracking")
+        try check(!tracking.observe(pose(8,1), now: trackedAt.addingTimeInterval(5)), "tracking clock reset needs a new baseline")
+        try check(tracking.observe(pose(10,2), now: trackedAt.addingTimeInterval(6)), "tracking reconnect")
         try check(NativeFiles.sha256(Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256")
         print("Native Swift support: \(checks) checks passed")
     }

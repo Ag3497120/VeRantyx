@@ -795,6 +795,45 @@ patch("runtime/kl_dl.c", [
      "    if (kl_image_loaded_hook) kl_image_loaded_hook(soname, img);\n",
      "after", "if (kl_image_loaded_hook) kl_image_loaded_hook"),
 ])
+# ---- kl_pthread.c: destroying one mutex must preserve colliding entries
+pthread_path = os.path.join(ROOT, "runtime/libc/kl_pthread.c")
+pthread_source = open(pthread_path).read()
+if "Destroy keeps the address key" not in pthread_source:
+    old_find = '''static mtx_entry *mtx_find(void *g) {
+    uintptr_t want = (uintptr_t)g;
+    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+        uintptr_t k = atomic_load(&g_mtx_map[i].key);
+        if (k == want) return &g_mtx_map[i];
+        if (!k) return NULL;
+    }
+}
+
+'''
+    old_destroy = '''    mtx_entry *e = mtx_find(p);
+    if (e) atomic_store(&e->key, 0);    // host leaks; it may be held
+'''
+    assert old_find in pthread_source and old_destroy in pthread_source
+    pthread_source = pthread_source.replace(old_find, "", 1).replace(old_destroy, '''    // Destroy keeps the address key: clearing it breaks a linear-probe chain,
+    // so another live mutex beyond it can acquire a second host object. Keep
+    // the unlocked host mutex for address reuse, just as init and conds do.
+''', 1)
+    old_comment = '''// *address* instead: a copied or recycled address is the same mutex, a
+// different address is a different mutex, and guest storage is never read.
+// Keyed by guest ADDRESS, and slots are only reclaimed on an explicit
+// pthread_mutex_destroy — which many guests never call (freeing the containing
+// object is legal on Linux, where a pthread_mutex_t needs no destroy). So the
+// table fills monotonically with the working set of distinct mutex addresses.
+'''
+    new_comment = '''// *address* instead: a copied or recycled address is the same mutex, a
+// different address is a different mutex, and guest storage is never read.
+// Entries survive destroy so probe chains and pooled condvar associations stay
+// valid. The table grows with the working set of distinct mutex addresses.
+'''
+    assert old_comment in pthread_source
+    pthread_source = pthread_source.replace(old_comment, new_comment, 1)
+    open(pthread_path, "w").write(pthread_source)
+    print("patched runtime/libc/kl_pthread.c (stable mutex identities)")
+
 # ---- kl_libc.c: CPU topology in the synthetic /sys
 # Source 2's tier0 counts physical cores from cpuN/topology/{core_id,
 # physical_package_id} (and reads cpu_capacity to find big cores, as on the

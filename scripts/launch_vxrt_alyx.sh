@@ -32,6 +32,11 @@ VXRT="$REPO_ROOT/VXRuntime/build/vxrt"
 [[ "${VXRT_ARM64:-0}" == 1 ]] && VXRT="$VXRT-arm64"   # (the ARM64 runtime, the program translated: experimental)
 
 [[ -d "$ALYX_BIN" ]] || { echo "Half-Life: Alyx not found at $ALYX_BIN" >&2; exit 1; }
+# The encoder reads the owner's common map assets; no game files are copied or changed.
+if [[ "${VERANTYX_LOADING_MAP:-1}" == 1 && -f "$ALYX_BIN/../../hlvr/webui/interstitials.js" ]]; then
+    export VERANTYX_LOADING_MAP=1
+    export VERANTYX_LOADING_GAME_DIR="$ALYX_BIN/../../hlvr"
+fi
 pgrep -f "Steam.AppBundle/Steam/Contents/MacOS/steam_osx" >/dev/null || { echo "Start Steam on the Mac and sign in first" >&2; exit 1; }
 if pgrep -f "wine.*(vrserver|hlvr)|build/vxrt.*(vrserver|hlvr)" >/dev/null; then echo "SteamVR or the game is already running" >&2; exit 1; fi
 mkdir -p "$LOG_DIR"

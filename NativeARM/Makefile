@@ -15,6 +15,7 @@ check: $(OUT)/runtime_test $(OUT)/async_pipeline $(OUT)/vulkan_compat $(OUT)/sup
 	$(OUT)/support_test $(abspath $(OUT))
 	$(OUT)/session_test $(abspath $(OUT))
 	python3 tests/quit_test.py
+	python3 tests/overlay_test.py
 
 $(OUT)/support_test: shared/NativeSupport.swift tests/SupportTests.swift
 	@mkdir -p $(OUT)

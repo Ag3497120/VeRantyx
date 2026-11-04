@@ -55,6 +55,17 @@ build/controller_hotplug.exe: ../VRDriver/tests/controller_hotplug.cpp ../VRDriv
 
 check: build/controller_hotplug.exe
 
+build/loading_stage.exe: ../VRDriver/tests/loading_stage.cpp ../VRDriver/src/openvr_capture_proxy.cpp ../VRDriver/include/openvr.h
+	@mkdir -p build
+	$(MINGWXX) -std=c++17 -O2 -static -static-libgcc -static-libstdc++ -o $@ $< -ld3d11 -ldxgi -lopengl32
+
+check: build/loading_stage.exe
+
+loading-stage-check: export VXRT_ROOT = build/root
+loading-stage-check: export VXRT_NO_ACTIVATE = 1
+loading-stage-check: build/vxrt build/loading_stage.exe
+	$(VXRT) build/loading_stage.exe
+
 build/tracking_height.exe: ../VRDriver/tests/tracking_height.cpp ../VRDriver/src/driver_verantyx.cpp ../VRDriver/include/openvr_driver.h
 	@mkdir -p build
 	$(MINGWXX) -std=c++17 -O2 -static -static-libgcc -static-libstdc++ -I../VRDriver/include -o $@ $< -ld3d11 -ldxgi
@@ -1337,6 +1348,7 @@ check-run:
 	build/shader_progress_test
 	python3 tests/shader_cache_check.py
 	$(VXRT) build/controller_hotplug.exe
+	$(VXRT) build/loading_stage.exe
 	$(VXRT) build/tracking_height.exe
 	python3 ../tests/loading_progress_test.py
 	python3 ../tools/vxrt_agents.py check
@@ -1570,7 +1582,7 @@ build/d3d12_bench.exe: tests/d3d12_bench.c tests/shaders/tex_vs.dxbc tests/shade
 clean:
 	rm -rf build
 
-.PHONY: vr-check all tests check check-run runtime-tests runtime-tests-run shader-progress-check shader-progress-check-run bench d3d12-bench clean shaders translator-check vulkan-test-shaders shader-cache-check
+.PHONY: vr-check all tests check check-run runtime-tests runtime-tests-run shader-progress-check shader-progress-check-run bench d3d12-bench clean shaders translator-check vulkan-test-shaders shader-cache-check loading-stage-check
 
 # The log's repeat limit (src/loader.c): 100000 identical lines come out as 21 (20 copies and the note).
 build/log_repeat.exe: tests/log_repeat.c

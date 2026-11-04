@@ -41,6 +41,7 @@ struct FrameContext {
     var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
     // Keep the source image alive until VideoToolbox finishes reading it.
     var pixelBuffer: CVPixelBuffer
+    var submittedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
 }
 struct UDPHeader {
     var magic: UInt32 // 0x5652414E ("VRAN")
@@ -168,6 +169,11 @@ var captureStalls = 0
 var submittedFrameCount = 0
 var posePacketCount = 0
 var lastPoseReceivedAt: TimeInterval = 0
+var encoderDelayCount = 0
+var encoderDelaySum: Double = 0
+var encoderDelayMax: Double = 0
+let encoderProbePath = ProcessInfo.processInfo.environment["VERANTYX_ENCODER_LATENCY_TEST"]
+var encoderProbeDelays: [Double] = []
 
 final class DatagramBatch {
     let completion = DispatchGroup()
@@ -607,6 +613,11 @@ func createCompressionSession(width: Int32, height: Int32, lowLatency: Bool) -> 
             requestKeyFrame()
             return
         }
+        let delay = (ProcessInfo.processInfo.systemUptime - refConPtr.pointee.submittedAt) * 1000
+        encoderDiagnosticLock.lock()
+        encoderDelayCount += 1; encoderDelaySum += delay; encoderDelayMax = max(encoderDelayMax, delay)
+        if encoderProbePath != nil { encoderProbeDelays.append(delay) }
+        encoderDiagnosticLock.unlock()
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
         let isKeyFrame = (attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) != true
         
@@ -617,9 +628,8 @@ func createCompressionSession(width: Int32, height: Int32, lowLatency: Bool) -> 
                                             compressionSessionOut: &compressionSession)
 }
 
-// Lowers the HEVC bitrate while the link loses packets (the headset's
-// incomplete-frame counter, or local send errors) and raises it back
-// slowly once the link has been clean for a while. VERANTYX_BITRATE_MBPS is
+// Lowers the HEVC bitrate for packet loss or ALVR network/decoder pressure,
+// and raises it back slowly once the stream has been healthy for a while. VERANTYX_BITRATE_MBPS is
 // the ceiling, VERANTYX_BITRATE_MIN_MBPS the floor; VERANTYX_ADAPTIVE_BITRATE=0
 // keeps the ceiling fixed.
 final class AdaptiveBitrate {
@@ -677,7 +687,7 @@ final class AdaptiveBitrate {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: current))
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
             value: [NSNumber(value: Double(current) / 8), NSNumber(value: 1)] as CFArray)
-        print(String(format: "HEVC bitrate %@ to %.1f Mbps (%d loss events in the last %.0f s)",
+        print(String(format: "HEVC bitrate %@ to %.1f Mbps (%d stream pressure events in the last %.0f s)",
             lossEvents >= 2 ? "lowered" : "raised", Double(current) / 1_000_000, lossEvents, elapsed))
     }
 }
@@ -718,6 +728,9 @@ func setupEncoder(width: Int32, height: Int32) {
     let quality = Double(ProcessInfo.processInfo.environment["VERANTYX_HEVC_QUALITY"] ?? "0.9") ?? 0.9
     if quality > 0 { set(kVTCompressionPropertyKey_Quality, NSNumber(value: min(quality, 1)), "quality") }
     set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "no B-frames")
+    if let value = ProcessInfo.processInfo.environment["VERANTYX_ENCODER_MAX_DELAY"], let delay = Int(value), (0...3).contains(delay) {
+        set(kVTCompressionPropertyKey_MaxFrameDelayCount, NSNumber(value: delay), "frame delay bound")
+    }
     set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, "speed priority")
     set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: adaptiveBitrate.current), "average bitrate")
     // Hard cap each second at the average: the game runs 15-25 fps and the
@@ -859,6 +872,7 @@ final class GamePromptOverlay {
     let language: String
     private var content: GamePromptContent?
     var text: String? { content?.text }
+    var readyForInput: Bool { content?.animated == false }
     private var activity: GameFrameActivity
     private var lastCheck: TimeInterval = -.infinity
     private var animationPhase: Int?
@@ -1043,10 +1057,19 @@ final class GamePromptOverlay {
         return true
     }
 }
-// Draw the native interstitial from the owner's installed assets. The room is
+// Draw the shared interstitial from the owner's installed assets. The room is
 // supplied by SetStageOverride, independently of the mailbox's map and text.
 // Loading and SceneKit work stay on one worker; cached frames retain the pose
 // they were rendered with, so ALVR can reproject them while the game is busy.
+func loadingHeightOffset(_ history: UnsafeRawPointer) -> Float {
+    // Match the driver's standing origin, as the Windows capture proxy does.
+    // Native producers and older drivers leave this metadata absent.
+    guard history.loadUnaligned(fromByteOffset: 4, as: UInt32.self) == 0x5348_5056,
+          history.loadUnaligned(fromByteOffset: 8, as: UInt32.self) == 0x464f_4856 else { return 0 }
+    let value = history.loadUnaligned(fromByteOffset: 12, as: Float.self)
+    return value.isFinite ? value : 0
+}
+
 final class NativeLoadingMap {
     struct State: Decodable, Equatable {
         let type: String
@@ -1055,8 +1078,9 @@ final class NativeLoadingMap {
         let description: String?
         let loadingText: String?
         let facingAngle: Float?
-        let messageText: String?
+        var messageText: String?
         let visible: Bool?
+        let waitingForInput: Bool?
     }
     struct Stage: Decodable, Equatable {
         let model: String
@@ -1071,6 +1095,8 @@ final class NativeLoadingMap {
         let image: CGImage
         let head: simd_float4x4
         let timestamp: Double
+        let mapName: String
+        let stageModel: String?
     }
     struct MapInfo: Decodable {
         struct Position: Decodable { let x: Float?; let y: Float?; let z: Float? }
@@ -1082,7 +1108,7 @@ final class NativeLoadingMap {
     let path: String?
     let game: URL?
     let stagePath: String?
-    private let queue = DispatchQueue(label: "verantyx.loading-scene", qos: .userInitiated, autoreleaseFrequency: .workItem)
+    fileprivate let queue = DispatchQueue(label: "verantyx.loading-scene", qos: .userInitiated, autoreleaseFrequency: .workItem)
     private let lock = NSLock()
     private var generation = 0
     private var image: View?
@@ -1108,16 +1134,23 @@ final class NativeLoadingMap {
               size.intValue <= 16384, let data = FileManager.default.contents(atPath: path) else { return nil }
         return try? JSONDecoder().decode(T.self, from: data)
     }
-    func poll(now: Double) {
+    func poll(now: Double, inputReady: Bool = true) {
         guard now - lastCheck >= 0.1 else { return }; lastCheck = now
         var next = Self.read(path, as: State.self)
         if next?.type != "begin_loading" || !Self.validName(next?.mapName ?? "") || game == nil { next = nil }
+        // Windows keeps its existing shader-idle policy for the trigger hint.
+        if next?.waitingForInput == true && !inputReady { next?.messageText = "" }
         var nextStage = Self.read(stagePath, as: Stage.self)
         if let value = nextStage, value.transform.count != 12 || value.settings.count != 11 ||
             !(value.transform + value.settings).allSatisfy(\.isFinite) { nextStage = nil }
         guard next != state || nextStage != stage else { return }
         state = next; stage = nextStage
-        lock.lock(); generation += 1; image = nil; lock.unlock()
+        lock.lock()
+        generation += 1
+        // Mailbox text and stage requests can change while assets are uploading.
+        // Keep the last complete stereo pair until its replacement is ready.
+        if !visible { image = nil }
+        lock.unlock()
         // A game may wait for StageOverrideReady before beginning its load.
         if let game {
             let stage = nextStage, epoch = generation
@@ -1147,7 +1180,10 @@ final class NativeLoadingMap {
                 let rendered = renderer?.render(state, width: width, height: height, tangents: tangents,
                                                 ipd: Float(ipd), head: head, time: now)
                 lock.lock(); defer { lock.unlock() }
-                if epoch == generation { image = rendered.map { View(image: $0, head: head, timestamp: timestamp) } }
+                if epoch == generation, let rendered {
+                    image = View(image: rendered, head: head, timestamp: timestamp, mapName: state.mapName ?? "",
+                                 stageModel: renderer?.stageNode == nil ? nil : renderer?.stage?.model)
+                }
                 pending = false
             }
         }
@@ -1174,7 +1210,8 @@ final class NativeLoadingMap {
         var stageNode: SCNNode?
         var mapNode: SCNNode?
         var lastState: State?
-        var spinner: SCNNode?
+        var spinners: [SCNNode] = []
+        var loadingLabels: [SCNNode] = []
         var info: [String: MapInfo] = [:]
         var order: [String] = []
         var tertiary: [String] = []
@@ -1297,17 +1334,29 @@ final class NativeLoadingMap {
             }
             guard (1...16384).contains(width), (1...16384).contains(height) else { return nil }
             var levels = max(1, Int(word(28)))
+            guard levels <= 1 + Int(log2(Double(max(width,height)))) else { return nil }
             while max(width,height) > 4096 && levels > 1 {
                 offset += ((width+3)/4) * ((height+3)/4) * block
                 width = max(1,width/2); height = max(1,height/2); levels -= 1
             }
-            let row = ((width+3)/4) * block, size = row * ((height+3)/4)
-            guard offset + size <= data.count else { return nil }
-            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
+            var mips: [(offset: Int, width: Int, height: Int, row: Int)] = []
+            var w = width, h = height
+            for _ in 0..<levels {
+                let row = ((w+3)/4) * block, size = row * ((h+3)/4)
+                guard offset + size <= data.count else { return nil }
+                mips.append((offset,w,h,row)); offset += size
+                w = max(1,w/2); h = max(1,h/2)
+            }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: levels > 1)
+            desc.mipmapLevelCount = levels
             desc.usage = .shaderRead; desc.storageMode = .shared
             guard let result = device.makeTexture(descriptor: desc) else { return nil }
-            data.withUnsafeBytes { result.replace(region: MTLRegionMake2D(0,0,width,height), mipmapLevel: 0,
-                withBytes: $0.baseAddress!.advanced(by: offset), bytesPerRow: row) }
+            data.withUnsafeBytes { raw in
+                for (level, mip) in mips.enumerated() {
+                    result.replace(region: MTLRegionMake2D(0,0,mip.width,mip.height), mipmapLevel: level,
+                        withBytes: raw.baseAddress!.advanced(by: mip.offset), bytesPerRow: mip.row)
+                }
+            }
             textures[relative] = result; return result
         }
         func mapTexture(_ name: String, kind: String) -> MTLTexture? {
@@ -1335,6 +1384,7 @@ final class NativeLoadingMap {
                 // DDS rows run downward; OBJ V runs upward. Without this the
                 // texture atlas lands on unrelated triangles of the room/map.
                 m.diffuse.contentsTransform = SCNMatrix4Scale(SCNMatrix4MakeTranslation(0, 1, 0), 1, -1, 1)
+                m.diffuse.mipFilter = .linear
             }
             m.multiply.contents = texture == nil ? NSColor.white : tint
             m.transparency = opacity
@@ -1353,8 +1403,11 @@ final class NativeLoadingMap {
             textures = textures.filter { !$0.key.hasPrefix("models/ui/dioramas/") }
             stage = next
             guard let next else { return false }
-            // The engine passes an absolute OBJ path. Keep it confined to this install.
-            let url = URL(fileURLWithPath: next.model.replacingOccurrences(of: "\\", with: "/")).resolvingSymlinksInPath()
+            // Native uses an absolute path; the Windows bridge supplies an
+            // install-relative model. Both stay confined to this game's assets.
+            let model = next.model.replacingOccurrences(of: "\\", with: "/")
+            let url = (model.hasPrefix("models/ui/dioramas/") ? game.appendingPathComponent(model)
+                : URL(fileURLWithPath: model)).resolvingSymlinksInPath()
             let root = game.appendingPathComponent("models/ui/dioramas").path + "/"
             guard url.path.hasPrefix(root), url.pathExtension == "obj", Self.validStage(next),
                   let mesh = mesh("models/ui/dioramas/" + url.lastPathComponent) else { return false }
@@ -1402,7 +1455,7 @@ final class NativeLoadingMap {
             return result
         }
         func buildMap(_ state: State) {
-            mapNode?.removeFromParentNode(); spinner = nil
+            mapNode?.removeFromParentNode(); spinners = []; loadingLabels = []
             let root = SCNNode(); scene.rootNode.addChildNode(root); mapNode = root
             root.eulerAngles.y = CGFloat(state.facingAngle ?? 0) * .pi / 180
             let name = state.mapName ?? "", current = info[name]
@@ -1428,19 +1481,30 @@ final class NativeLoadingMap {
             for name in names where NativeLoadingMap.validName(name) {
                 guard let g = mesh("models/ui/map_hologram_steamvr/" + name + ".obj") else { continue }
                 let selected = name == selectedName, visited = played.contains(name)
+                let cable = cableNames.contains(name) || name == "cables_citadel"
+                let vault = name == "a5_vault", precrash = name == "a4_c17_parking_garage_precrash"
                 let ao = mapTexture(name, kind: "ao")
                 let fill = material(selected ? 0xffbe55 : visited || cableNames.contains(name) ? 0x805f2a : 0x553c18,
-                    opacity: selected || visited ? 1 : 0.75, texture: ao, additive: true)
+                    opacity: selected || visited || vault ? 1 : 0.75, texture: ao, additive: true)
+                let rimStrength = cable ? 0.1 : selected || visited || vault ? 0.5 : 0.75
                 fill.shaderModifiers = [.surface: """
                     \(ao != nil ? "_surface.diffuse.rgb = float3(_surface.diffuse.r);" : "")
-                    float rim = pow(1.0 - abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.5);
-                    _surface.diffuse.a *= 1.0 - rim;
+                    float rim = pow(clamp(1.0 - abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.0, 1.0), \(rimStrength));
+                    _surface.diffuse.a = clamp(_surface.diffuse.a * (1.0 \(cable ? "+" : "-") rim), 0.0, 1.0);
                     """]
                 let mask = material(0); mask.colorBufferWriteMask = []
+                // The colour and wire shaders round coincident depths
+                // differently. Put only the occlusion shell slightly behind
+                // them, preserving the visible mesh and its stereo position.
+                mask.shaderModifiers = [.geometry: """
+                    float4 viewPosition = scn_node.modelViewTransform * _geometry.position;
+                    viewPosition.xyz *= 1.00002;
+                    _geometry.position = scn_node.inverseModelViewTransform * viewPosition;
+                    """]
                 let depth = node(g, material: mask, parent: models); depth.renderingOrder = -2
                 let surface = node(g, material: fill, parent: models); surface.renderingOrder = 2
-                let wire = material(selected ? 0xffd155 : visited ? 0xcc953d : 0x66471d,
-                    opacity: selected ? 1 : visited ? 0.75 : name == "cables_citadel" ? 0.15 : 0.25,
+                let wire = material(selected ? 0xffd155 : visited ? 0xcc953d : vault ? 0x805924 : 0x66471d,
+                    opacity: selected ? 1 : visited || tertiary.contains(name) || vault || precrash ? 0.75 : name == "cables_citadel" ? 0.15 : 0.25,
                     texture: mapTexture(name, kind: "wire"), additive: true)
                 if wire.diffuse.contents is MTLTexture {
                     wire.shaderModifiers = [.surface: "_surface.transparent.a = _surface.diffuse.r; _surface.diffuse.rgb = float3(1.0);"]
@@ -1450,6 +1514,26 @@ final class NativeLoadingMap {
             if let streets = mesh("models/ui/map_hologram_steamvr/map_streets.obj") {
                 let m = material(0x664c22, opacity: 0.1, texture: texture("models/ui/map_hologram_steamvr/map_streets_col.dds"), additive: true)
                 _ = node(streets, material: m, parent: models)
+            }
+            // The faint points outside the city are authored quads, not a
+            // screen-space pattern: they must keep the map's stereo depth.
+            if let grid = mesh("models/ui/map_hologram_steamvr/voxel_cubes.obj") {
+                let dots = material(0xffe2a8, opacity: 0.35, texture: mapTexture("voxel_cubes", kind: "ao"), additive: true)
+                // The authored lower mips fade these subpixel marks away.
+                // Keep their base image; the city retains filtered mip chains.
+                dots.diffuse.mipFilter = .none
+                dots.shaderModifiers = [.surface: """
+                    _surface.diffuse.rgb = float3(_surface.diffuse.r);
+                    """]
+                let points = node(grid, material: dots, parent: models); points.renderingOrder = 4
+                points.name = "loading-map-points"
+                let wire = material(0xffbe55, opacity: 0.1, texture: mapTexture("voxel_cubes", kind: "wire"), additive: true)
+                wire.diffuse.mipFilter = .none
+                if wire.diffuse.contents is MTLTexture {
+                    wire.shaderModifiers = [.surface: "_surface.transparent.a = _surface.diffuse.r; _surface.diffuse.rgb = float3(1.0);"]
+                } else { wire.fillMode = .lines }
+                let lines = node(grid, material: wire, parent: models); lines.renderingOrder = 4
+                lines.name = "loading-map-point-wire"
             }
             // The amber panel lies beneath the city, with its far edge elevated
             // in the viewer's field of view just as in the authored interstitial.
@@ -1471,33 +1555,51 @@ final class NativeLoadingMap {
                 return result
             }
             _ = backdrop(0x553c18, height: 1.8, opacity: 0.2)
-            let edge = backdrop(0xffbe55, height: 0.028, opacity: 0.5)
+            let edge = backdrop(0xffbe55, height: 0.1, opacity: 0.2)
             edge.position.y = 0.9
             if prompt.isEmpty, let p = current?.pos {
                 let anchor = SCNNode(); map.addChildNode(anchor); anchor.position = SCNVector3(p.x ?? 0,p.y ?? 0,p.z ?? 0)
                 let stem = node(SCNCylinder(radius: 0.0015, height: 0.1), material: material(0xffffff), parent: anchor)
                 stem.position.y = 0.05
-                let label = text((state.loadingText ?? "LOADING") + "...", height: 0.12, parent: anchor,
-                                 position: SCNVector3(0.035,0.12,0), left: true)
-                label.eulerAngles.x = -.pi/6
-                let context = CGContext(data: nil, width: 96, height: 96, bitsPerComponent: 8, bytesPerRow: 384,
-                    space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-                context.setStrokeColor(CGColor(gray: 1, alpha: 1)); context.setLineWidth(7); context.setLineCap(.round)
-                for radius in [27.0, 39.0] {
-                    context.addArc(center: CGPoint(x: 48,y: 48), radius: radius, startAngle: 0.3, endAngle: 5.3, clockwise: false)
-                    context.strokePath()
+                let elbow = node(SCNCylinder(radius: 0.0015, height: 0.01), material: material(0xffffff), parent: anchor)
+                elbow.position = SCNVector3(0.005,0.1,0); elbow.eulerAngles.z = -.pi/2
+                let callout = SCNNode(); anchor.addChildNode(callout)
+                callout.position = SCNVector3(0.02,0.1,0); callout.eulerAngles.x = -.pi/3
+                for count in 0...3 {
+                    let label = text((state.loadingText ?? "LOADING") + String(repeating: ".", count: count),
+                        height: 0.08, parent: callout, position: SCNVector3(0.035,0,0), left: true)
+                    loadingLabels.append(label)
                 }
-                let ink = material(0xffffff); ink.diffuse.contents = context.makeImage(); ink.writesToDepthBuffer = false
-                let ring = node(SCNPlane(width: 0.06,height: 0.06), material: ink, parent: label)
-                ring.position.x = label.boundingBox.min.x - 0.035; ring.renderingOrder = 10; spinner = ring
+                for index in 0..<6 {
+                    let ink = material(0xffffff); ink.writesToDepthBuffer = false
+                    if let url = asset(String(format: "webui/images/arc_%02d.svg", index+1), limit: 16384),
+                       let image = NSImage(contentsOf: url) {
+                        ink.diffuse.contents = image
+                    } else {
+                        let context = CGContext(data: nil, width: 96, height: 96, bitsPerComponent: 8, bytesPerRow: 384,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                        context.setStrokeColor(CGColor(gray: 1, alpha: 1)); context.setLineWidth(4)
+                        let start = Double(index % 3) * 2 * .pi / 3
+                        context.addArc(center: CGPoint(x: 48,y: 48), radius: index < 3 ? 27 : 39,
+                                       startAngle: start, endAngle: start + .pi/2, clockwise: false)
+                        context.strokePath(); ink.diffuse.contents = context.makeImage()
+                    }
+                    let arc = node(SCNPlane(width: 0.075,height: 0.075), material: ink, parent: callout)
+                    arc.renderingOrder = 10; spinners.append(arc)
+                }
             }
         }
         func render(_ state: State, width: Int, height: Int, tangents: [Float]?, ipd: Float,
                     head: simd_float4x4, time: Double) -> CGImage? {
             guard width > 0, height > 0, width <= 8192, height <= 4096,
-                  head.columns.0.x.isFinite else { return nil }
+                  head.columns.0.x.isFinite, time.isFinite else { return nil }
             if state != lastState { buildMap(state); lastState = state }
-            spinner?.eulerAngles.z = CGFloat(time * 2 * .pi)
+            let phase = max(0,time.truncatingRemainder(dividingBy: 2))
+            for (index, arc) in spinners.enumerated() {
+                let progress = min(1,max(0,(phase - Double(index)*0.1)/0.9))
+                arc.eulerAngles.z = CGFloat(-2 * .pi * (1 - pow(1-progress,3)))
+            }
+            for (index, label) in loadingLabels.enumerated() { label.isHidden = index != Int(phase*2) }
             guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
                 bytesPerRow: width*4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                 bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
@@ -1519,14 +1621,25 @@ final class NativeLoadingMap {
     }
 }
 
-let nativeLoadingMap = NativeLoadingMap(path: ProcessInfo.processInfo.environment["VERANTYX_NATIVE_LOADING_FILE"],
-                                       game: ProcessInfo.processInfo.environment["VERANTYX_NATIVE_GAME_DIR"],
-                                       stagePath: ProcessInfo.processInfo.environment["VERANTYX_NATIVE_STAGE_FILE"])
+let loadingEnvironment = ProcessInfo.processInfo.environment
+let nativeLoadingMap = NativeLoadingMap(path: loadingEnvironment["VERANTYX_LOADING_FILE"] ?? loadingEnvironment["VERANTYX_NATIVE_LOADING_FILE"],
+                                       game: loadingEnvironment["VERANTYX_LOADING_GAME_DIR"] ?? loadingEnvironment["VERANTYX_NATIVE_GAME_DIR"],
+                                       stagePath: loadingEnvironment["VERANTYX_LOADING_STAGE_FILE"] ?? loadingEnvironment["VERANTYX_NATIVE_STAGE_FILE"])
 
 if let output = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_MAP_SELFTEST"],
    let game = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_GAME_DIR"] {
     let name = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_MAP_NAME"] ?? "a2_pistol"
     precondition(NativeLoadingMap.validName(name) && !NativeLoadingMap.validName("../outside"))
+    var history = Data(count: 16)
+    history.withUnsafeMutableBytes { bytes in
+        precondition(loadingHeightOffset(bytes.baseAddress!) == 0)
+        bytes.storeBytes(of: UInt32(0x5348_5056), toByteOffset: 4, as: UInt32.self)
+        bytes.storeBytes(of: UInt32(0x464f_4856), toByteOffset: 8, as: UInt32.self)
+        bytes.storeBytes(of: Float(-0.74), toByteOffset: 12, as: Float.self)
+        precondition(abs(loadingHeightOffset(bytes.baseAddress!) + 0.74) < 0.0001)
+        bytes.storeBytes(of: Float.nan, toByteOffset: 12, as: Float.self)
+        precondition(loadingHeightOffset(bytes.baseAddress!) == 0)
+    }
     let json = try! JSONSerialization.data(withJSONObject: ["type": "begin_loading", "mapName": name, "chapter": "HALF-LIFE: ALYX", "loadingText": "LOADING"])
     let stateFile = output + ".state.json", stageFile = output + ".stage.json"
     let stageName = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_STAGE_MODEL"] ?? "synthetic"
@@ -1552,7 +1665,11 @@ if let output = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_MAP_SELFTES
     let largeHandle = try! FileHandle(forWritingTo: largeFile)
     try! largeHandle.truncate(atOffset: 89_478_660); try! largeHandle.close()
     let largeScene = NativeLoadingMap.Scene(game: largeRoot)!
-    precondition(largeScene.texture("room.dds")?.width == 4096, "Large diorama must load its bounded mip")
+    let roomTexture = largeScene.texture("room.dds")
+    precondition(roomTexture?.width == 4096 && roomTexture?.mipmapLevelCount == 13,
+                 "Large diorama must retain the bounded mip and its smaller levels")
+    try! header.write(to: largeRoot.appendingPathComponent("truncated.dds"))
+    precondition(largeScene.texture("truncated.dds") == nil, "Truncated mip chains must be rejected")
     try! FileManager.default.removeItem(at: largeRoot)
     var head = matrix_identity_float4x4; head.columns.3.y = 1.7
     let tilt = Float(-25) * .pi / 180
@@ -1573,14 +1690,159 @@ if let output = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_MAP_SELFTES
     precondition(probe.renderer?.info[name] != nil, "No authored map metadata")
     precondition(probe.renderer?.stageNode != nil, "The loading room was discarded")
     precondition((probe.renderer?.geometry.count ?? 0) >= 3, "The city geometry was not loaded")
+    precondition(probe.renderer?.geometry["models/ui/map_hologram_steamvr/voxel_cubes.obj"] != nil,
+                 "The point field around the city was not loaded")
     precondition((try? String(contentsOfFile: stageFile + ".ready", encoding: .utf8)) == "1")
     save(loading.image, output)
+    // Windows publishes install-relative models; their room must be identical
+    // to the native absolute path, including its transform and material.
+    var relativeStage = stage
+    relativeStage["model"] = "models/ui/dioramas/" + stageName + ".obj"
+    try! JSONSerialization.data(withJSONObject: relativeStage).write(to: URL(fileURLWithPath: stageFile), options: .atomic)
+    probe.poll(now: 0.2); probe.queue.sync {}
+    let relativeView = draw(head, timestamp: 0.2)
+    precondition(relativeView.stageModel == relativeStage["model"] as? String &&
+                 relativeView.image.dataProvider!.data! as Data == loading.image.dataProvider!.data! as Data,
+                 "Windows and native room paths must produce the same stereo image")
+    // A fixed view missed the reported flicker. Exercise coincident depth and
+    // colour passes with subpixel head motion on wholly synthetic buildings.
+    let stability = NativeLoadingMap.Scene(game: largeRoot)!
+    stability.info[name] = NativeLoadingMap.MapInfo(pos: .init(x: 0,y: 0,z: 0), cables: 99, hidden: nil, drawVault: nil)
+    stability.order = [name]
+    var vertices: [SCNVector3] = [], normals: [SCNVector3] = []
+    let faces = [[0,1,2,3],[4,7,6,5],[0,4,5,1],[1,5,6,2],[2,6,7,3],[3,7,4,0]]
+    for row in 0..<12 { for column in 0..<12 {
+        let x = Float(column)*0.45-2.7, z = Float(row)*0.4-1.8
+        let top = Float((row*7+column*11)%5)*0.06+0.06
+        let corners: [SIMD3<Float>] = [SIMD3(x,0,z),SIMD3(x+0.32,0,z),SIMD3(x+0.32,0,z+0.28),SIMD3(x,0,z+0.28),
+            SIMD3(x,top,z),SIMD3(x+0.32,top,z),SIMD3(x+0.32,top,z+0.28),SIMD3(x,top,z+0.28)]
+        for face in faces {
+            let normal = simd_normalize(simd_cross(corners[face[1]]-corners[face[0]],corners[face[2]]-corners[face[0]]))
+            for index in [face[0],face[1],face[2],face[0],face[2],face[3]] {
+                let p = corners[index]; vertices.append(SCNVector3(p.x,p.y,p.z))
+                normals.append(SCNVector3(normal.x,normal.y,normal.z))
+            }
+        }
+    }}
+    stability.geometry["models/ui/map_hologram_steamvr/" + name + ".obj"] = SCNGeometry(
+        sources: [SCNGeometrySource(vertices: vertices), SCNGeometrySource(normals: normals)],
+        elements: [SCNGeometryElement(indices: Array(0..<UInt32(vertices.count)), primitiveType: .triangles)])
+    let stabilityState = try! JSONDecoder().decode(NativeLoadingMap.State.self, from: json)
+    let jitter = head * simd_float4x4(simd_quatf(angle: 0.0001, axis: SIMD3(0,1,0)))
+    let first = stability.render(stabilityState, width: 1536,height: 864,tangents: nil,ipd: 0.064,head: head,time: 10)!
+    let second = stability.render(stabilityState, width: 1536,height: 864,tangents: nil,ipd: 0.064,head: jitter,time: 10)!
+    let a = [UInt8](first.dataProvider!.data! as Data), b = [UInt8](second.dataProvider!.data! as Data)
+    var changed = [Bool](repeating: false,count: 1536*864)
+    for y in 0..<864 { for x in 0..<1536 {
+        let at = y*first.bytesPerRow+x*4
+        if Int(b[at+2]) > Int(b[at+1])+8 && Int(b[at+1]) > Int(b[at])+4 && abs(Int(a[at+2])-Int(b[at+2])) > 15 {
+            changed[y*1536+x] = true
+        }
+    }}
+    var largest = 0
+    for start in changed.indices where changed[start] {
+        var pending = [start], count = 0; changed[start] = false
+        while let at = pending.popLast() {
+            count += 1
+            for dy in -1...1 { for dx in -1...1 {
+                let x = at%1536+dx, y = at/1536+dy
+                guard (0..<1536).contains(x), (0..<864).contains(y) else { continue }
+                let next = y*1536+x
+                if changed[next] { changed[next] = false; pending.append(next) }
+            }}
+        }
+        largest = max(largest,count)
+    }
+    print("Loading depth jitter: largest changing patch \(largest) pixels")
+    precondition(largest <= 16, "Subpixel head motion must not flash building faces")
+    // A loaded mesh alone does not prove the side points survived filtering.
+    // Model a sparse point atlas whose smaller authored mips lose its ink.
+    let pointScene = NativeLoadingMap.Scene(game: largeRoot)!
+    pointScene.info = stability.info; pointScene.order = [name]
+    var pointVertices: [SCNVector3] = [], pointUV: [CGPoint] = []
+    let corners: [CGPoint] = [.init(x: 0,y: 0),.init(x: 1,y: 0),.init(x: 1,y: 1),.init(x: 0,y: 1)]
+    for row in 0..<8 { for column in 0..<32 {
+        for index in [0,1,2,0,2,3] {
+            let uv = corners[index]
+            pointVertices.append(SCNVector3(Float(column)*0.5-8+Float(uv.x)*0.01,0.05,Float(row)*0.5-1.5+Float(uv.y)*0.01))
+            pointUV.append(uv)
+        }
+    }}
+    let pointFolder = "models/ui/map_hologram_steamvr/"
+    pointScene.geometry[pointFolder + "voxel_cubes.obj"] = SCNGeometry(
+        sources: [SCNGeometrySource(vertices: pointVertices), SCNGeometrySource(textureCoordinates: pointUV)],
+        elements: [SCNGeometryElement(indices: Array(0..<UInt32(pointVertices.count)), primitiveType: .triangles)])
+    for kind in ["ao","wire"] {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: 32,height: 32,mipmapped: true)
+        desc.storageMode = .shared; desc.usage = .shaderRead
+        let texture = pointScene.device.makeTexture(descriptor: desc)!
+        for level in 0..<texture.mipmapLevelCount {
+            let size = max(1,32 >> level)
+            let bytes = [UInt8](repeating: level == 0 ? 255 : 0,count: size*size)
+            bytes.withUnsafeBytes { texture.replace(region: MTLRegionMake2D(0,0,size,size),mipmapLevel: level,withBytes: $0.baseAddress!,bytesPerRow: size) }
+        }
+        pointScene.textures[pointFolder + "voxel_cubes_" + kind + ".dds"] = texture
+    }
+    pointScene.buildMap(stabilityState); pointScene.lastState = stabilityState
+    var pointNodes: [SCNNode] = []
+    pointScene.mapNode!.enumerateChildNodes { node,_ in
+        if ["loading-map-points","loading-map-point-wire"].contains(node.name ?? "") { pointNodes.append(node) }
+    }
+    precondition(pointNodes.count == 2)
+    for (width,height) in [(1536,864),(2880,1620)] {
+        for pose in [head,jitter] {
+            func pointImage(_ hidden: Bool) -> CGImage {
+                for node in pointNodes { node.isHidden = hidden }
+                return pointScene.render(stabilityState,width: width,height: height,tangents: nil,ipd: 0.064,head: pose,time: 10)!
+            }
+            let background = pointImage(true), visible = pointImage(false)
+            let back = [UInt8](background.dataProvider!.data! as Data), ink = [UInt8](visible.dataProvider!.data! as Data)
+            var counts = [Int](repeating: 0,count: 4)
+            for y in 0..<height { for x in 0..<width {
+                let at = y*visible.bytesPerRow+x*4, eyeWidth = width/2, local = x%eyeWidth
+                guard Int(ink[at+2])-Int(back[at+2]) > 6 else { continue }
+                if local < eyeWidth/4 { counts[(x/eyeWidth)*2] += 1 }
+                if local >= eyeWidth*3/4 { counts[(x/eyeWidth)*2+1] += 1 }
+            }}
+            print("Loading side points \(width)x\(height): \(counts)")
+            precondition(counts.allSatisfy { $0 >= 10 }, "Side points must remain visible on both sides of both eyes")
+        }
+    }
+    for timestamp in 2...5 {
+        let repeated = draw(head, timestamp: Double(timestamp))
+        precondition(repeated.image.dataProvider!.data! as Data == loading.image.dataProvider!.data! as Data,
+                     "A stationary loading map must not flicker between identical renders")
+    }
     var ready = try! JSONSerialization.jsonObject(with: json) as! [String: Any]
     ready["messageText"] = "Press Trigger To Start"
+    ready["waitingForInput"] = true
     try! JSONSerialization.data(withJSONObject: ready).write(to: URL(fileURLWithPath: stateFile), options: .atomic)
+    probe.poll(now: 0.4, inputReady: false)
+    precondition(probe.state?.messageText == "", "Busy/unknown Windows shader state must withhold the trigger hint")
+    let stillLoading = draw(head, timestamp: 0.4)
+    precondition(stillLoading.image.dataProvider!.data! as Data == loading.image.dataProvider!.data! as Data)
+    _ = draw(head, timestamp: 5)
+    // Hold the scene worker across a mailbox update, as during a slow asset upload.
+    probe.queue.sync {}
+    let blocked = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    probe.queue.async { blocked.signal(); release.wait() }
+    blocked.wait()
     probe.poll(now: 1)
+    let movedWhileBusy = head * simd_float4x4(simd_quatf(angle: 0.1, axis: SIMD3(0,1,0)))
+    let retained = probe.draw(into: pixel!, tangents: nil, ipd: 0.064, head: movedWhileBusy, timestamp: 6)
+    guard retained?.timestamp == 5 && retained?.head == head else {
+        print("Loading cache regression: mailbox update discarded the complete stereo frame")
+        exit(1)
+    }
+    release.signal()
     let waiting = draw(head, timestamp: 2); save(waiting.image, output + ".ready.png")
     precondition(waiting.image.dataProvider!.data! as Data != loading.image.dataProvider!.data! as Data)
+    // A rejected render must not replace the cached picture with a blank frame.
+    probe.queue.sync {}
+    _ = probe.draw(into: pixel!, tangents: Array(repeating: 0, count: 8), ipd: 0.064, head: head, timestamp: 99)
+    probe.queue.sync {}
+    precondition(probe.draw(into: pixel!, tangents: nil, ipd: 0.064, head: head, timestamp: 2)?.timestamp == 2,
+                 "A failed render discarded the previous stereo frame")
     let turn = head * simd_float4x4(simd_quatf(angle: 0.25, axis: SIMD3(0,1,0)))
     let turned = draw(turn, timestamp: 3); save(turned.image, output + ".turned.png")
     precondition(turned.head == turn && turned.image.dataProvider!.data! as Data != waiting.image.dataProvider!.data! as Data)
@@ -1593,7 +1855,7 @@ if let output = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_MAP_SELFTES
     try! Data("{\"type\":\"begin_loading\",\"mapName\":\"../outside\"}".utf8).write(to: URL(fileURLWithPath: stateFile))
     probe.poll(now: 3); precondition(!probe.active)
     for file in [stateFile, stageFile, stageFile + ".ready"] { try? FileManager.default.removeItem(atPath: file) }
-    print("Native loading scene: room, authored city, textures, world-space prompt, head motion, pose timestamps, load/end lifecycle and bounded paths passed")
+    print("Native loading scene: room, city and point field, textures, world-space prompt, head motion, stable stereo cache across updates/failures, load/end lifecycle and bounded paths passed")
     exit(0)
 }
 
@@ -1703,6 +1965,64 @@ if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] ?? 
     exit(0)
 }
 
+// Exercise the real encoder settings and callback without a game, audio,
+// shared map, network listener or headset. JSON only; no per-frame logging.
+if let path = encoderProbePath {
+    precondition(!alvrMode)
+    let width = 3056, height = 1528, count = 180, hz = 72.0
+    setupEncoder(width: Int32(width), height: Int32(height))
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: hz))
+    let pool = makePixelBufferPool(width: width, height: height)!
+    var buffers: [CVPixelBuffer] = []
+    for phase in 0..<8 {
+        var buffer: CVPixelBuffer?
+        precondition(CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer) == kCVReturnSuccess)
+        let pb = buffer!; CVPixelBufferLockBaseAddress(pb, [])
+        let base = CVPixelBufferGetBaseAddress(pb)!, stride = CVPixelBufferGetBytesPerRow(pb)
+        for y in 0..<height {
+            let row = base.advanced(by: y*stride).assumingMemoryBound(to: UInt32.self)
+            for x in 0..<width {
+                let v = UInt32(((x+phase*3)/8*13 + y/8*7) & 255)
+                row[x] = 0xff000000 | (v << 16) | (((v+85)&255) << 8) | ((v+170)&255)
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pb, []); buffers.append(pb)
+    }
+    let began = ProcessInfo.processInfo.systemUptime
+    var calls: [Double] = []
+    for index in 0..<count {
+        let target = began + Double(index)/hz
+        let wait = target - ProcessInfo.processInfo.systemUptime
+        if wait > 0 { usleep(useconds_t(wait*1_000_000)) }
+        precondition(encoderInFlightFrames.wait(timeout: .now()+2) == .success)
+        let submitted = ProcessInfo.processInfo.systemUptime
+        let context = UnsafeMutablePointer<FrameContext>.allocate(capacity: 1)
+        context.initialize(to: FrameContext(sequence: UInt32(index), visionTimestamp: Double(index)/hz,
+            transform: (1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1), pixelBuffer: buffers[index%buffers.count],
+            submittedAt: submitted))
+        let status = VTCompressionSessionEncodeFrame(compressionSession!, imageBuffer: context.pointee.pixelBuffer,
+            presentationTimeStamp: CMTime(value: Int64(index), timescale: 72), duration: .invalid,
+            frameProperties: nil, sourceFrameRefcon: UnsafeMutableRawPointer(context), infoFlagsOut: nil)
+        precondition(status == noErr)
+        calls.append((ProcessInfo.processInfo.systemUptime-submitted)*1000)
+    }
+    let inputDuration = ProcessInfo.processInfo.systemUptime-began
+    VTCompressionSessionCompleteFrames(compressionSession!, untilPresentationTimeStamp: .invalid)
+    for _ in 0..<3 { encoderInFlightFrames.wait() }
+    VTCompressionSessionInvalidate(compressionSession!)
+    encoderDiagnosticLock.lock(); let delays = Array(encoderProbeDelays.dropFirst(16)).sorted(); encoderDiagnosticLock.unlock()
+    func percentile(_ values: [Double], _ fraction: Double) -> Double {
+        let ordered = values.sorted(); return ordered.isEmpty ? 0 : ordered[Int(Double(ordered.count-1)*fraction)]
+    }
+    let report: [String: Any] = ["width": width, "height": height, "frames": count, "callbacks": encoderDelayCount,
+        "input_seconds": inputDuration, "delay_median_ms": percentile(delays,0.5), "delay_p95_ms": percentile(delays,0.95),
+        "encode_call_p95_ms": percentile(calls,0.95), "max_delay": ProcessInfo.processInfo.environment["VERANTYX_ENCODER_MAX_DELAY"] ?? "default"]
+    try! JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]).write(to: URL(fileURLWithPath: path))
+    precondition(encoderDelayCount == count)
+    print(String(format: "Encoder test: median %.1f ms, p95 %.1f ms, input %.2f s", percentile(delays,0.5),percentile(delays,0.95),inputDuration))
+    exit(0)
+}
+
 let winePrefix = ProcessInfo.processInfo.environment["WINEPREFIX"]
     ?? (NSHomeDirectory() + "/Verantyx_VR_Drive/SteamVR_Prefix")
 // VERANTYX_SHARED_FRAME names the file directly (the native ARM build keeps
@@ -1776,7 +2096,10 @@ func loadingFrame() -> SharedFrame {
     var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
         = (1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)
     let timestamp = handsMapPtr.loadUnaligned(fromByteOffset: 244, as: Double.self)
-    if timestamp.isFinite && timestamp > 0 { _ = withUnsafeMutableBytes(of: &transform) { memcpy($0.baseAddress!, handsMapPtr, 64) } }
+    if timestamp.isFinite && timestamp > 0 {
+        _ = withUnsafeMutableBytes(of: &transform) { memcpy($0.baseAddress!, handsMapPtr, 64) }
+        transform.13 += loadingHeightOffset(handsMapPtr.advanced(by: 512))
+    }
     return SharedFrame(sequenceNumber: 0, width: UInt32(outputWidth), height: UInt32(outputHeight), format: 87,
                        renderHeadTransform: transform, visionTimestamp: timestamp.isFinite ? timestamp : 0)
 }
@@ -1953,13 +2276,16 @@ func reportDiagnosticsIfDue() {
         errors: videoPacketSendErrorCount, drops: droppedTransportFrames, poses: posePacketCount)
     let poseAge = lastPoseReceivedAt > 0 ? now - lastPoseReceivedAt : -1
     let gap = longestCaptureGap, stalls = captureStalls
+    let encodeMean = encoderDelayCount > 0 ? encoderDelaySum/Double(encoderDelayCount) : 0
+    let encodeMax = encoderDelayMax
+    encoderDelayCount = 0; encoderDelaySum = 0; encoderDelayMax = 0
     longestCaptureGap = 0; captureStalls = 0
     encoderDiagnosticLock.unlock()
     peerLock.lock()
     let endpoint = videoPeer.map { String(describing: $0.endpoint) } ?? "none"
     peerLock.unlock()
     let captureFPS = Double(current.capture - lastDiagnostics.capture) / elapsed
-    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps bitrate=%.1fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs gap=%.0fms stalls=%d peer=%@",
+    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps bitrate=%.1fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs gap=%.0fms stalls=%d encode=%.1f/%.1fms peer=%@",
         elapsed, dbHeaderPtr.pointee.captureSourceMode, captureFPS,
         Double(current.submit - lastDiagnostics.submit) / elapsed,
         Double(current.encode - lastDiagnostics.encode) / elapsed,
@@ -1968,7 +2294,7 @@ func reportDiagnosticsIfDue() {
         Double(adaptiveBitrate.current) / 1_000_000,
         current.packets - lastDiagnostics.packets, current.errors - lastDiagnostics.errors,
         current.drops - lastDiagnostics.drops, droppedEncoderFrames,
-        Double(current.poses - lastDiagnostics.poses) / elapsed, poseAge, gap * 1000, stalls, endpoint))
+        Double(current.poses - lastDiagnostics.poses) / elapsed, poseAge, gap * 1000, stalls, encodeMean, encodeMax, endpoint))
     if videoPeer != nil {
         adaptiveBitrate.update(
             localLossEvents: (current.errors - lastDiagnostics.errors) + (current.drops - lastDiagnostics.drops),
@@ -2713,6 +3039,7 @@ func sendStreamStatsIfDue() {
 print("Starting native read loop and UDP transmission on port 9999...")
 var loadingFrameClock = LoadingFrameClock()
 var loadingFrames = 0
+var lastEncodedLoadingMap: String?
 
 while isEncoding {
     autoreleasepool {
@@ -2721,7 +3048,9 @@ while isEncoding {
         sendStreamStatsIfDue()
         sendScreenModeIfDue()
         let pollTime = ProcessInfo.processInfo.systemUptime
-        nativeLoadingMap.poll(now: pollTime)
+        gamePrompt.poll(now: pollTime)
+        nativeLoadingMap.poll(now: pollTime, inputReady: gamePrompt.readyForInput)
+        if !nativeLoadingMap.active { lastEncodedLoadingMap = nil }
         let sourceMode = dbHeaderPtr.pointee.captureSourceMode
         if sourceMode != lastCaptureSourceMode {
             print("Capture source changed \(lastCaptureSourceMode)->\(sourceMode); continuing stream sequence \(streamSequence)")
@@ -2793,11 +3122,16 @@ while isEncoding {
                     pixelBufferPool = makePixelBufferPool(width: outputWidth, height: outputHeight)
                 }
 
-                guard encoderInFlightFrames.wait(timeout: .now()) == .success else {
-                    droppedEncoderFrames += 1
+                // A loading heartbeat has no captured frame to discard. Yield
+                // briefly under backpressure instead of retrying it in a spin.
+                let capacityDeadline: DispatchTime = hasSource ? .now() : .now() + .milliseconds(5)
+                guard encoderInFlightFrames.wait(timeout: capacityDeadline) == .success else {
                     lastSeq = currentSeq
-                    if droppedEncoderFrames == 1 || droppedEncoderFrames % 90 == 0 {
-                        print("Dropped capture frame: VideoToolbox has 3 frames in flight (total dropped=\(droppedEncoderFrames))")
+                    if hasSource {
+                        droppedEncoderFrames += 1
+                        if droppedEncoderFrames == 1 || droppedEncoderFrames % 90 == 0 {
+                            print("Dropped capture frame: VideoToolbox has 3 frames in flight (total dropped=\(droppedEncoderFrames))")
+                        }
                     }
                     return
                 }
@@ -2871,6 +3205,7 @@ while isEncoding {
                     return
                 }
 
+                var loadingMapView: NativeLoadingMap.View?
                 // (a game's prompt from its loading page, over both eyes: GamePromptOverlay)
                 if nativeLoadingMap.active || gamePrompt.text != nil {
                     let ipd = handsMapPtr.load(fromByteOffset: 320, as: UInt32.self) == 0x4450_4956
@@ -2880,10 +3215,16 @@ while isEncoding {
                         let head = withUnsafeBytes(of: frameHeader.renderHeadTransform) { $0.loadUnaligned(as: simd_float4x4.self) }
                         if let view = nativeLoadingMap.draw(into: pb, tangents: readSourceProjection(), ipd: Double(safeIPD),
                             head: head, timestamp: frameHeader.visionTimestamp) {
+                            loadingMapView = view
                             withUnsafeBytes(of: view.head) { bytes in
                                 withUnsafeMutableBytes(of: &frameHeader.renderHeadTransform) { $0.copyMemory(from: bytes) }
                             }
                             frameHeader.visionTimestamp = view.timestamp
+                        } else if nativeLoadingMap.visible {
+                            // Asset preparation is asynchronous. Sending the
+                            // cleared input here flashes black in the headset.
+                            encoderInFlightFrames.signal()
+                            return
                         }
                     }
                     else { gamePrompt.draw(into: pb, tangents: readSourceProjection(), ipd: safeIPD) }
@@ -2905,7 +3246,7 @@ while isEncoding {
                     sequence: outputSequence,
                     visionTimestamp: currentVisionTimestamp,
                     transform: currentTransform,
-                    pixelBuffer: pb
+                    pixelBuffer: pb, submittedAt: now
                 ))
 
                 var frameProps: CFDictionary? = nil
@@ -2947,6 +3288,13 @@ while isEncoding {
                     requestKeyFrame()
                 } else {
                     loadingFrameClock.sent(now: now, hasOverlay: hasLoadingOverlay, hasSource: hasSource)
+                    if let view = loadingMapView {
+                        let key = "map=\(view.mapName) stage=\(view.stageModel ?? "(none)")"
+                        if key != lastEncodedLoadingMap {
+                            print("Loading map encoded \(key)")
+                            lastEncodedLoadingMap = key
+                        }
+                    }
                     encoderDiagnosticLock.lock()
                     submittedFrameCount += 1
                     encoderDiagnosticLock.unlock()

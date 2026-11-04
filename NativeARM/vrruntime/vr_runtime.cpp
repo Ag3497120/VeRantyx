@@ -395,6 +395,21 @@ struct Presence {
 static Presence g_presence;
 static float g_heldHead[16];
 static bool g_haveHeldHead;
+struct HeadSample { vr::HmdMatrix34_t pose; double timestamp, received; };
+static std::deque<HeadSample> g_headHistory; // guarded by g_sampleMu, like sampling
+
+double timestamp_for_head_pose(const vr::HmdMatrix34_t &pose) {
+    std::lock_guard<std::mutex> lock(g_sampleMu);
+    const double now = now_seconds();
+    for (auto it = g_headHistory.rbegin(); it != g_headHistory.rend(); ++it) {
+        if (now - it->received > 0.5) break;
+        bool matches = true;
+        for (int r = 0; r < 3; r++) for (int c = 0; c < 4; c++)
+            if (!std::isfinite(pose.m[r][c]) || std::fabs(pose.m[r][c] - it->pose.m[r][c]) > 1e-5f) matches = false;
+        if (matches) return it->timestamp;
+    }
+    return 0;
+}
 
 void sample_poses(PoseSet *out, double predictSeconds) {
     std::lock_guard<std::mutex> sampleLock(g_sampleMu);
@@ -456,6 +471,16 @@ void sample_poses(PoseSet *out, double predictSeconds) {
     hmd.eTrackingResult = vr::TrackingResult_Running_OK;
     hmd.bPoseIsValid = true;
     hmd.bDeviceIsConnected = true;
+    if (fresh) {
+        // Alyx can submit a decoupled render pose older than WaitGetPoses.
+        // ALVR identifies that pose by its original timestamp, not the frame's
+        // publication time. Never extrapolate a pose already predicted by ALVR.
+        if (!g_headHistory.empty() && out->visionTimestamp < g_headHistory.back().timestamp) g_headHistory.clear();
+        if (g_headHistory.empty() || out->visionTimestamp != g_headHistory.back().timestamp) {
+            g_headHistory.push_back({hmd.mDeviceToAbsoluteTracking, out->visionTimestamp, now});
+            while (g_headHistory.size() > 64 || now - g_headHistory.front().received > 0.5) g_headHistory.pop_front();
+        }
+    }
 
     for (int hand = 0; hand < 2; hand++) {
         vr::TrackedDevicePose_t &p = out->dev[1 + hand];

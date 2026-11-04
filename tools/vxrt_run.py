@@ -429,7 +429,7 @@ def git_state():
     return head, dirty
 
 def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_every=15.0, root=None, overlay=None,
-        trace=False, need_steam=True, quiet=False, settings=None, stream=False):
+        trace=False, need_steam=True, quiet=False, settings=None, stream=False, runtime_root=None):
     key, spec, inst = resolve(game)
     scenario = scenario or (spec or {}).get("default_scenario", "start")
     sc = (spec or {}).get("scenarios", {}).get(scenario)
@@ -440,6 +440,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     started = time.time()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{key}-{scenario}" + (f"-{quality}" if quality else "")
     run_dir = os.path.join(REPO, "runs", run_id)
+    runtime = os.path.realpath(runtime_root or REPO)
     logs = os.path.join(run_dir, "logs")
     os.makedirs(logs, exist_ok=True)
     head, dirty = git_state()
@@ -449,6 +450,12 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
                               "machine": doctor.machine_info(), "python": sys.version.split()[0],
                               # (settings already in the environment reach the game too: recorded, so a result says what ran)
                               "inherited": {k: v for k, v in os.environ.items() if k.startswith(("VXRT_", "VERANTYX_"))}}}
+    if runtime_root:
+        result["environment"]["runtime_root"] = runtime
+        result["environment"]["runtime_sha256"] = {
+            name: ledger.sha256_file(os.path.join(runtime, name)) for name in
+            ["VXRuntime/build/vxrt", "build/HardwareEncoder", "build/vxrt-helper", "build/openvr_api_capture_proxy.dll", "VRDriver/driver_verantyx.dll"]
+            if os.path.isfile(os.path.join(runtime, name))}
     say = (lambda *a: None) if quiet else (lambda *a: print(*a, file=sys.stderr))
 
     settings = dict((spec or {}).get("settings", {}), **(settings or {}))      # (the profile's defaults, then the run's)
@@ -464,9 +471,15 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         result["refused"] = [c["code"] for c in checks if not c["ok"]]
         return finish(result, run_dir, say)
 
-    build = subprocess.run(["make", "-C", os.path.join(REPO, "VXRuntime"), "build/vxrt"], capture_output=True, text=True)
-    if build.returncode:
-        open(os.path.join(logs, "build.log"), "w").write(build.stdout + build.stderr)
+    runtime_dir = os.path.join(runtime, "VXRuntime")
+    build_error = ""
+    if os.path.isfile(os.path.join(runtime_dir, "Makefile")):
+        build = subprocess.run(["make", "-C", runtime_dir, "build/vxrt"], capture_output=True, text=True)
+        if build.returncode: build_error = build.stdout + build.stderr or f"make exited with {build.returncode}"
+    elif not os.access(os.path.join(runtime_dir, "build/vxrt"), os.X_OK):
+        build_error = "No executable VXRuntime in the supplied runtime root: " + runtime
+    if build_error:
+        open(os.path.join(logs, "build.log"), "w").write(build_error)
         result["status"] = "refused"; result["refused"] = ["vxrt_builds"]
         result["preconditions"].append({"code": "vxrt_builds", "ok": False, "detail": "make failed: logs/build.log"})
         return finish(result, run_dir, say)
@@ -477,10 +490,10 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     if trace: env["VXRT_TRACE"] = "1"
     env.update({k: str(v) for k, v in settings.items()})
     if spec["launcher"] == "alyx":
-        cmd = [os.path.join(REPO, "scripts", "launch_vxrt_alyx.sh")] + args
+        cmd = [os.path.join(runtime, "scripts", "launch_vxrt_alyx.sh")] + args
         game_log = os.path.join(logs, "vxrt-alyx.log"); exe = "hlvr.exe"
     else:
-        cmd = [os.path.join(REPO, "scripts", "launch_vxrt_game.sh"), inst["exe"]] + args
+        cmd = [os.path.join(runtime, "scripts", "launch_vxrt_game.sh"), inst["exe"]] + args
         exe = os.path.basename(inst["exe"]); game_log = os.path.join(logs, "vxrt-%s.log" % os.path.splitext(exe)[0])
     result["command"] = " ".join(cmd)
     result["exe"] = exe
@@ -573,6 +586,23 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     ev.observe("managed_exceptions", facts["managed_exceptions"], game_log)
     ev.observe("first_problem", facts["first_problem"], game_log)
     ev.observe("exit", facts["exit"], game_log)
+    encoder_log = os.path.join(logs, "hardware-encoder.log")
+    if os.path.exists(encoder_log):
+        maps = re.findall(r"^Loading map encoded map=(\S+) stage=(.+)$", open(encoder_log, errors="replace").read(), re.M)
+        if maps:
+            ev.observe("loading_maps_encoded", [{"map": name, "stage": stage} for name, stage in maps], encoder_log,
+                       note="shared renderer produced a stereo map frame accepted by VideoToolbox; not proof of headset appearance")
+    stages = [dict(token=int(token), model=model) for line in proxy
+              for token, model in re.findall(r"Loading stage mirrored token=(\d+) model=(\S+)", line)]
+    if stages:
+        ev.observe("loading_stages_mirrored", stages, proxy_log,
+                   note="successful original SteamVR stage calls mirrored to the shared renderer; original async readiness is preserved")
+    webui_log = os.path.join(logs, "webui-standin.log")
+    if os.path.exists(webui_log):
+        events = re.findall(r'^\s*"type"\s*:\s*"(begin_loading|show_message|end_loading)"',
+                            open(webui_log, errors="replace").read(), re.M)
+        if events:
+            ev.observe("loading_ui_events", events, webui_log, note="game mailbox messages in received order")
 
     base_name, base, base_src = baseline_for(key, scenario, quality)
     result["baseline"] = base_src
@@ -632,6 +662,7 @@ def main():
     ap.add_argument("--args", nargs=argparse.REMAINDER, default=[], help="more game arguments (last)")
     ap.add_argument("--press-every", type=float, default=15.0, help="pull the right trigger every N seconds (0: never)")
     ap.add_argument("--root"); ap.add_argument("--overlay")
+    ap.add_argument("--runtime-root", help="test a built app's Contents/Resources/runtime instead of repository binaries")
     ap.add_argument("--trace", action="store_true", help="VXRT_TRACE=1 (slower: more in the log)")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="a tunable setting (AGENTS.md), repeatable")
     ap.add_argument("--no-steam", action="store_true", help="do not require Mac Steam (games that do not use it)")
@@ -662,7 +693,7 @@ def main():
             for name in spec["baselines"]:
                 scenario, _, quality = name.partition("@")
                 r = run(key, scenario, quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam,
-                        settings=dict(kv.split("=", 1) for kv in a.set))
+                        settings=dict(kv.split("=", 1) for kv in a.set), runtime_root=a.runtime_root)
                 code = {"pass": 0, "fail": 1, "no_baseline": 2, "refused": 3}.get(r["status"], 4)
                 if code == 3: sys.exit(3)                      # (refused: the rest would be too)
                 worst = max(worst, code)
@@ -676,7 +707,7 @@ def main():
         print(json.dumps(checks, ensure_ascii=False, indent=2)); sys.exit(0 if all(c["ok"] for c in checks) else 3)
     try:
         r = run(a.game, a.scenario, a.quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam, quiet=a.json,
-                settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream)
+                settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream, runtime_root=a.runtime_root)
     except Exception as e:                                    # (an error in the harness itself, not a game's)
         print(f"vxrt run: error: {e}", file=sys.stderr); sys.exit(4)
     if a.json:

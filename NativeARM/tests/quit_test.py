@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ PEER = r'''
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 root = Path(os.environ['NATIVE_QUIT_TEST_ROOT'])
 mode = os.environ['NATIVE_QUIT_TEST_MODE']
@@ -43,6 +45,9 @@ while not (root/'release').exists() and time.monotonic() < deadline:
         time.sleep(.35)
         break
     time.sleep(.01)
+if '--load' in sys.argv:
+    save = Path.cwd()/'game/hlvr/save'/(sys.argv[sys.argv.index('--load')+1]+'.sav')
+    save.write_bytes(b'synthetic save written at shutdown')
 (root/'saved').touch()
 print('synthetic host exited normally', flush=True)
 '''
@@ -162,11 +167,15 @@ class QuitTests(unittest.TestCase):
         self.assertIn('"method": "forced"', result.stderr)
         self.assertFalse((self.root/'saved').exists())
 
-    def probe(self, interrupted=False, broken=False):
+    def probe(self, interrupted=False, broken=False, load_save=False):
         installation = self.root/'installation'
         (installation/'lib').mkdir(parents=True)
         (installation/'lib/libengine2.so').touch()
         (installation/'game-root/game/hlvr/cfg').mkdir(parents=True)
+        if load_save:
+            save = installation/'game-root/game/hlvr/save/s0/quick.sav'
+            save.parent.mkdir(parents=True)
+            save.write_bytes(b'synthetic save before game launch')
         (self.root/'runs').mkdir()
         check_output, run = subprocess.check_output, subprocess.run
         def output(command, *args, **kwargs):
@@ -175,6 +184,7 @@ class QuitTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0) if command[0] == 'pgrep' else run(command, *args, **kwargs)
         argv = ['render_probe.py', '--installation', str(installation), '--host', str(self.peer),
                 '--seconds', '2' if interrupted or broken else '0', '--quit-timeout', '.1']
+        if load_save: argv += ['--load','s0/quick']
         sealed = []
         pending_resources = []
         wait = render_probe.wait_for_game
@@ -236,6 +246,34 @@ class QuitTests(unittest.TestCase):
         status, result = self.probe(broken=True)
         self.assertEqual((status, result['status']), (1, 'error'))
         self.assertIn('synthetic collection error', result['collection_error'])
+
+    def test_probe_identifies_the_save_input_without_changing_the_installation(self):
+        status, result = self.probe(load_save=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(result['load_save_sha256'], hashlib.sha256(b'synthetic save before game launch').hexdigest())
+        save = self.root/'installation/game-root/game/hlvr/save/s0/quick.sav'
+        self.assertEqual(save.read_bytes(), b'synthetic save before game launch')
+
+
+class ControllerProbeTests(unittest.TestCase):
+    def test_menu_button_layout_and_trigger_suppression(self):
+        packet = bytearray(312)
+        render_probe.controller_input(packet, 0, [62,82])
+        self.assertEqual(packet[192:196], bytes([1,1,0,255]))
+        render_probe.controller_input(packet, 62.1, [62,82])
+        right,left = struct.unpack_from('<II',packet,196)
+        self.assertEqual((right,left>>8), (0,2))
+        self.assertEqual(left&255, 0)
+        render_probe.controller_input(packet, 75, [62,82])
+        self.assertEqual(packet[194:204], bytes(10))
+        render_probe.controller_input(packet, 82.1, [62,82])
+        self.assertEqual(struct.unpack_from('<I',packet,200)[0], 512)
+        render_probe.controller_input(packet, 82.3, [62,82])
+        self.assertEqual(struct.unpack_from('<I',packet,200)[0], 0)
+        render_probe.controller_input(packet, 63, [62], 1.5)
+        self.assertEqual(struct.unpack_from('<I',packet,200)[0], 512)
+        render_probe.controller_input(packet, 63.5, [62], 1.5)
+        self.assertEqual(struct.unpack_from('<I',packet,200)[0], 0)
 
 
 if __name__ == '__main__':

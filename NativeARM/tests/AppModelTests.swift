@@ -243,6 +243,42 @@ import Foundation
         // final poll after Stop. Dry runs launch only printf, never the game.
         setenv("VERANTYX_DRY_RUN", "1", 1)
         defer { unsetenv("VERANTYX_DRY_RUN") }
+        let stalled = try Play(title: alyx.name, appID: alyx.id, exe: nil, headset: .quest, wired: false,
+                               quality: .standard, known: alyx, backend: .nativeARM64)
+        let session = stalled.nativeSession!, testTime = Date().addingTimeInterval(60)
+        try fm.createDirectory(at: session, withIntermediateDirectories: true)
+        try Data("{\"state\":\"running\"}".utf8).write(to: session.appendingPathComponent("session.json"))
+        try Data("frame sample: t=10 pairs=100\n".utf8).write(to: session.appendingPathComponent("alyx_host.log"))
+        let encoder = session.appendingPathComponent("hardware-encoder.log")
+        try Data("Pipeline 5.0s source=2 capture=0.0fps pose=215.0Hz poseAge=0.00s peer=none\n".utf8).write(to: encoder)
+        try fm.setAttributes([.modificationDate: testTime], ofItemAtPath: encoder.path)
+        let frame = session.appendingPathComponent("frame.dat")
+        fm.createFile(atPath: frame.path, contents: nil)
+        let frameHandle = try FileHandle(forWritingTo: frame)
+        try frameHandle.truncate(atOffset: UInt64(NativeIPC.size))
+        func trackingPacket(_ sequence: UInt32, _ timestamp: Double) throws {
+            var data = Data(count: 328)
+            func put<T>(_ value: T, _ at: Int) { var v = value; withUnsafeBytes(of: &v) { data.replaceSubrange(at..<at+$0.count, with: $0) } }
+            for i in 0..<16 { put(Float(i%5 == 0 ? 1 : 0),i*4) }
+            put(timestamp,244)
+            for i in 0..<8 { put(Float(i%2 == 0 ? -1 : 1),252+i*4) }
+            put(UInt8(1),286); put(UInt32(0x44504956),320); put(Float(0.064),324)
+            try frameHandle.seek(toOffset: UInt64(NativeIPC.hands)); try frameHandle.write(contentsOf: data)
+            var seq = sequence
+            try frameHandle.seek(toOffset: 20)
+            try withUnsafeBytes(of: &seq) { try frameHandle.write(contentsOf: $0) }
+        }
+        try trackingPacket(2,1); stalled.pollNative(now: testTime)
+        guard !stalled.headsetConnected else { throw NativeFailure("One stale tracking packet counted as connected") }
+        try trackingPacket(4,2); stalled.pollNative(now: testTime.addingTimeInterval(1))
+        guard stalled.headsetConnected, stalled.fps == 0, stalled.headsetFPS == nil else {
+            throw NativeFailure("A game stall became a headset disconnect or retained stale FPS")
+        }
+        stalled.pollNative(now: testTime.addingTimeInterval(4))
+        guard !stalled.headsetConnected else { throw NativeFailure("Stopped tracking remained connected") }
+        try trackingPacket(6,3); stalled.pollNative(now: testTime.addingTimeInterval(5))
+        guard stalled.headsetConnected else { throw NativeFailure("Native tracking reconnect was not seen") }
+        try frameHandle.close()
         for (phase, notice, timedOut) in [(Play.Phase.steamVR, "Open ALVR and connect", false),
                                          (.stopping, "Waiting for the game to close normally…", false),
                                          (.stopping, "The game is still closing", true)] {
@@ -259,6 +295,7 @@ import Foundation
         print("App model: global runtime, migration, mixed installs, shared quality, readiness, navigation and Windows regression checks passed")
         print("App integration: PTY metadata / Unicode / output drain, synthetic Debian archive and FPS statistics passed")
         print("Play lifecycle: child exit clears headset, normal-stop and quit-timeout notices")
+        print("Native play: live tracking survives a video stall; stale frames and stale ALVR statistics do not imply a live stream")
         print("Native installer: old-manifest reuse, symbolic-link omission, fake Linux validation, original preservation, no autoplay and failed-retry publication checks passed")
     }
 }
