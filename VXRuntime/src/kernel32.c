@@ -355,6 +355,25 @@ static DWORD g_error_mode;
 static WINAPI DWORD SetErrorMode(DWORD m) { DWORD o = g_error_mode; g_error_mode = m; return o; }
 static WINAPI DWORD GetErrorMode(void) { return g_error_mode; }
 static WINAPI DWORD GetCurrentProcessorNumber(void) { return 0; }
+// (The C++ runtime's concurrency code, under std::mutex in an older MSVC build, throws at start without this one:
+//  Google Earth VR's openvr_api.dll.)
+static WINAPI void GetCurrentProcessorNumberEx(void *number) { memset(number, 0, 4); }   // PROCESSOR_NUMBER: group 0, processor 0
+// User-mode scheduling: the same runtime looks all of these up at start and throws if one is absent, but schedules on
+// ordinary threads unless asked otherwise. Present, and failing as Windows does without the feature.
+#define UMS_UNSUPPORTED(name) static WINAPI uintptr_t name(void) { vx_set_last_error(50 /* ERROR_NOT_SUPPORTED */); return 0; }
+UMS_UNSUPPORTED(CreateUmsCompletionList)
+UMS_UNSUPPORTED(CreateUmsThreadContext)
+UMS_UNSUPPORTED(DeleteUmsCompletionList)
+UMS_UNSUPPORTED(DeleteUmsThreadContext)
+UMS_UNSUPPORTED(DequeueUmsCompletionListItems)
+UMS_UNSUPPORTED(EnterUmsSchedulingMode)
+UMS_UNSUPPORTED(ExecuteUmsThread)
+UMS_UNSUPPORTED(GetCurrentUmsThread)
+UMS_UNSUPPORTED(GetNextUmsListItem)
+UMS_UNSUPPORTED(GetUmsCompletionListEvent)
+UMS_UNSUPPORTED(QueryUmsThreadInformation)
+UMS_UNSUPPORTED(SetUmsThreadInformation)
+UMS_UNSUPPORTED(UmsThreadYield)
 static WINAPI DWORD GetPriorityClass(HANDLE h) { (void)h; return 0x20; }    // NORMAL_PRIORITY_CLASS
 static WINAPI BOOL SetPriorityClass(HANDLE h, DWORD c) { (void)h; (void)c; return 1; }
 static WINAPI BOOL HeapValidate(HANDLE h, DWORD f, const void *p) { (void)h; (void)f; (void)p; return 1; }
@@ -1210,7 +1229,9 @@ static const vx_export k32[] = {
     { "EncodeSystemPointer", (void *)EncodePointer }, { "DecodeSystemPointer", (void *)DecodePointer },
     VX_EXPORT(IsProcessorFeaturePresent), VX_EXPORT(GetLocalTime), VX_EXPORT(GetSystemTime),
     VX_EXPORT(GetVersion), VX_EXPORT(GetVersionExA), VX_EXPORT(GetVersionExW),
-    VX_EXPORT(SetErrorMode), VX_EXPORT(GetErrorMode), VX_EXPORT(GetCurrentProcessorNumber), VX_EXPORT(GetPriorityClass),
+    VX_EXPORT(SetErrorMode), VX_EXPORT(GetErrorMode), VX_EXPORT(GetCurrentProcessorNumber), VX_EXPORT(GetCurrentProcessorNumberEx), 
+    VX_EXPORT(CreateUmsCompletionList), VX_EXPORT(CreateUmsThreadContext), VX_EXPORT(DeleteUmsCompletionList), VX_EXPORT(DeleteUmsThreadContext), VX_EXPORT(DequeueUmsCompletionListItems), VX_EXPORT(EnterUmsSchedulingMode), VX_EXPORT(ExecuteUmsThread), VX_EXPORT(GetCurrentUmsThread), VX_EXPORT(GetNextUmsListItem), VX_EXPORT(GetUmsCompletionListEvent), VX_EXPORT(QueryUmsThreadInformation), VX_EXPORT(SetUmsThreadInformation), VX_EXPORT(UmsThreadYield),
+    VX_EXPORT(GetPriorityClass),
     VX_EXPORT(SetPriorityClass), VX_EXPORT(HeapValidate), VX_EXPORT(DeviceIoControl), VX_EXPORT(K32GetMappedFileNameW),
     VX_EXPORT(CreateProcessA), VX_EXPORT(CreateProcessW), VX_EXPORT(WinExec),
     VX_EXPORT(GlobalMemoryStatusEx), VX_EXPORT(GetComputerNameA), VX_EXPORT(GetComputerNameW), VX_EXPORT(GetComputerNameExA),
