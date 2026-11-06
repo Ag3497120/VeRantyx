@@ -62,7 +62,8 @@ struct Title: Identifiable, Hashable {
                          "動作（タイトル場面 約 55 fps）。通しのプレイはまだ。無料。"), works: false),
         Title(id: "348250", name: "Google Earth VR", bytes: 2_996_347_031, free: true, exe: "Earth.exe",
               summary: T("Runs (terrain and labels, about 57 fps); not played through yet. Free.",
-                         "動作（地形とラベル、約 57 fps）。通しのプレイはまだ。無料。"), works: false),
+                         "動作（地形とラベル、約 57 fps）。通しのプレイはまだ。無料。"), works: false,
+              captureProxy: "openvr_api.dll"),   // (OpenGL: SteamVR on macOS cannot take its frames, the proxy can)
         Title(id: "359320", name: "Elite Dangerous", bytes: 58_055_995_280, free: false, exe: "EDLaunch.exe",
               summary: T("Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.",
                          "Mac の画面（M1 Max のゲーム中で約 60 fps）でもヘッドセット（30〜35 fps）でも飛べます。キーボード・マウス・DualSense。専用のランチャーが開くので、そこでサインインして PLAY を押します。"),
