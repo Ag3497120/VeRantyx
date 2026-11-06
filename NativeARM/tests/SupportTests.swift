@@ -108,11 +108,13 @@ import Darwin
         let source = root.appendingPathComponent("source"), depot = root.appendingPathComponent("depot"), support = root.appendingPathComponent("support")
         try write(Data("assets".utf8), source.appendingPathComponent("game/hlvr/pak01_dir.vpk"))
         try write(Data("original".utf8), source.appendingPathComponent("game/hlvr/cfg/settings.cfg"))
+        try write(Data("webm".utf8), source.appendingPathComponent("game/hlvr/panorama/videos.bak/intro_world_heist.webm"))
         for (path, name) in zip(NativeFiles.armDirectories, ["libengine2.so", "libclient.so"]) { try write(elf(name), depot.appendingPathComponent(path + "/" + name)) }
         for name in NativeFiles.systemLibraries { try write(elf(name), support.appendingPathComponent(name)) }
         let output = root.appendingPathComponent("version"), state = root.appendingPathComponent("state")
         try NativeFiles.prepare(content: source, depot: depot, support: support, output: output, state: state)
         try NativeFiles.validateGame(output.appendingPathComponent("game-root")); try NativeFiles.validateGuest(output.appendingPathComponent("lib"))
+        try check(String(contentsOf: output.appendingPathComponent("game-root/game/hlvr/panorama/videos/intro_world_heist.webm"), encoding: .utf8) == "webm", "panorama videos.bak restored as videos")
         try check(ELF.soname(output.appendingPathComponent("lib/libengine2.so")) == "libengine2.so", "guest symlinks survive preparation")
         try write(Data("player".utf8), output.appendingPathComponent("game-root/game/hlvr/cfg/settings.cfg"))
         try check(String(contentsOf: source.appendingPathComponent("game/hlvr/cfg/settings.cfg")) == "original", "source remains unchanged")

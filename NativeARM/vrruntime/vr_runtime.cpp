@@ -527,7 +527,14 @@ double seconds_since_vsync() { return now_seconds() - g_lastVsync.load(std::memo
 void wait_next_vsync() {
     const double period = display_period();
     double now = now_seconds();
-    uint64_t n = (uint64_t)floor((now - g_epoch) / period) + 1;
+    uint64_t prev = g_frameCounter.load(std::memory_order_relaxed);
+    uint64_t elapsed_ticks = (uint64_t)floor((now - g_epoch) / period);
+    if (prev > 0 && elapsed_ticks > prev) {
+        g_lastVsync = g_epoch + (double)elapsed_ticks * period;
+        g_frameCounter = elapsed_ticks;
+        return;
+    }
+    uint64_t n = elapsed_ticks + 1;
     double target = g_epoch + (double)n * period;
     double remaining = target - now;
     if (remaining > 0.0015) {
