@@ -993,12 +993,13 @@ struct HeadsetView: View {
                         Text(T("ALVR's setting (72 Hz unless changed)", "ALVR の設定（変えていなければ 72 Hz）")).tag(0)
                         Text("60 Hz").tag(60)
                         Text("72 Hz").tag(72)
+                        Text("80 Hz").tag(80)
                         Text("90 Hz").tag(90)
                         Text("120 Hz").tag(120)
                     }
                     .labelsHidden().pickerStyle(.segmented).disabled(model.configurationLocked)
-                    Text(T("The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 60 Hz on a headset that has it (Quest 1); at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.",
-                           "ヘッドセットの表示のレート。60 fps のゲームは、各フレームを 2 回ずつ表示する 120 Hz か、60 Hz のあるヘッドセット（Quest 1）では 60 Hz が最もなめらかです。72 Hz では 2 回出るフレームと 1 回のフレームが混ざってカクつきます。ヘッドセットは持っているレートのうち最も近いものを使います。次のプレイから有効です。"))
+                    Text(T("The headset's display rate. Quest 2, Quest 3 and Pico support 72, 80, 90 and 120 Hz (60 Hz is Quest 1 only and falls back to 72 Hz on newer headsets). A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 72 Hz when the Mac can sustain 72 fps. Takes effect at the next play.",
+                           "ヘッドセットの表示レート。Quest 2・Quest 3・Pico は 72 / 80 / 90 / 120 Hz に対応しています（60 Hz は Quest 1 のみで、新しいヘッドセットでは 72 Hz になります）。60 fps のゲームは各フレームを 2 回表示する 120 Hz か、Mac が 72 fps を維持できるなら 72 Hz がなめらかです。次のプレイから有効です。"))
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 Banner(icon: "person.2.wave.2", text: T("Quest and Pico have not been tested by the author yet (no headset). If you try, a report helps a lot, whether it works or not.",

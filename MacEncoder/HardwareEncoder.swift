@@ -878,6 +878,8 @@ final class GamePromptOverlay {
     private var animationPhase: Int?
     private var image: CGImage?
     private var imageFor = (0, 0)
+    private var startupImage: CGImage?
+    private var startupImageFor = (0, 0, -1)
 
     init(path: String?, statePath: String? = nil, shaderPath: String? = nil,
          language: String = Locale.preferredLanguages.first ?? "en",
@@ -1038,7 +1040,26 @@ final class GamePromptOverlay {
             image = GamePromptOverlay.render(text, eyeWidth: width / 2, eyeHeight: height, activityPhase: animationPhase)
             imageFor = (width, height)
         }
-        guard let image, CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return false }
+        guard let image else { return false }
+        return Self.drawBadge(image, into: pb, tangents: tangents, ipd: ipd)
+    }
+
+    /// Draws the compact animated startup notice during initial boot while the 3D loading scene is intentionally hidden.
+    @discardableResult
+    func drawStartup(into pb: CVPixelBuffer, tangents: [Float]?, ipd: Float, now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        let width = CVPixelBufferGetWidth(pb), height = CVPixelBufferGetHeight(pb), phase = Int(now * 4) % 8
+        if startupImage == nil || startupImageFor != (width, height, phase) {
+            let notice = words("Loading game\nPlease wait", "Загрузка игры\nПожалуйста, подождите", "ゲームを読み込み中\nしばらくお待ちください")
+            startupImage = GamePromptOverlay.render(notice, eyeWidth: width / 2, eyeHeight: height, activityPhase: phase)
+            startupImageFor = (width, height, phase)
+        }
+        guard let startupImage else { return false }
+        return Self.drawBadge(startupImage, into: pb, tangents: tangents, ipd: ipd)
+    }
+
+    private static func drawBadge(_ image: CGImage, into pb: CVPixelBuffer, tangents: [Float]?, ipd: Float) -> Bool {
+        let width = CVPixelBufferGetWidth(pb), height = CVPixelBufferGetHeight(pb)
+        guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return false }
         defer { CVPixelBufferUnlockBaseAddress(pb, []) }
         guard let base = CVPixelBufferGetBaseAddress(pb),
               let ctx = CGContext(data: base, width: width, height: height, bitsPerComponent: 8,
@@ -3225,6 +3246,8 @@ while isEncoding {
                             // cleared input here flashes black in the headset.
                             encoderInFlightFrames.signal()
                             return
+                        } else if !hasSource {
+                            gamePrompt.drawStartup(into: pb, tangents: readSourceProjection(), ipd: safeIPD)
                         }
                     }
                     else { gamePrompt.draw(into: pb, tangents: readSourceProjection(), ipd: safeIPD) }

@@ -37,11 +37,14 @@ for f in vxrt-steamvr-launch.log; do [[ -s "$LOG_DIR/$f" ]] && mv -f "$LOG_DIR/$
 # Where the game's writes go: the Steam library's overlay, or one of the game's own.
 LIB="$(steam_library_of "$EXE")"
 case "$LIB" in
-    ?*) OVERLAY="$LIB:$VXRT_VR_OVERLAY" ;;
+    ?*) OVERLAY="$LIB:$VXRT_VR_OVERLAY"
+        rel="${EXE#"$LIB/steamapps/common/"}"
+        GAME_ROOT="$LIB/steamapps/common/${rel%%/*}" ;;
     *)  top="$GAME_DIR"                                   # the install's top folder: where steamapps/ is, else the exe's
         d="$GAME_DIR"
         while [[ "$d" != "/" && "$d" != "$HOME" ]]; do [[ -d "$d/steamapps" ]] && { top="$d"; break; }; d="$(dirname "$d")"; done
-        OVERLAY="$top:$VXRT_VR_OVERLAY/games/$(basename "$top")" ;;
+        OVERLAY="$top:$VXRT_VR_OVERLAY/games/$(basename "$top")"
+        GAME_ROOT="$top" ;;
 esac
 
 # The Steam app ID, for the Steam bridge.
@@ -71,6 +74,7 @@ fi
 # on the Mac's screen (a game that finds SteamVR running may choose VR by itself: Elite Dangerous did).
 cleanup() {
     [[ -n "${GAME_PID:-}" ]] && kill -TERM "$GAME_PID" 2>/dev/null || true
+    [[ -n "${GAME_ROOT:-}" ]] && pkill -TERM -f "VXRuntime/build/vxrt(-arm64)? $GAME_ROOT/" 2>/dev/null || true
     [[ -n "${STEAMVR_PID:-}" ]] && { kill -TERM "$STEAMVR_PID" 2>/dev/null || true; wait "$STEAMVR_PID" 2>/dev/null || true; }
 }
 trap cleanup EXIT INT TERM
@@ -82,6 +86,11 @@ if [[ "${VXRT_FLAT:-0}" == 1 ]]; then
     [[ -s "$LOG" ]] && mv -f "$LOG" "${LOG%.log}.prev.log"
     echo "Flat (no SteamVR); starting $EXE_NAME${APP_ID:+ (Steam app $APP_ID)} (log: $LOG)"
 else
+# Sub-applications launched through IVRApplications::LaunchInternalProcess (e.g. The Lab's Robot Repair and Secret Shop)
+# are spawned by vrserver.exe and inherit its environment.
+export VXRT_STEAM_BRIDGE=1 VXRT_STAY_ACTIVE="${VXRT_STAY_ACTIVE:-1}" VXRT_DEBUG_OUTPUT=1 VXRT_LOG_TIME=1
+export VXRT_SHADER_PROGRESS_FILE="$VERANTYX_SHADER_PROGRESS_FILE"
+[[ -n "$APP_ID" ]] && export SteamAppId="$APP_ID" SteamGameId="$APP_ID"
 "$SCRIPT_DIR/launch_vxrt_steamvr.sh" >"$LOG_DIR/vxrt-steamvr-launch.log" 2>&1 &
 STEAMVR_PID=$!
 waited=0                                               # vrserver's web server is up once SteamVR has started
@@ -145,4 +154,18 @@ env "${GAME_ENV[@]}" "$VXRT" "$EXE_NAME" "$@" >"$LOG" 2>&1 &
 GAME_PID=$!
 wait "$GAME_PID" || true
 GAME_PID=
+# Games such as The Lab hand off to sub-executables via IVRApplications::LaunchInternalProcess (which vrserver
+# spawns under GAME_ROOT) and then terminate the initial process. Keep the VR session alive while any game
+# process under GAME_ROOT is running or starting.
+if [[ "${VXRT_FLAT:-0}" != 1 && -n "${GAME_ROOT:-}" ]]; then
+    idle=0
+    while (( idle < 6 )); do
+        if pgrep -f "VXRuntime/build/vxrt(-arm64)? $GAME_ROOT/" >/dev/null 2>&1; then
+            idle=0
+        else
+            idle=$((idle + 1))
+        fi
+        sleep 0.5
+    done
+fi
 echo "$EXE_NAME exited (log: $LOG)"

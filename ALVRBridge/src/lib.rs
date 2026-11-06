@@ -90,9 +90,8 @@ pub fn prepare_session(layout: &alvr_filesystem::Layout) {
     }
     // (VERANTYX_ALVR_FPS: the display rate asked of the headset, which takes the nearest one it has; ALVR's 72 when
     //  not set. A headset that then differs from the last one asks for the restart below, vx_alvr_restart_needed.)
-    if let Some(fps) = env::var("VERANTYX_ALVR_FPS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|f| (50.0..=144.0).contains(f)) {
-        ss["video"]["preferred_fps"] = fps.into();
-    }
+    let fps = env::var("VERANTYX_ALVR_FPS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|f| (50.0..=144.0).contains(f)).unwrap_or(72.0);
+    ss["video"]["preferred_fps"] = fps.into();
     ss["video"]["preferred_codec"]["variant"] = "Hevc".into();
     ss["video"]["foveated_encoding"]["enabled"] = false.into();
     fs::write(&path, serde_json::to_string_pretty(&s).unwrap()).unwrap();
@@ -766,6 +765,22 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         assert_eq!(headsets, vec!["Pico 4 Ultra".to_string()]);
         assert_eq!(velocity_source(&headsets, None), VelocitySource::Poses);
+    }
+
+    #[test]
+    fn prepare_session_resets_default_refresh_rate_to_72() {
+        let dir = std::env::temp_dir().join(format!("vx-alvr-fps-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let l = layout(Some(dir.clone()));
+        env::set_var("VERANTYX_ALVR_FPS", "60");
+        prepare_session(&l);
+        let s60: serde_json::Value = serde_json::from_str(&fs::read_to_string(l.session()).unwrap()).unwrap();
+        assert_eq!(s60["session_settings"]["video"]["preferred_fps"].as_f64(), Some(60.0));
+        env::remove_var("VERANTYX_ALVR_FPS");
+        prepare_session(&l);
+        let s72: serde_json::Value = serde_json::from_str(&fs::read_to_string(l.session()).unwrap()).unwrap();
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(s72["session_settings"]["video"]["preferred_fps"].as_f64(), Some(72.0));
     }
 
     #[test]
