@@ -664,6 +664,15 @@ static void test_compositor() {
         assert(frame()->visionTimestamp == 123);
         // Authored magenta after the intro, including a full-screen fade, survives.
         out = publish(pink, pink); assert(out[0] == 255 && out[1] == 0 && out[2] == 255);
+        // Brief Blink-locomotion black frames preserve the last rendered scene
+        // when VERANTYX_SUPPRESS_BLINK_BLACK=1, while sustained black fades pass.
+        setenv("VERANTYX_SUPPRESS_BLINK_BLACK", "1", 1);
+        out = publish(scene, scene); assert(out[1] == 27 && out[2] == 42);
+        for (int i = 0; i < 6; i++) {
+            out = publish(black, black);
+            assert(out[1] == 27 && out[2] == 42);
+        }
+        unsetenv("VERANTYX_SUPPRESS_BLINK_BLACK");
     }
     {
         setenv("VERANTYX_NATIVE_EXPOSURE_EV", "0", 1);

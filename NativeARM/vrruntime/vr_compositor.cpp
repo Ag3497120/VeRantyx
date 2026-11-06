@@ -323,19 +323,37 @@ static inline uint8_t half_to_u8(uint16_t h) {
     return (uint8_t)(v * 255.0f + 0.5f);
 }
 
+static bool staging_is_black(const Readback::Staging &s) {
+    if (!s.map || !s.w || !s.h) return false;
+    if (bytes_per_pixel(s.fmt) != 4) return false;
+    const uint8_t *src = (const uint8_t *)s.map;
+    for (uint32_t y = 0; y < 16; y++) for (uint32_t x = 0; x < 16; x++) {
+        const uint32_t px = (2 * x + 1) * s.w / 32;
+        const uint32_t py = (2 * y + 1) * s.h / 32;
+        const uint8_t *p = src + ((size_t)py * s.w + px) * 4;
+        unsigned value = (unsigned(p[0]) + p[1] + p[2]) / 3;
+        if (value > 1) return false;
+    }
+    return true;
+}
+
 // Convert one eye from the staging buffer into the encoder's 8-bit layout
 // (DXGI 28 RGBA or 87 BGRA), writing into the shared frame at column x0.
 // The eye is scaled (nearest) to dw x dh: the two eyes' own frusta differ by a
 // few percent, and the encoder expects two equal halves, each spanning its
 // eye's frustum.
 static void convert_eye(const Readback::Staging &s, uint8_t *dst, uint32_t dstRowBytes, uint32_t x0, bool flipY, uint32_t *outFormat,
-                        uint32_t dw, uint32_t dh, bool flipX = false) {
+                        uint32_t dw, uint32_t dh, bool flipX = false, const vrrt::NativeDisplayCurve *color = nullptr) {
     const uint32_t w = s.w, h = s.h;
     const uint8_t *src = (const uint8_t *)s.map;
     uint32_t bpp = bytes_per_pixel(s.fmt);
     const bool scale = dw != w || dh != h || flipX;
-    std::vector<uint8_t> rowbuf(scale ? (size_t)w * 4 : 0);
-    std::vector<uint32_t> xmap(scale ? dw : 0);
+    thread_local std::vector<uint8_t> rowbuf;
+    thread_local std::vector<uint32_t> xmap;
+    if (scale) {
+        rowbuf.resize((size_t)w * 4);
+        xmap.resize(dw);
+    }
     for (uint32_t c = 0; scale && c < dw; c++) {
         uint32_t x = std::min(w - 1, (uint32_t)(((uint64_t)c * w + w / 2) / dw));
         xmap[c] = flipX ? w - 1 - x : x;
@@ -347,9 +365,19 @@ static void convert_eye(const Readback::Staging &s, uint8_t *dst, uint32_t dstRo
         uint8_t *const out = dst + (size_t)orow * dstRowBytes + (size_t)x0 * 4;
         uint8_t *dp = scale ? rowbuf.data() : out;
         switch (s.fmt) {
-        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
-            for (uint32_t c = 0; c < w; c++) { dp[c*4] = sp[c*4+2]; dp[c*4+1] = sp[c*4+1]; dp[c*4+2] = sp[c*4]; dp[c*4+3] = sp[c*4+3]; }
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: {
+            uint32_t c = 0;
+#if defined(__aarch64__)
+            const uint8_t idx_bytes[16] = { 2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15 };
+            const uint8x16_t perm = vld1q_u8(idx_bytes);
+            for (; c + 4 <= w; c += 4) {
+                uint8x16_t v = vld1q_u8(sp + c * 4);
+                vst1q_u8(dp + c * 4, vqtbl1q_u8(v, perm));
+            }
+#endif
+            for (; c < w; c++) { dp[c*4] = sp[c*4+2]; dp[c*4+1] = sp[c*4+1]; dp[c*4+2] = sp[c*4]; dp[c*4+3] = sp[c*4+3]; }
             *outFormat = 87; break;
+        }
         case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: memcpy(dp, sp, (size_t)w * 4); *outFormat = 87; break;
         case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {   // R in bits 0-9 → BGRA8
             const uint32_t *p = (const uint32_t *)sp;
@@ -390,6 +418,7 @@ static void convert_eye(const Readback::Staging &s, uint8_t *dst, uint32_t dstRo
             uint32_t *o = (uint32_t *)out;
             for (uint32_t c = 0; c < dw; c++) o[c] = in[xmap[c]];
         }
+        if (color) color->apply_bgra(out, scale ? dw : w);
     }
 }
 
@@ -421,6 +450,7 @@ public:
     std::atomic<unsigned> m_submits{0}, m_published{0}, m_skipped{0};
     bool m_startup = true;
     unsigned m_startupClears = 0;
+    unsigned m_blinkBlackFrames = 0;
     double m_lastReport = 0;
     double m_lastBoundsError = 0;
     uint32_t m_boundsErrors = 0;
@@ -440,7 +470,7 @@ public:
         // destroying its VkDevice. Never carry its borrowed handles into Init.
         m_rb = Readback();
         m_stopping = false; m_submitted = 0; m_dropFrame = false;
-        m_startup = true; m_startupClears = 0;
+        m_startup = true; m_startupClears = 0; m_blinkBlackFrames = 0;
         { std::lock_guard<std::mutex> poses(m_poseMu); m_poseHistory.clear(); m_posePredictionId = 0; }
         m_eyeDone[0] = m_eyeDone[1] = false;
     }
@@ -717,14 +747,26 @@ public:
         m_eyeDone[0] = m_eyeDone[1] = false;
     }
     void publish_from(const Readback::Staging &L, const Readback::Staging &R, const bool *flips, const bool *flipX, const float *head, double visionTs) {
+        const char *suppressBlink = getenv("VERANTYX_SUPPRESS_BLINK_BLACK");
+        if (!m_startup && m_published > 0 && suppressBlink && strcmp(suppressBlink, "1") == 0) {
+            if (staging_is_black(L) && staging_is_black(R)) {
+                if (++m_blinkBlackFrames <= 18) {
+                    m_published++;
+                    return;
+                }
+            } else {
+                m_blinkBlackFrames = 0;
+            }
+        }
         const uint32_t ew = std::max(L.w, R.w), h = std::max(L.h, R.h), w = ew * 2;
         uint32_t idx;
         uint8_t *dst = vrrt::frame_begin(w, h, &idx);
         if (!dst) { m_skipped++; return; }
         uint32_t fmt = 87;
         const double tc0 = vrrt::now_seconds();
-        convert_eye(L, dst, w * 4, 0, flips[0], &fmt, ew, h, flipX[0]);
-        convert_eye(R, dst, w * 4, ew, flips[1], &fmt, ew, h, flipX[1]);
+        const vrrt::NativeDisplayCurve *rowColor = m_startup ? nullptr : &m_color;
+        convert_eye(L, dst, w * 4, 0, flips[0], &fmt, ew, h, flipX[0], rowColor);
+        convert_eye(R, dst, w * 4, ew, flips[1], &fmt, ew, h, flipX[1], rowColor);
         if (m_startup) {
             if (startup_clear(dst, w, h, 0) || startup_clear(dst, w, h, 1)) {
                 memset(dst, 0, (size_t)w*h*4);
@@ -733,8 +775,8 @@ public:
                 m_startup = false;
                 vrrt::log("startup: first scene pair; %u clear-only pairs replaced", m_startupClears);
             }
+            m_color.apply_bgra(dst, (size_t)w * h);
         }
-        m_color.apply_bgra(dst, (size_t)w * h);
         if (!m_published) vrrt::log("native display color: %.2f EV shadow/midtone matching, sRGB SDR, black/white preserved", m_color.exposure());
         vrrt::frame_publish(idx, w, h, fmt, head, visionTs);
         m_published++;

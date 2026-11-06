@@ -202,6 +202,13 @@ enum NativeFiles {
         try fm.createDirectory(at: game, withIntermediateDirectories: true)
         try merge(content, into: game)
         if content.standardizedFileURL != depot.standardizedFileURL { try merge(depot, into: game) }
+        // If the source installation had panorama/videos renamed to videos.bak
+        // (an old Wine workaround), link panorama/videos so in-game video panels work.
+        let videos = game.appendingPathComponent("game/hlvr/panorama/videos")
+        let videosBak = game.appendingPathComponent("game/hlvr/panorama/videos.bak")
+        if !fm.fileExists(atPath: videos.path), fm.fileExists(atPath: videosBak.path) {
+            try fm.createSymbolicLink(atPath: videos.path, withDestinationPath: "videos.bak")
+        }
         try validateGame(game)
         try fm.createDirectory(at: lib, withIntermediateDirectories: true)
         var names = Set<String>()
