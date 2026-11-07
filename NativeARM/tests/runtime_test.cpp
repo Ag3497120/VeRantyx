@@ -91,6 +91,11 @@ static vrrt::PoseSet test_shared_memory() {
     vrrt::frame_publish(index, 4, 2, 87, p.headTransform, p.visionTimestamp);
     assert(frame()->sequenceNumber && frame()->width == 4 && frame()->visionTimestamp == p.visionTimestamp);
     assert(header()->captureSourceMode == 2 && header()->padding[8] == 0x4E415456);
+    auto projection = reinterpret_cast<vrrt::FrameProjection *>(vrrt::shm_base()+vrrt::kProjectionOffset)+(index&1);
+    assert(projection->sequence == frame()->sequenceNumber);
+    assert(extras->ipdMagic == vrrt::kIpdMagic); // frame metadata never overwrites IPD
+    for (int i=0;i<4;i++) assert(near(projection->tangents[i],vrrt::config().tangentsLeft[i]));
+
     auto old = frame();
     vrrt::frame_begin(4, 2, &index); vrrt::frame_publish(index, 4, 2, 87, p.headTransform, 2);
     vrrt::frame_begin(4, 2, &index);
@@ -776,6 +781,20 @@ static void test_compositor() {
         assert(c.Submit(Eye_Left, &texture, nullptr, Submit_Default) == VRCompositorError_None);
         assert(c.Submit(Eye_Right, &texture, nullptr, Submit_Default) == VRCompositorError_None);
         c.shutdown(); assert(c.m_published == 1 && c.m_boundsErrors == 3 && inFlight.empty());
+    }
+    {
+        // Preserve the MoltenVR fix: graphics changes can leave Alyx submitting
+        // a viewport larger than its new allocation, with projection metadata.
+        Compositor c; fake_queue(c,pixels); c.WaitGetPoses(nullptr,0,nullptr,0);
+        VRTextureWithDepth_t resized{};
+        static_cast<Texture_t &>(resized) = texture;
+        VRTextureBounds_t oldViewport = {0,0,1.25f,1.25f};
+        assert(c.Submit(Eye_Left,&resized,&oldViewport,Submit_TextureWithDepth)==VRCompositorError_None);
+        assert(c.Submit(Eye_Right,&resized,&oldViewport,Submit_TextureWithDepth)==VRCompositorError_None);
+        c.shutdown(); assert(c.m_published==1 && inFlight.empty());
+        const auto published = reinterpret_cast<vrrt::FrameProjection *>(vrrt::shm_base()+vrrt::kProjectionOffset)+(header()->latestReadyIndex&1);
+        assert(published->sequence==frame()->sequenceNumber);
+        for (int i=0;i<8;i++) assert(near(published->tangents[i],c.m_imageTangents[i]));
     }
     {
         Compositor c; fake_queue(c, pixels); c.WaitGetPoses(nullptr, 0, nullptr, 0);

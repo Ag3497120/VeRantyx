@@ -1008,8 +1008,13 @@ static void exit_trace(const char *what, int code) {
     fprintf(stderr, "  [glibc] %s(%d) called:\n", what, code);
     kl_fault_print_frames(stderr, __builtin_frame_address(0));
 }
-static void klg__exit(int code) { exit_trace("_exit", code); fflush(NULL); if (g__exit) g__exit(code); _exit(code); }
-static void klg_exit(int code) { exit_trace("exit", code); exit(code); }
+#ifdef VERANTYX_FOSSILIZE
+extern void kl_fossilize_flush(void);
+#else
+static void kl_fossilize_flush(void) {}
+#endif
+static void klg__exit(int code) { kl_fossilize_flush(); exit_trace("_exit", code); fflush(NULL); if (g__exit) g__exit(code); _exit(code); }
+static void klg_exit(int code) { kl_fossilize_flush(); exit_trace("exit", code); exit(code); }
 
 // dlsym/dlopen with a trace (KL_GLIBC_TRACE_DLSYM=1): what the guest asked, on
 // which handle, and what it got.
@@ -1413,7 +1418,7 @@ static struct { const char *name; void *fn; } g_table[] = {
     E("inotify_init", klg_inotify_init), E("inotify_init1", klg_inotify_init1), E("inotify_add_watch", klg_inotify_add_watch),
     E("inotify_rm_watch", klg_inotify_rm_watch),
     E("readlink", klg_readlink), E("readlinkat", klg_readlinkat), E("stat", klg_stat), E("lstat", klg_lstat),
-    E("fstatat", klg_fstatat), E("fopen", klg_fopen),
+    E("fstatat", klg_fstatat), E("fopen", klg_fopen), E("fopen64", klg_fopen),
     E("tmpnam", tmpnam), E("getloadavg", getloadavg), E("putenv", putenv), E("asctime", asctime), E("asctime_r", asctime_r),
     E("getdtablesize", getdtablesize), E("futimes", futimes), E("ctermid", ctermid), E("faccessat", klg_faccessat),
     E("posix_fadvise", klg_posix_fadvise), E("posix_fadvise64", klg_posix_fadvise), E("mount", klg_mount), E("umount", klg_mount),

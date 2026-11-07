@@ -1,0 +1,24 @@
+#!/bin/bash
+set -euo pipefail
+verb="${1:-}"; if (( $# )); then shift; fi
+case "$verb" in
+ getcompatpath) printf '%s\n' "${STEAM_COMPAT_DATA_PATH:-}"; exit 0 ;;
+ getnativepath) printf '%s\n' "${1:-}"; exit 0 ;;
+ run|waitforexitandrun) ;;
+ *) exit 0 ;;
+esac
+app_id="${STEAM_COMPAT_APP_ID:-${SteamAppId:-546560}}"
+if [[ "$app_id" != 546560 ]]; then
+ echo 'This tool supports only Half-Life: Alyx (546560).' >&2; exit 1
+fi
+if (( $# == 0 )); then echo 'Steam supplied no game executable.' >&2; exit 1; fi
+executable="$1"; shift
+# Alyx prerequisites are Windows installers, not the native game.
+case "${executable##*/}" in hlvr.exe|HLVR.exe|hlvr) ;; *) exit 0 ;; esac
+tool_dir="$(cd "$(dirname "$0")" && pwd)"
+config="$tool_dir/game-path.txt"
+if [[ ! -f "$config" ]]; then echo 'Run install-notproton.sh with your Alyx installation path.' >&2; exit 1; fi
+IFS= read -r game_dir < "$config"
+launcher="$game_dir/start.command"
+if [[ ! -f "$launcher" ]]; then echo "Native launcher not found: $launcher" >&2; exit 1; fi
+exec /bin/bash "$launcher" "$@"

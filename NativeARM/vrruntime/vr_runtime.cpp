@@ -118,6 +118,8 @@ static std::atomic<double> g_lastVsync{0};
 static uint32_t g_frameSequence;
 
 void log(const char *fmt, ...) {
+    static bool quiet = getenv("VERANTYX_QUIET") && !strcmp(getenv("VERANTYX_QUIET"), "1");
+    if (quiet) return;
     char buf[1024];
     va_list a; va_start(a, fmt); vsnprintf(buf, sizeof buf, fmt, a); va_end(a);
     fprintf(stderr, "  [vrrt] %s\n", buf);
@@ -249,13 +251,18 @@ static void publish_effective_tangents() {
 }
 
 void frame_publish(uint32_t idx, uint32_t combinedWidth, uint32_t height, uint32_t format,
-                   const float renderHeadTransform[16], double visionTimestamp) {
+                   const float renderHeadTransform[16], double visionTimestamp, const float *imageTangents) {
     publish_effective_tangents();
     SharedFrame *f = g_frames[idx & 1];
     uint32_t seq = ++g_frameSequence; if (seq == 0) seq = ++g_frameSequence;
     f->width = combinedWidth; f->height = height; f->format = format;
     memcpy(f->renderHeadTransform, renderHeadTransform, sizeof f->renderHeadTransform);
     f->visionTimestamp = visionTimestamp;
+    auto *projection = reinterpret_cast<FrameProjection *>(g_map + kProjectionOffset) + (idx & 1);
+    projection->sequence = seq;
+    memcpy(projection->tangents, imageTangents ? imageTangents : g_cfg.tangentsLeft, 4 * sizeof(float));
+    memcpy(projection->tangents + 4, imageTangents ? imageTangents + 4 : g_cfg.tangentsRight, 4 * sizeof(float));
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&f->sequenceNumber, seq, __ATOMIC_RELEASE);
     __atomic_store_n(&g_hdr->latestReadyIndex, (int32_t)idx, __ATOMIC_RELEASE);
     __atomic_store_n(&g_hdr->captureSourceMode, 2, __ATOMIC_RELEASE);     // game frames
@@ -313,6 +320,16 @@ static void latch_tangents() {
         }
         hgt = (uint32_t)(((uint32_t)lround(height) + 1u) & ~1u);
         w = (uint32_t)(((uint32_t)lround(width) + 1u) & ~1u);
+    }
+    const uint32_t targetWidth = (uint32_t)env_number("VERANTYX_OUTPUT_EYE_WIDTH", 0, 0, 8192);
+    const uint32_t targetHeight = (uint32_t)env_number("VERANTYX_OUTPUT_EYE_HEIGHT", 0, 0, 8192);
+    if (targetWidth && targetHeight) {
+        float cropWidth = std::min((L[1]-L[0]),(R[1]-R[0]))/(g_cfg.renderTangents[1]-g_cfg.renderTangents[0]);
+        float cropHeight = std::min((L[3]-L[2]),(R[3]-R[2]))/(g_cfg.renderTangents[3]-g_cfg.renderTangents[2]);
+        // Deckard fidelity scale 1.0 aligns targets to 96 pixels. Round up so
+        // each cropped eye retains at least the requested output resolution.
+        w = (uint32_t)(ceil((g_cfg.sharedFrustum ? targetWidth/cropWidth : targetWidth)/96.0)*96);
+        hgt = (uint32_t)(ceil((g_cfg.sharedFrustum ? targetHeight/cropHeight : targetHeight)/96.0)*96);
     }
     g_cfg.eyeWidth = w; g_cfg.eyeHeight = hgt;
     log("eye frustum: %s; left=(%.3f %.3f %.3f %.3f) right=(%.3f %.3f %.3f %.3f); render target %ux%u per eye; display %.0f Hz",

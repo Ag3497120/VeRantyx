@@ -29,6 +29,11 @@
 // The OpenVR runtime (../vrruntime), served to the guest as vrclient.so.
 extern void *vrrt_dlsym(const char *name);
 extern void vrrt_init(const char *gameDir);
+#ifdef VERANTYX_FOSSILIZE
+extern void kl_fossilize_install(void);
+#else
+static void kl_fossilize_install(void) {}
+#endif
 
 // openvr_api finds its runtime through a JSON path registry; point it (via
 // VR_PATHREG_OVERRIDE) at one naming a directory whose vrclient.so is ours.
@@ -177,6 +182,7 @@ int main(int argc, char **argv) {
     // The persistent worker archive owns completed shaders. Keeping engine
     // caches small avoids their synchronous serialization on frame workers.
     setenv("KL_VK_PRIVATE_CACHE", "1", 0);
+    kl_fossilize_install();
     kl_glibc_install(argv[0]);
     kl_set_library_path(g_libdir);
     kl_thread_init();
