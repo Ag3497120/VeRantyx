@@ -1,0 +1,8 @@
+{
+  "upstream": "https://github.com/glovebox-vr/glovebox",
+  "license": "MIT",
+  "recipe_path": "packages/alyx/pipelines/alyx.recipe",
+  "recipe_sha256": "a4a4d1301d001c83bdaef369399b06275acd5cf2b099915f5914625a509c5eca",
+  "fossilize_commit": "556da9ff7d7616704dda515756219ab1dab693ec",
+  "contains_game_shader_code": false
+}
