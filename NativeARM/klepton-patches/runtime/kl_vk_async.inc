@@ -6,10 +6,10 @@
 // hitches when characters or new areas appear). With KL_VK_ASYNC_PIPELINES=1
 // the create info is deep-copied, the guest gets a placeholder handle at once,
 // and worker threads compile ahead of use. Pending graphics draws are omitted
-// without waiting, including depth passes: uninterrupted head motion takes
-// priority over complete cold frames. Ready materials activate together at
-// the next stereo frame boundary. Cached shadow contents may be incomplete
-// until the engine redraws them; this policy is not a shadow-correctness fix.
+// without waiting for ordinary colour materials. Depth/stencil-only and colour-only offscreen passes
+// must complete at first use: Source 2 may cache their shadow contents and
+// never redraw an omitted occluder. Colour materials activate together at
+// the next stereo frame boundary; depth is available before its consumers.
 // Anything the copy does not understand is compiled synchronously as before.
 //
 // While compiles are in flight, destroys of shader modules, pipeline layouts,
@@ -176,7 +176,7 @@ typedef struct kva_pipe {
     _Atomic int state;              // 0 pending, 1 ready, 2 failed
     uint64_t ready_serial;          // immutable after state becomes ready
     _Atomic int demanded;           // priority hint; never locks the recording thread
-    int depth_only;
+    int required_first_use;
     int destroy_requested;          // under g_kva_mu
     VkDevice dev;
     VkPipelineCache cache;
@@ -187,6 +187,7 @@ typedef struct kva_pipe {
     struct kva_pipe *next_job;
     struct kva_pipe *next_active;
     double queued_ms, started_ms, compiled_ms;
+    int prewarm;
 } kva_pipe;
 
 static pthread_mutex_t g_kva_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -202,6 +203,10 @@ static int kva_private_archive(void) {
 static pthread_cond_t g_kva_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_kva_ready = PTHREAD_COND_INITIALIZER;
 static kva_pipe *g_kva_head, *g_kva_tail, *g_kva_active;
+static int g_kva_game_compiling;
+static int g_kva_game_limit = 8;
+static int g_kva_preserve_required = 1;
+static int g_kva_preserve_all;
 static int g_kva_pending;                   // queued + compiling
 static unsigned long long g_kva_done, g_kva_failed, g_kva_sync, g_kva_deferred_binds, g_kva_failed_binds;
 static double g_kva_ms;
@@ -288,6 +293,16 @@ static int kva_depth_only(const VkGraphicsPipelineCreateInfo *ci) {
     return 1;
 }
 
+// The 4x-MSAA scene may defer a cold material. Single-sample passes also
+// write persistent coloured lighting/shadow masks, whose omitted draws can
+// leave excessive fog illumination until the engine rebuilds that mask.
+static int kva_required_first_use(const VkGraphicsPipelineCreateInfo *ci) {
+    if (kva_depth_only(ci)) return 1;
+    int usage = kva_render_usage(ci);
+    if (usage >= 0 && !(usage & 2)) return 1;
+    return ci->pMultisampleState && ci->pMultisampleState->rasterizationSamples == VK_SAMPLE_COUNT_1_BIT;
+}
+
 typedef struct { int kind; VkDevice dev; uint64_t h; } kva_deferred;   // 0 module 1 layout 2 renderpass 3 dsl 4 cache
 static kva_deferred *g_kva_def; static size_t g_kva_ndef, g_kva_capdef;
 
@@ -331,7 +346,9 @@ static void *kva_archive_load(void *arg) {
     pthread_setname_np("kl-shader-cache-load");
     VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
     void *data = NULL;
-    FILE *file = fopen(a->path, "rb");
+    // FOZ preparation reconstructs the entire known shader set in parallel.
+    // Do not first recompile its large serialized MSL cache serially.
+    FILE *file = kl_env_on("KL_VK_FOZ_REBUILD_CACHE",0) ? NULL : fopen(a->path, "rb");
     if (file) {
         if (!fseek(file, 0, SEEK_END)) {
             long size = ftell(file);
@@ -395,6 +412,7 @@ static kva_archive *kva_archive_locked(VkDevice dev) {
     return a;
 }
 static void kva_archive_save_locked(kva_archive *a, int force) {
+    if(!force && kl_env_on("KL_VK_FOZ_REBUILD_CACHE",0))return;
     // Do not replace the old file with a partial cold cache before import ends.
     if (a->loading || !a->dirty || (!force && a->saved_ms && kl_pipe_ms() - a->saved_ms < 5000)) return;
     PFN_vkGetPipelineCacheData get = (PFN_vkGetPipelineCacheData)real_gdpa(a->dev, "vkGetPipelineCacheData");
@@ -440,6 +458,29 @@ static void kva_archive_publish(VkDevice dev, VkPipelineCache cache) {
     if (a && merge && merge(dev, a->cache, 1, &cache) == VK_SUCCESS) {
         a->dirty = 1;
         kva_archive_save_locked(a, 0);
+    }
+    pthread_mutex_unlock(&g_kva_archive_mu);
+}
+// Preparation may wait for cache IO; gameplay retains upstream nonblocking
+// seeding/publication. Every prepared shader must reach the persistent archive.
+static void kva_archive_seed_replay(VkDevice dev,VkPipelineCache cache) {
+    if(!cache || !kva_private_archive())return;
+    pthread_mutex_lock(&g_kva_archive_mu);
+    kva_archive *a=kva_archive_locked(dev);
+    if(a) {
+        while(a->loading)pthread_cond_wait(&g_kva_archive_ready,&g_kva_archive_mu);
+        PFN_vkMergePipelineCaches merge=(PFN_vkMergePipelineCaches)real_gdpa(dev,"vkMergePipelineCaches");
+        if(merge)merge(dev,cache,1,&a->cache);
+    }
+    pthread_mutex_unlock(&g_kva_archive_mu);
+}
+static void kva_archive_publish_replay(VkDevice dev,VkPipelineCache cache) {
+    if(!cache || !kva_private_archive())return;
+    pthread_mutex_lock(&g_kva_archive_mu);
+    kva_archive *a=kva_archive_locked(dev);
+    PFN_vkMergePipelineCaches merge=(PFN_vkMergePipelineCaches)real_gdpa(dev,"vkMergePipelineCaches");
+    if(a && merge && merge(dev,a->cache,1,&cache)==VK_SUCCESS) {
+        a->dirty=1; kva_archive_save_locked(a,0);
     }
     pthread_mutex_unlock(&g_kva_archive_mu);
 }
@@ -527,22 +568,31 @@ static void *kva_worker(void *arg) {
     pthread_setname_np("kl-pipeline-compile");
     for (;;) {
         pthread_mutex_lock(&g_kva_mu);
-        while (!g_kva_head) pthread_cond_wait(&g_kva_cv, &g_kva_mu);
-        for (kva_pipe *job = g_kva_head; job; job = job->next_job) {
-            if (atomic_load(&job->demanded)) { kva_prioritize_locked(job); break; }
+        for (;;) {
+            while (!g_kva_head) pthread_cond_wait(&g_kva_cv, &g_kva_mu);
+            for (kva_pipe *job = g_kva_head; job; job = job->next_job) {
+                if (atomic_load(&job->demanded)) { kva_prioritize_locked(job); break; }
+            }
+            // Recheck the selected job AFTER demand prioritization: a demanded
+            // gameplay job must not escape the budget behind a preparation job.
+            if (g_kva_head->prewarm || g_kva_game_compiling < g_kva_game_limit) break;
+            pthread_cond_wait(&g_kva_cv, &g_kva_mu);
         }
         kva_pipe *p = g_kva_head;
         g_kva_head = p->next_job;
         if (!g_kva_head) g_kva_tail = NULL;
+        if (!p->prewarm) g_kva_game_compiling++;
         p->started_ms = kl_pipe_ms();
         pthread_mutex_unlock(&g_kva_mu);
 
         VkPipelineCache private_cache = kva_private_cache(p);
-        kva_archive_seed(p->dev, private_cache);
+        if(p->prewarm) kva_archive_seed_replay(p->dev, private_cache);
+        else kva_archive_seed(p->dev, private_cache);
         double t0 = kl_pipe_ms();
         VkPipeline real = VK_NULL_HANDLE;
         VkResult r = p->create(p->dev, private_cache, 1, p->ci, NULL, &real);
         double dt = kl_pipe_ms() - t0;
+        if(getenv("ALYX_V2_COMPILE_METRICS") && dt>=20) VKI("[prewarm-v2] %s compile %.2f ms\n",p->prewarm?"preparation":"game",dt);
 
         if (!kva_private_archive()) {
             pthread_mutex_lock(&g_kva_cache_mu);
@@ -569,8 +619,11 @@ static void *kva_worker(void *arg) {
         while (*active && *active != p) active = &(*active)->next_active;
         if (*active) *active = p->next_active;
         VkDevice dev = p->dev;
+        int prewarm=p->prewarm;
         g_kva_finishing++;
         g_kva_pending--;
+        if (!prewarm) g_kva_game_compiling--;
+        pthread_cond_broadcast(&g_kva_cv);
         kva_deferred *deferred = NULL; size_t deferred_count = 0;
         if (g_kva_pending == 0) {
             deferred = g_kva_def; deferred_count = g_kva_ndef;
@@ -588,7 +641,10 @@ static void *kva_worker(void *arg) {
         }
         kva_flush_deferred(deferred, deferred_count);
         // Publish outside the recording/queue mutex; no frame waits for the disk cache.
-        if (r == VK_SUCCESS) kva_archive_publish(dev, private_cache);
+        if (r == VK_SUCCESS) {
+            if(prewarm) kva_archive_publish_replay(dev,private_cache);
+            else kva_archive_publish(dev, private_cache);
+        }
         PFN_vkDestroyPipelineCache destroy_cache = real_gdpa ?
             (PFN_vkDestroyPipelineCache)real_gdpa(dev, "vkDestroyPipelineCache") : NULL;
         if (private_cache && destroy_cache) destroy_cache(dev, private_cache, NULL);
@@ -607,12 +663,17 @@ static void *kva_worker(void *arg) {
 }
 
 static void kva_spawn_workers(void) {
+    g_kva_preserve_all = kl_env_on("KL_VK_ASYNC_WAIT_ALL", 0);
     const char *e = getenv("KL_VK_ASYNC_THREADS");
     int n = e && *e ? atoi(e) : 3;
     if (n < 1) n = 1;
     if (n > 8) n = 8;
+    const char *game = getenv("KL_VK_ASYNC_GAME_THREADS");
+    g_kva_game_limit = game && *game ? atoi(game) : n;
+    if (g_kva_game_limit < 1) g_kva_game_limit = 1;
+    if (g_kva_game_limit > n) g_kva_game_limit = n;
     for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, kva_worker, NULL); pthread_detach(t); }
-    VKI("[async] pipeline compiles moved off the render thread (%d workers) with private caches; nonblocking colour/depth binds; materials activate at stereo frame boundaries\n", n);
+    VKI("[async] pipeline compiles moved off the render thread (%d workers) with private caches; nonblocking colour binds; offscreen/depth first-use preserved; colour materials activate at stereo frame boundaries\n", n);
 }
 static void kva_start_workers(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -631,11 +692,14 @@ static int kva_create(VkDevice dev, VkPipelineCache cache, uint32_t n, const VkG
         kva_pipe *p = (kva_pipe *)calloc(1, sizeof *p);
         if (!p) goto fail;
         p->magic = KVA_MAGIC; p->dev = dev; p->cache = cache;
-        p->depth_only = kva_depth_only(&ci[i]);
-        if (p->depth_only) {
+#ifdef KVA_REPLAY_THREAD
+        p->prewarm=KVA_REPLAY_THREAD();
+#endif
+        p->required_first_use = kva_required_first_use(&ci[i]);
+        if (p->required_first_use) {
             static unsigned long long targets;
             if (__atomic_add_fetch(&targets, 1, __ATOMIC_RELAXED) <= 32)
-                VKI("[async] depth/stencil pipeline: renderPass=%#llx subpass=%u targets=%d\n",
+                VKI("[async] required lighting/depth pipeline: renderPass=%#llx subpass=%u targets=%d\n",
                     (unsigned long long)(uintptr_t)ci[i].renderPass, ci[i].subpass, kva_render_usage(&ci[i]));
         }
         p->create = real;
@@ -704,12 +768,25 @@ static void kva_prioritize_locked(kva_pipe *p) {
     }
 }
 
-// Never wait for a graphics pipeline on the thread recording a frame.
+// Ordinary materials remain nonblocking; cached depth/shadow passes cannot be omitted.
 static inline uint64_t kva_bind(void *cb, uint32_t bindPoint, uint64_t pipeline) {
     if (!kva_on() || bindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS) return pipeline;
     kva_pipe *p = kva_of(pipeline);
     if (!p) { kva_set_skip(cb, 0); return pipeline; }
     int state = atomic_load(&p->state);
+    if ((p->required_first_use || g_kva_preserve_all) && g_kva_preserve_required) {
+        if (state == 0) {
+            pthread_mutex_lock(&g_kva_mu);
+            atomic_store(&p->demanded, 1);
+            kva_prioritize_locked(p);
+            while ((state = atomic_load(&p->state)) == 0)
+                pthread_cond_wait(&g_kva_ready, &g_kva_mu);
+            pthread_mutex_unlock(&g_kva_mu);
+        }
+        // Offscreen outputs are shared by later lighting passes; frame-delayed activation
+        // would otherwise drop a ready shadow pass for the rest of this frame.
+        if (state == 1) { kva_set_skip(cb, 0); return atomic_load(&p->real); }
+    }
     if (state == 1 && p->ready_serial <= atomic_load(&g_kva_visible_serial)) {
         kva_set_skip(cb, 0); return atomic_load(&p->real);
     }

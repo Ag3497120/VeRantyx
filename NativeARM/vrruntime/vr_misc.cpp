@@ -10,6 +10,10 @@
 #include <string>
 #include <deque>
 #include <map>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <cstdlib>
 #include <unistd.h>
 
 namespace {
@@ -76,29 +80,65 @@ public:
 };
 
 class Settings : public Stub_IVRSettings {
+    struct Value { char type; std::string text; };
+    std::map<std::pair<std::string,std::string>, Value> values;
+    std::mutex mutex;
+    bool loaded=false;
+    std::string filename() { const char *p=getenv("VERANTYX_SETTINGS_FILE"); return p?p:vrrt::config().gameDir+"/native-vr-settings.txt"; }
+    void load() {
+        if(loaded)return; loaded=true;
+        std::ifstream f(filename()); std::string section,key,text; char type;
+        while(f>>std::quoted(section)>>std::quoted(key)>>type>>std::quoted(text))
+            if(type=='b'||type=='i'||type=='f'||type=='s')values[{section,key}]={type,text};
+    }
+    bool save() {
+        std::string path=filename(),temp=path+".tmp";
+        std::ofstream f(temp,std::ios::trunc);
+        if(!f)return false;
+        for(const auto &p:values) f<<std::quoted(p.first.first)<<' '<<std::quoted(p.first.second)<<' '<<p.second.type<<' '<<std::quoted(p.second.text)<<'\n';
+        f.close(); return !f.fail()&&rename(temp.c_str(),path.c_str())==0;
+    }
+    void set(const char *section,const char *key,char type,std::string text,EVRSettingsError *e) {
+        std::lock_guard<std::mutex> lock(mutex);load();
+        values[{section?section:"",key?key:""}]={type,std::move(text)};
+        bool ok=save();if(e)*e=ok?VRSettingsError_None:VRSettingsError_WriteFailed;
+        vrrt::log("VR settings write %s/%s type %c: %s",section?section:"",key?key:"",type,ok?"saved":"FAILED");
+    }
+    bool get(const char *section,const char *key,char type,std::string &text,EVRSettingsError *e) {
+        std::lock_guard<std::mutex> lock(mutex);load();
+        auto p=values.find({section?section:"",key?key:""});
+        bool found=p!=values.end()&&p->second.type==type;
+        if(found){text=p->second.text;if(e)*e=VRSettingsError_None;return true;}
+        if(e)*e=VRSettingsError_UnsetSettingHasNoDefault;return false;
+    }
 public:
-    const char *GetSettingsErrorNameFromEnum(EVRSettingsError e) override { static char b[48]; snprintf(b, sizeof b, "VRSettingsError_%d", (int)e); return b; }
-    void SetBool(const char *, const char *, bool, EVRSettingsError *e) override { if (e) *e = VRSettingsError_None; }
-    void SetInt32(const char *, const char *, int32_t, EVRSettingsError *e) override { if (e) *e = VRSettingsError_None; }
-    void SetFloat(const char *, const char *, float, EVRSettingsError *e) override { if (e) *e = VRSettingsError_None; }
-    void SetString(const char *, const char *, const char *, EVRSettingsError *e) override { if (e) *e = VRSettingsError_None; }
-    bool GetBool(const char *sec, const char *key, EVRSettingsError *e) override {
-        if (e) *e = VRSettingsError_None;
-        if (!strcmp(key, "enableHomeApp") || !strcmp(key, "motionSmoothing") || !strcmp(key, "supersampleManualOverride")) return false;
-        if (e) *e = VRSettingsError_UnsetSettingHasNoDefault;
+    const char *GetSettingsErrorNameFromEnum(EVRSettingsError e) override { static char b[48];snprintf(b,sizeof b,"VRSettingsError_%d",(int)e);return b; }
+    void SetBool(const char *s,const char *k,bool v,EVRSettingsError *e) override {set(s,k,'b',v?"1":"0",e);}
+    void SetInt32(const char *s,const char *k,int32_t v,EVRSettingsError *e) override {set(s,k,'i',std::to_string(v),e);}
+    void SetFloat(const char *s,const char *k,float v,EVRSettingsError *e) override {std::ostringstream o;o<<std::setprecision(9)<<v;set(s,k,'f',o.str(),e);}
+    void SetString(const char *s,const char *k,const char *v,EVRSettingsError *e) override {set(s,k,'s',v?v:"",e);}
+    bool GetBool(const char *s,const char *k,EVRSettingsError *e) override {
+        std::string v;if(get(s,k,'b',v,e))return v=="1";
+        if(k&&(!strcmp(k,"enableHomeApp")||!strcmp(k,"motionSmoothing")||!strcmp(k,"supersampleManualOverride"))){if(e)*e=VRSettingsError_None;}
         return false;
     }
-    int32_t GetInt32(const char *, const char *, EVRSettingsError *e) override { if (e) *e = VRSettingsError_UnsetSettingHasNoDefault; return 0; }
-    float GetFloat(const char *sec, const char *key, EVRSettingsError *e) override {
-        if (e) *e = VRSettingsError_None;
-        if (!strcmp(key, "supersampleScale") || !strcmp(key, "renderTargetMultiplier")) return 1.0f;
-        if (!strcmp(key, "ipd")) return vrrt::config().ipd;
-        if (e) *e = VRSettingsError_UnsetSettingHasNoDefault;
-        return 0.f;
+    int32_t GetInt32(const char *s,const char *k,EVRSettingsError *e) override {std::string v;return get(s,k,'i',v,e)?(int32_t)strtol(v.c_str(),nullptr,10):0;}
+    float GetFloat(const char *s,const char *k,EVRSettingsError *e) override {
+        std::string v;if(get(s,k,'f',v,e))return strtof(v.c_str(),nullptr);
+        if(k&&(!strcmp(k,"supersampleScale")||!strcmp(k,"renderTargetMultiplier"))){if(e)*e=VRSettingsError_None;return 1;}
+        if(k&&!strcmp(k,"ipd")){if(e)*e=VRSettingsError_None;return vrrt::config().ipd;}
+        return 0;
     }
-    void GetString(const char *, const char *, char *buf, uint32_t cap, EVRSettingsError *e) override { if (buf && cap) buf[0] = 0; if (e) *e = VRSettingsError_UnsetSettingHasNoDefault; }
-    void RemoveSection(const char *, EVRSettingsError *e) override { if (e) *e = VRSettingsError_None; }
-    void RemoveKeyInSection(const char *, const char *, EVRSettingsError *e) override { if (e) *e = VRSettingsError_None; }
+    void GetString(const char *s,const char *k,char *buf,uint32_t cap,EVRSettingsError *e) override {std::string v;get(s,k,'s',v,e);if(buf&&cap){strncpy(buf,v.c_str(),cap);buf[cap-1]=0;}}
+    void RemoveSection(const char *s,EVRSettingsError *e) override {
+        std::lock_guard<std::mutex> lock(mutex);load();
+        for(auto p=values.begin();p!=values.end();)if(p->first.first==(s?s:""))p=values.erase(p);else ++p;
+        if(e)*e=save()?VRSettingsError_None:VRSettingsError_WriteFailed;else save();
+    }
+    void RemoveKeyInSection(const char *s,const char *k,EVRSettingsError *e) override {
+        std::lock_guard<std::mutex> lock(mutex);load();values.erase({s?s:"",k?k:""});
+        if(e)*e=save()?VRSettingsError_None:VRSettingsError_WriteFailed;else save();
+    }
 };
 
 // No dashboard, no overlays: creation fails, everything else is a no-op error.

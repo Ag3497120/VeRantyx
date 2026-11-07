@@ -2,6 +2,8 @@
 // No Valve binaries, Steam, Metal device, encoder or network connection.
 #include "../vrruntime/vr_compositor.cpp"
 #include "../vrruntime/vr_misc.cpp"
+#include "../vrruntime/pose_history.h"
+#include "../vrruntime/display_cadence.h"
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -89,6 +91,11 @@ static vrrt::PoseSet test_shared_memory() {
     vrrt::frame_publish(index, 4, 2, 87, p.headTransform, p.visionTimestamp);
     assert(frame()->sequenceNumber && frame()->width == 4 && frame()->visionTimestamp == p.visionTimestamp);
     assert(header()->captureSourceMode == 2 && header()->padding[8] == 0x4E415456);
+    auto projection = reinterpret_cast<vrrt::FrameProjection *>(vrrt::shm_base()+vrrt::kProjectionOffset)+(index&1);
+    assert(projection->sequence == frame()->sequenceNumber);
+    assert(extras->ipdMagic == vrrt::kIpdMagic); // frame metadata never overwrites IPD
+    for (int i=0;i<4;i++) assert(near(projection->tangents[i],vrrt::config().tangentsLeft[i]));
+
     auto old = frame();
     vrrt::frame_begin(4, 2, &index); vrrt::frame_publish(index, 4, 2, 87, p.headTransform, 2);
     vrrt::frame_begin(4, 2, &index);
@@ -163,6 +170,38 @@ static void test_input(const char *manifest, vrrt::PoseSet p) {
     std::array<VRBoneTransform_t, 31> bones;
     assert(in->GetSkeletalBoneData(skeleton, VRSkeletalTransformSpace_Model, VRSkeletalMotionRange_WithController, bones.data(), 31) == VRInputError_None);
     for (auto &b : bones) assert(std::isfinite(b.orientation.w));
+    // Capacitive input is independent of presses and never leaks between hands.
+    const auto savedHands = p.hands;
+    auto rightSkeleton = action("/actions/main/in/rightskeleton");
+    auto curls = [&](bool leftHand) {
+        VRSkeletalSummaryData_t result{};
+        assert(in->GetSkeletalSummaryData(leftHand ? skeleton : rightSkeleton, VRSummaryType_FromDevice, &result) == VRInputError_None);
+        return result;
+    };
+    for (bool leftHand : {true, false}) {
+        for (uint32_t bit : {vrrt::kBtnTriggerTouch, vrrt::kBtnStickTouch, vrrt::kBtnPrimaryTouch,
+                             vrrt::kBtnSecondaryTouch, vrrt::kBtnThumbrestTouch}) {
+            p.hands.leftTrigger = p.hands.rightTrigger = p.hands.leftGrip = p.hands.rightGrip = 0;
+            p.hands.leftButtons = p.hands.rightButtons = 0;
+            p.hands.leftStickX = p.hands.leftStickY = p.hands.rightStickX = p.hands.rightStickY = 0;
+            (leftHand ? p.hands.leftButtons : p.hands.rightButtons) = bit << (leftHand ? 8 : 0);
+            update();
+            auto own = curls(leftHand), other = curls(!leftHand);
+            assert(own.flFingerCurl[bit == vrrt::kBtnTriggerTouch ? 1 : 0] > 0.f);
+            for (float value : other.flFingerCurl) assert(near(value, 0.f));
+            assert(!digital(pull, right).bState && !digital(use, left).bState && !digital(use, right).bState);
+            p.hands.leftButtons = p.hands.rightButtons = 0; update();
+            for (float value : curls(leftHand).flFingerCurl) assert(near(value, 0.f));
+        }
+    }
+    // Minor stick drift must not keep a resting hand curled.
+    p.hands.rightStickX = 0.03f; p.hands.rightStickY = -0.03f; update();
+    for (float value : curls(false).flFingerCurl) assert(near(value, 0.f));
+    // A lost input stream clears capacitive state as well as button presses.
+    p.hands.rightButtons = vrrt::kBtnTriggerTouch | vrrt::kBtnPrimaryTouch;
+    p.inputsFresh = false; update();
+    for (float value : curls(false).flFingerCurl) assert(near(value, 0.f));
+    p.inputsFresh = true; p.hands = savedHands; update();
     auto haptics = (vrrt::SharedHaptic *)(vrrt::shm_base() + vrrt::kHapticsOffset);
     auto rightSeq = haptics[1].sequence;
     assert(in->TriggerHapticVibrationAction(pulse, 0, .2f, 80, .5f, left) == VRInputError_None);
@@ -336,7 +375,10 @@ static void test_locomotion(const char *manifest, vrrt::PoseSet p) {
     auto primary = action("/actions/buttons/in/primary"), secondary = action("/actions/buttons/in/secondary");
     auto ejectClip = action("/actions/buttons/in/ejectclip");
     auto update = [&](uint32_t count = 2) {
-        vrrt::set_last_poses(p);
+        if(p.inputsFresh) {
+            p.hands.visionTimestamp=vrrt::now_seconds();send(p.hands);
+        } else std::this_thread::sleep_for(std::chrono::milliseconds(510));
+        vrrt::sample_poses(&p,0);vrrt::set_last_poses(p);
         assert(in->UpdateActionState(sets, sizeof sets[0], count) == VRInputError_None);
     };
     auto digital = [&](VRActionHandle_t action) {
@@ -732,6 +774,20 @@ static void test_compositor() {
         c.shutdown(); assert(c.m_published == 1 && c.m_boundsErrors == 3 && inFlight.empty());
     }
     {
+        // Preserve the MoltenVR fix: graphics changes can leave Alyx submitting
+        // a viewport larger than its new allocation, with projection metadata.
+        Compositor c; fake_queue(c,pixels); c.WaitGetPoses(nullptr,0,nullptr,0);
+        VRTextureWithDepth_t resized{};
+        static_cast<Texture_t &>(resized) = texture;
+        VRTextureBounds_t oldViewport = {0,0,1.25f,1.25f};
+        assert(c.Submit(Eye_Left,&resized,&oldViewport,Submit_TextureWithDepth)==VRCompositorError_None);
+        assert(c.Submit(Eye_Right,&resized,&oldViewport,Submit_TextureWithDepth)==VRCompositorError_None);
+        c.shutdown(); assert(c.m_published==1 && inFlight.empty());
+        const auto published = reinterpret_cast<vrrt::FrameProjection *>(vrrt::shm_base()+vrrt::kProjectionOffset)+(header()->latestReadyIndex&1);
+        assert(published->sequence==frame()->sequenceNumber);
+        for (int i=0;i<8;i++) assert(near(published->tangents[i],c.m_imageTangents[i]));
+    }
+    {
         Compositor c; fake_queue(c, pixels); c.WaitGetPoses(nullptr, 0, nullptr, 0);
         c.m_framePose.visionTimestamp = 123.125;
         assert(c.Submit(Eye_Right, &texture, nullptr, Submit_Default) == VRCompositorError_None);
@@ -781,7 +837,38 @@ static void test_compositor() {
         assert(c.Submit(Eye_Left, &texture, &bounds, Submit_Default) == VRCompositorError_InvalidBounds);
         assert(c.Submit(Eye_Left, nullptr, nullptr, Submit_Default) == VRCompositorError_InvalidTexture);
         alignas(Compositor_FrameTiming) struct { uint32_t size, canary; } small = {4, 0x12345678};
-        assert(c.GetFrameTiming((Compositor_FrameTiming *)&small, 0) && small.canary == 0x12345678);
+        assert(!c.GetFrameTiming((Compositor_FrameTiming *)&small, 0) && small.canary == 0x12345678);
+        // The ledger preserves measured missed-frame intervals and bounded history;
+        // CPU timings must never be presented as GPU busy time.
+        assert(vrrt::bridge_display_intervals(106, 100, .042, 1./72.) == 3);
+        assert(vrrt::bridge_display_intervals(2, 0xfffffffeu, .028, 1./72.) == 2);
+        assert(vrrt::bridge_display_intervals(2, 200, .028, 1./72.) == 1); // recenter/reset
+        assert(vrrt::bridge_display_intervals(2000000, 2, .028, 1./72.) == 1); // corrupt leap
+        assert(vrrt::bridge_display_intervals(106, 100, -.01, 1./72.) == 1); // clock reset
+        assert(vrrt::bridge_display_intervals(107, 100, .04, 1./72.) == 1); // writer in progress
+        assert(vrrt::bridge_display_intervals(106, 100, .04, 0) == 1);
+        vrrt::FrameCpuTimings ledger;
+        TrackedDevicePose_t pose{}; pose.bPoseIsValid = true;
+        ledger.begin(10, 1., 1.005, pose);
+        ledger.submit(.00025, 1.012, false);
+        ledger.submit(.00050, 1.019, true);
+        ledger.begin(13, 1.04, 1.042, pose);
+        Compositor_FrameTiming result{}; result.m_nSize = sizeof(result);
+        assert(ledger.get(&result, 0));
+        assert(result.m_nFrameIndex == 10 && near(result.m_flClientFrameIntervalMs, 40));
+        assert(near(result.m_flWaitGetPosesCalledMs, -5) && near(result.m_flNewFrameReadyMs, 14));
+        assert(near(result.m_flSubmitFrameMs, .75f) && result.m_flTotalRenderGpuMs == 0);
+        assert(result.m_nNumFramePresents == 0 && result.m_nNumDroppedFrames == 0);
+        assert(ledger.get((Compositor_FrameTiming *)&small, 0) && small.canary == 0x12345678);
+        assert(!ledger.get(&result, 1));
+        for (unsigned i=0; i<70; ++i) ledger.begin(14+i, 1.1+i*.02, 1.105+i*.02, pose);
+        Compositor_FrameTiming range[70]{}; range[0].m_nSize = sizeof(range[0]);
+        assert(ledger.range(range, 70) == 64);
+        assert(range[0].m_nFrameIndex == 19 && range[63].m_nFrameIndex == 82);
+        assert(ledger.get(&result, 63) && !ledger.get(&result, 64));
+        ledger.begin(100, .5, .51, pose); // reset cannot leak old timing history
+        assert(!ledger.get(&result, 0));
+        ledger.clear(); assert(!ledger.get(&result, 0));
     }
 }
 
@@ -834,6 +921,100 @@ static void test_quit(const char *framePath) {
     unsetenv("VERANTYX_NATIVE_QUIT_FILE");
 }
 
+static void test_settings(const char *map) {
+    const std::string path = std::string(map) + ".settings";
+    setenv("VERANTYX_SETTINGS_FILE", path.c_str(), 1);
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    {
+        Settings settings;
+        settings.SetBool("section", "bool", true, &error); assert(error == vr::VRSettingsError_None);
+        settings.SetInt32("section", "int", -123, &error);
+        settings.SetFloat("section", "float", .125f, &error);
+        settings.SetString("section", "text", "spaces and \"quotes\"", &error);
+        assert(error == vr::VRSettingsError_None);
+    }
+    {
+        Settings settings;
+        assert(settings.GetBool("section", "bool", &error));
+        assert(settings.GetInt32("section", "int", &error) == -123);
+        assert(near(settings.GetFloat("section", "float", &error), .125f));
+        char text[64]; settings.GetString("section", "text", text, sizeof text, &error);
+        assert(!strcmp(text, "spaces and \"quotes\""));
+        settings.GetInt32("section", "bool", &error);
+        assert(error == vr::VRSettingsError_UnsetSettingHasNoDefault);
+        settings.RemoveKeyInSection("section", "int", &error);
+        settings.RemoveSection("section", &error);
+    }
+    {
+        Settings settings; settings.GetBool("section", "bool", &error);
+        assert(error == vr::VRSettingsError_UnsetSettingHasNoDefault);
+    }
+    setenv("VERANTYX_SETTINGS_FILE", (path + "/missing/file").c_str(), 1);
+    Settings unwritable; unwritable.SetBool("s", "k", true, &error);
+    assert(error == vr::VRSettingsError_WriteFailed);
+    unsetenv("VERANTYX_SETTINGS_FILE"); unlink(path.c_str());
+}
+
+static void test_hand_history_math() {
+    vrrt::HandPoseHistory history;
+    vr::TrackedDevicePose_t hands[2]{};
+    for(auto &p:hands) {p.bPoseIsValid=p.bDeviceIsConnected=true;vrrt::identity34(&p.mDeviceToAbsoluteTracking);}
+    history.add(1,hands);
+    hands[0].mDeviceToAbsoluteTracking.m[0][0]=0;hands[0].mDeviceToAbsoluteTracking.m[0][2]=1;
+    hands[0].mDeviceToAbsoluteTracking.m[2][0]=-1;hands[0].mDeviceToAbsoluteTracking.m[2][2]=0;
+    hands[0].mDeviceToAbsoluteTracking.m[0][3]=2;hands[0].vVelocity.v[1]=4;
+    history.add(1.1,hands);
+    vr::TrackedDevicePose_t middle{};assert(history.sample(0,1.05,&middle));
+    assert(near(middle.mDeviceToAbsoluteTracking.m[0][3],1));assert(near(middle.vVelocity.v[1],2));
+    const auto &m=middle.mDeviceToAbsoluteTracking;
+    for(int i=0;i<3;i++)for(int j=0;j<3;j++) {
+        float dot=0;for(int k=0;k<3;k++)dot+=m.m[i][k]*m.m[j][k];assert(near(dot,i==j?1:0));
+    }
+    assert(std::fabs(m.m[0][0]-std::sqrt(.5))<1e-5);
+    assert(!history.sample(0,std::numeric_limits<double>::quiet_NaN(),&middle));
+    for(int i=0;i<1000;i++)history.add(2+i*.01,hands);
+    assert(history.size()<=51); // bounded duration and memory
+    history.add(.1,hands);assert(history.size()==1); // clock reset discards the old tracking space
+}
+
+static void test_release_pose_timing(const char *manifest,vrrt::PoseSet original) {
+    using namespace vr;
+    auto in=vrrt_input();assert(in->SetActionManifestPath(manifest)==VRInputError_None);
+    VRActionSetHandle_t main;VRActionHandle_t use,pose;VRInputValueHandle_t left;
+    assert(in->GetActionSetHandle("/actions/main",&main)==VRInputError_None);
+    assert(in->GetActionHandle("/actions/main/in/use",&use)==VRInputError_None);
+    assert(in->GetActionHandle("/actions/main/in/leftpose",&pose)==VRInputError_None);
+    assert(in->GetInputSourceHandle("/user/hand/left",&left)==VRInputError_None);
+    VRActiveActionSet_t set{};set.ulActionSet=main;
+    auto h=original.hands;double now=vrrt::now_seconds();
+    h.headTracked=h.leftTracked=h.rightTracked=h.velocityValid=1;
+    h.leftGrip=255;h.rightGrip=0;
+    float velocity[3]={0,0,0};memcpy(h.leftVelocity,velocity,sizeof velocity);
+    h.leftTransform[12]=0;h.visionTimestamp=now-.04;
+    send(h);vrrt::PoseSet sample{};vrrt::sample_poses(&sample,0);vrrt::set_last_poses(sample);
+    assert(in->UpdateActionState(&set,sizeof set,1)==VRInputError_None);
+    h.leftTransform[12]=.04f;velocity[0]=2;memcpy(h.leftVelocity,velocity,sizeof velocity);h.visionTimestamp=now-.02;
+    send(h);vrrt::sample_poses(&sample,0);vrrt::set_last_poses(sample);
+    assert(in->UpdateActionState(&set,sizeof set,1)==VRInputError_None);
+    // Newer release packet arrives between two compositor frames.
+    h.leftTransform[12]=.05f;velocity[0]=0;memcpy(h.leftVelocity,velocity,sizeof velocity);h.leftGrip=0;h.visionTimestamp=now-.005;
+    send(h);assert(in->UpdateActionState(&set,sizeof set,1)==VRInputError_None);
+    InputDigitalActionData_t release{};
+    assert(in->GetDigitalActionData(use,&release,sizeof release,left)==VRInputError_None);
+    assert(release.bActive && release.bChanged && !release.bState && release.activeOrigin==left);
+    assert(release.fUpdateTime<-.002 && release.fUpdateTime>-.1);
+    InputPoseActionData_t historical{},latest{},render{};
+    float relative=(float)((now-.02)-vrrt::now_seconds());
+    assert(in->GetPoseActionDataRelativeToNow(pose,TrackingUniverseStanding,relative,&historical,sizeof historical,left)==VRInputError_None);
+    assert(std::fabs(historical.pose.vVelocity.v[0]-2)<.01);
+    assert(std::fabs(historical.pose.mDeviceToAbsoluteTracking.m[0][3]-.04)<.001);
+    assert(in->GetPoseActionDataRelativeToNow(pose,TrackingUniverseStanding,0,&latest,sizeof latest,left)==VRInputError_None);
+    assert(near(latest.pose.vVelocity.v[0],0));
+    assert(in->GetPoseActionDataForNextFrame(pose,TrackingUniverseStanding,&render,sizeof render,left)==VRInputError_None);
+    assert(near(render.pose.vVelocity.v[0],2)); // retain the compositor's own frame pose
+    puts("Release timing: latest input, measured event time, historical velocity, orthonormal rotation and frame-pose separation passed");
+}
+
 int main(int argc, char **argv) {
     assert(argc == 3);
     if (!strcmp(argv[1], "--without-shared")) {
@@ -844,16 +1025,40 @@ int main(int argc, char **argv) {
     }
     setenv("VERANTYX_SHARED_FRAME", argv[1], 1); unsetenv("VERANTYX_IPD");
     vrrt::init(""); assert(vrrt::shm_ready());
+    if (!strcmp(argv[2], "--cadence-only")) {
+        setenv("VERANTYX_SYNC_TRACKING", "1", 1);
+        vrrt::config().bench = false;
+        vrrt::SharedHands h{}; h.headTracked = true;
+        identity(h.headTransform, 0, 1.6f, 0);
+        h.visionTimestamp = vrrt::now_seconds(); send(h);
+        vrrt::wait_next_vsync();
+        uint64_t prior = vrrt::frame_counter();
+        for (int i=0; i<3; ++i) { h.visionTimestamp = vrrt::now_seconds(); send(h); }
+        vrrt::wait_next_vsync(); assert(vrrt::frame_counter() == prior+3);
+        prior = vrrt::frame_counter();
+        __atomic_store_n(&header()->poseSequence, uint32_t(0), __ATOMIC_RELEASE);
+        h.visionTimestamp = vrrt::now_seconds(); send(h);
+        vrrt::wait_next_vsync(); assert(vrrt::frame_counter() == prior+1);
+        prior = vrrt::frame_counter();
+        vrrt::wait_next_vsync(); assert(vrrt::frame_counter() > prior); // no packet: fallback
+        prior = vrrt::frame_counter();
+        h.visionTimestamp = vrrt::now_seconds(); send(h);
+        vrrt::wait_next_vsync(); assert(vrrt::frame_counter() == prior+1); // no double count
+        puts("NativeARM: skipped tracking intervals, counter reset, fallback and resumed cadence passed");
+        return 0;
+    }
     // The cached frustum is beside this native session's shared map, with no
     // dependency on a Wine prefix or a previously connected Vision Pro.
     assert(near(vrrt::config().tangentsLeft[0], -1.2f) && near(vrrt::config().tangentsRight[1], 1.2f));
     float u0, u1, v0, v1;
     vrrt::eye_crop(0, &u0, &u1, &v0, &v1); assert(near(u0, 0) && near(u1, 5/6.f));
     vrrt::eye_crop(1, &u0, &u1, &v0, &v1); assert(near(u0, 1/6.f) && near(u1, 1));
+    test_settings(argv[1]);
     auto p = test_shared_memory();
     test_legacy_input(p);
     test_input(argv[2], p); test_mixed_input_sources(p); test_pose_contention(p);
     test_locomotion(argv[2], p); test_loading_prompt(argv[1]); test_display_color(); test_pixels(); test_compositor();
+    test_hand_history_math(); test_release_pose_timing(argv[2],p);
     test_quit(argv[1]);
     puts("NativeARM: shared memory, pose contention, mixed hand/gamepad input, locomotion, binding events, loading prompts, skeleton, haptics, compositor and cooperative quit tests passed");
 }

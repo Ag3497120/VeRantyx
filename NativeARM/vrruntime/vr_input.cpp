@@ -173,6 +173,12 @@ public:
                 const json::Value &params = src["parameters"];
                 for (auto &inp : src["inputs"].obj) {
                     std::string output = inp.second["output"].string_or("");
+                    // Touch's stock height-adjust action requires an accessibility mode.
+                    // Expose the explicit crouch toggle for the requested stick click.
+                    if (bindingFile == "bindings_touch.json" &&
+                        path == "/user/hand/left/input/joystick" && inp.first == "click" &&
+                        lower(output) == "/actions/move/in/adjustheight")
+                        output = "/actions/move/in/MoveCrouchToggle";
                     Action *a = find_action(output);
                     if (!a) continue;
                     Binding b;
@@ -217,7 +223,7 @@ public:
     }
 
     // ---- evaluating one input source component against the controller data ----
-    struct HandState { bool present; float trigger, grip, stickX, stickY; bool primary, secondary, stickClick, stickTouch, menu; };
+    struct HandState { bool present; float trigger, grip, stickX, stickY; bool primary, secondary, stickClick, stickTouch, menu, triggerTouch, primaryTouch, secondaryTouch, thumbrestTouch; };
     HandState hand_state(int hand, const vrrt::PoseSet *live = nullptr) const {
         HandState s = {};
         const auto &snapshot = live ? *live : m_snapshot;
@@ -232,8 +238,12 @@ public:
         s.stickX = std::clamp(s.stickX, -1.f, 1.f); s.stickY = std::clamp(s.stickY, -1.f, 1.f);
         uint32_t b = (left ? h.leftButtons : h.rightButtons) >> (left ? 8 : 0);
         s.primary = b & vrrt::kBtnPrimary; s.secondary = b & vrrt::kBtnSecondary; s.stickClick = b & vrrt::kBtnStickClick;
-        s.stickTouch = (b & vrrt::kBtnStickTouch) || s.stickClick || fabsf(s.stickX) >= 0.02f || fabsf(s.stickY) >= 0.02f;
+        s.stickTouch = (b & vrrt::kBtnStickTouch) || s.stickClick;
         s.menu = b & vrrt::kBtnMenu;
+        s.triggerTouch = b & vrrt::kBtnTriggerTouch;
+        s.primaryTouch = b & vrrt::kBtnPrimaryTouch;
+        s.secondaryTouch = b & vrrt::kBtnSecondaryTouch;
+        s.thumbrestTouch = b & vrrt::kBtnThumbrestTouch;
         return s;
     }
     // Returns the source's scalar/boolean value; vec2 for joystick position.
@@ -244,13 +254,13 @@ public:
         if (!m_snapshot.inputsFresh) { b.grabbed = b.toggled = b.lastRaw = b.clicked = false; return true; }
         const std::string &in = b.input, &c = b.component;
         float value = 0; bool click = false, touch = false;
-        if (in == "trigger") { value = h.trigger; click = value >= b.clickThreshold; touch = value > b.touchThreshold; }
+        if (in == "trigger") { value = h.trigger; click = value >= b.clickThreshold; touch = h.triggerTouch || value > b.touchThreshold; }
         else if (in == "grip") { value = h.grip; click = value >= b.clickThreshold; touch = value > b.touchThreshold; }
-        else if (in == "joystick" || in == "thumbstick" || in == "trackpad") { *x = h.stickX; *y = h.stickY; click = h.stickClick; touch = h.stickTouch; value = sqrtf(h.stickX * h.stickX + h.stickY * h.stickY); }
-        else if (in == "a" || in == "x") { click = touch = h.primary; value = click ? 1.f : 0.f; }
-        else if (in == "b" || in == "y") { click = touch = h.secondary; value = click ? 1.f : 0.f; }
+        else if (in == "joystick" || in == "thumbstick" || in == "trackpad") { *x = h.stickX; *y = h.stickY; click = h.stickClick; touch = h.stickTouch || fabsf(h.stickX) >= 0.02f || fabsf(h.stickY) >= 0.02f; value = sqrtf(h.stickX * h.stickX + h.stickY * h.stickY); }
+        else if (in == "a" || in == "x") { click = h.primary; touch = h.primaryTouch || click; value = click ? 1.f : 0.f; }
+        else if (in == "b" || in == "y") { click = h.secondary; touch = h.secondaryTouch || click; value = click ? 1.f : 0.f; }
         else if (in == "system" || in == "menu" || in == "application_menu") { click = touch = h.menu; value = click ? 1.f : 0.f; }
-        else if (in == "thumbrest") { touch = h.grip > 0.05f; click = false; }
+        else if (in == "thumbrest") { touch = h.thumbrestTouch; click = false; }
         else return false;
 
         const bool stick = in == "joystick" || in == "thumbstick" || in == "trackpad";
@@ -301,8 +311,14 @@ public:
 
     void update_locked() {
         vrrt::PoseSet latest = vrrt::last_poses();
+        // Action updates may happen after a newer bridge packet than the
+        // compositor frame. Do not delay release until the next rendered pose.
+        vrrt::PoseSet fresh{};vrrt::sample_poses(&fresh,0);
+        if(fresh.inputsFresh && fresh.visionTimestamp>latest.visionTimestamp)latest=fresh;
         m_snapshot = latest;
         double now = vrrt::now_seconds();
+        double eventTime = latest.inputsFresh && std::isfinite(latest.visionTimestamp) &&
+            latest.visionTimestamp<=now && now-latest.visionTimestamp<.5 ? latest.visionTimestamp : now;
         std::map<std::pair<int, std::string>, int32_t> priorities;
         for (auto &a : m_actions) for (auto &s : m_sets) if (lower(s.name) == lower(a.setName))
             for (auto &b : a.bindings) if (b.hand >= 0 && (s.active & (1u << b.hand)) && !b.input.empty()) {
@@ -332,7 +348,7 @@ public:
             }
             for (auto &h : a.hands) {
                 if (a.type != AT_Boolean) h.state = h.x != 0 || h.y != 0;
-                if (!h.updateTime || h.state != h.prevState || h.x != h.px || h.y != h.py) h.updateTime = now;
+                if (!h.updateTime || h.state != h.prevState || h.x != h.px || h.y != h.py) h.updateTime = eventTime;
                 a.active |= h.active;
             }
             int selected = a.hand >= 0 && a.hands[a.hand].active ? a.hand : a.hands[0].active ? 0 : a.hands[1].active ? 1 : -1;
@@ -342,7 +358,7 @@ public:
             }
             a.hand = selected;
             if (selected >= 0) { a.state = a.hands[selected].state; a.x = a.hands[selected].x; a.y = a.hands[selected].y; }
-            if (!a.updateTime || a.state != a.prevState || a.x != a.px || a.y != a.py) a.updateTime = now;
+            if (!a.updateTime || a.state != a.prevState || a.x != a.px || a.y != a.py) a.updateTime = eventTime;
         }
         report_locomotion(now);
     }
@@ -555,7 +571,7 @@ public:
         memcpy(d, &out, std::min<uint32_t>(size, sizeof out));
         return VRInputError_None;
     }
-    EVRInputError pose_data(VRActionHandle_t h, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t restrict_) {
+    EVRInputError pose_data(VRActionHandle_t h, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t restrict_, double at=0) {
         if (!d || size < sizeof *d) return VRInputError_InvalidParam;
         std::lock_guard<std::mutex> l(m_mu);
         m_poseReads++;
@@ -567,11 +583,14 @@ public:
         if (!s) return VRInputError_InvalidHandle;
         out.bActive = s->active && hand >= 0;
         out.activeOrigin = out.bActive ? origin_for(hand) : k_ulInvalidInputValueHandle;
-        if (hand >= 0) out.pose = m_snapshot.dev[1 + hand];
+        if (hand >= 0) {
+            out.pose = at>0 ? m_snapshot.dev[1+hand] : vrrt::last_poses().dev[1+hand];
+            if(at>0)vrrt::hand_pose_at(hand,at,&out.pose);
+        }
         memcpy(d, &out, std::min<uint32_t>(size, sizeof out));
         return VRInputError_None;
     }
-    EVRInputError GetPoseActionDataRelativeToNow(VRActionHandle_t h, ETrackingUniverseOrigin, float, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) override { return pose_data(h, d, size, r); }
+    EVRInputError GetPoseActionDataRelativeToNow(VRActionHandle_t h, ETrackingUniverseOrigin, float seconds, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) override { if(!std::isfinite(seconds))return VRInputError_InvalidParam; return pose_data(h, d, size, r,vrrt::now_seconds()+seconds); }
     EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t h, ETrackingUniverseOrigin, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) override { return pose_data(h, d, size, r); }
     // ---- skeletal input: fingers from pinch/fist/thumb (vr_skeleton.cpp) ----
     vrrt::SkeletonState m_skel[2];
@@ -586,8 +605,8 @@ public:
         vrrt::FingerInputs in;
         in.trigger = st.trigger;
         in.grip = st.grip;
-        in.indexTouch = st.trigger > 0.05f;
-        in.thumbTouch = st.primary || st.secondary || st.stickTouch || st.grip > 0.6f;
+        in.indexTouch = st.triggerTouch || st.trigger > 0.05f;
+        in.thumbTouch = st.primaryTouch || st.secondaryTouch || st.thumbrestTouch || st.primary || st.secondary || st.stickTouch;
         return in;
     }
     EVRInputError GetSkeletalActionData(VRActionHandle_t h, InputSkeletalActionData_t *d, uint32_t size) override {
@@ -650,7 +669,7 @@ public:
         if (hand < 0) return VRInputError_WrongType;
         vrrt::FingerInputs in = finger_inputs(hand);
         d->flFingerCurl[0] = in.thumbTouch ? 0.6f : 0.f;
-        d->flFingerCurl[1] = in.trigger;
+        d->flFingerCurl[1] = std::max(in.trigger, in.indexTouch ? 0.25f : 0.f);
         d->flFingerCurl[2] = d->flFingerCurl[3] = d->flFingerCurl[4] = in.grip;
         for (int i = 0; i < 4; i++) d->flFingerSplay[i] = 0.2f;
         return VRInputError_None;

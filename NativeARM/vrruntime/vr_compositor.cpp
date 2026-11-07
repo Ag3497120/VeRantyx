@@ -5,6 +5,7 @@
 #include "vr_runtime.h"
 #include "json_mini.h"
 #include "display_color.h"
+#include "frame_timing.h"
 #include <cstring>
 #include <cmath>
 #include <vector>
@@ -430,6 +431,8 @@ public:
     std::mutex m_poseMu;                    // pose queries never wait for render/vsync
     std::mutex m_mu;
     std::mutex m_statsMu;
+    std::mutex m_frameTimingMu;
+    vrrt::FrameCpuTimings m_frameTimings;
 
     ~Compositor() { shutdown(); }
     void resume() {
@@ -441,6 +444,7 @@ public:
         m_rb = Readback();
         m_stopping = false; m_submitted = 0; m_dropFrame = false;
         m_startup = true; m_startupClears = 0;
+        { std::lock_guard<std::mutex> timing(m_frameTimingMu); m_frameTimings.clear(); }
         { std::lock_guard<std::mutex> poses(m_poseMu); m_poseHistory.clear(); m_posePredictionId = 0; }
         m_eyeDone[0] = m_eyeDone[1] = false;
     }
@@ -451,6 +455,7 @@ public:
         std::lock_guard<std::mutex> l(m_wmu);
         Readback::Slot &sl = m_rb.slot[m_slot];
         if (sl.submitted) {
+            memcpy(m_slotTangents[m_slot], m_imageTangents, sizeof m_imageTangents);
             sl.publish = publish; sl.state = 2;
             m_pending.push_back(m_slot);
             if (!m_worker.joinable()) m_worker = std::thread([this] { worker(); });
@@ -514,6 +519,8 @@ public:
             m_poseHistory.push_back({m_posePredictionId, sampledAt, set});
             while (m_poseHistory.size() > 64 || sampledAt - m_poseHistory.front().sampledAt > .1) m_poseHistory.pop_front();
         }
+        { std::lock_guard<std::mutex> timing(m_frameTimingMu);
+          m_frameTimings.begin(m_posePredictionId, t0, m_tWaitEnd, set.dev[0]); }
         if (render) copy_poses(set, render, nr);
         if (game) copy_poses(set, game, ng);
         return VRCompositorError_None;
@@ -531,6 +538,8 @@ public:
         if (game) *game = set.dev[i];
         return VRCompositorError_None;
     }
+    float m_imageTangents[8]{};
+    float m_slotTangents[2][8]{};
     EVRCompositorError GetSubmitTexture(Texture_t *out, bool *flush, EVRCompositorTextureUsage, const Texture_t *in, const VRTextureBounds_t *, EVRSubmitFlags) override {
         if (out && in) *out = *in;
         if (flush) *flush = false;
@@ -555,6 +564,14 @@ public:
     }
     EVRCompositorError submit(EVREye eye, const Texture_t *tex, uint32_t layer, const VRTextureBounds_t *bounds, EVRSubmitFlags flags) {
         std::lock_guard<std::mutex> l(m_mu);
+        struct SubmitTimer {
+            Compositor *c; double started = vrrt::now_seconds();
+            ~SubmitTimer() {
+                const double finished = vrrt::now_seconds();
+                std::lock_guard<std::mutex> timing(c->m_frameTimingMu);
+                c->m_frameTimings.submit(finished-started, finished, c->m_submitted == 3 && !c->m_dropFrame);
+            }
+        } submitTimer{this};
         m_submits++;
         if (m_stopping) return VRCompositorError_RequestFailed;
         if (eye != Eye_Left && eye != Eye_Right) return VRCompositorError_IndexOutOfRange;
@@ -590,11 +607,15 @@ public:
         // Bounds select a rectangle; vMin > vMax means the image is upside down.
         float u0 = 0, u1 = 1, v0 = 0, v1 = 1;
         if (bounds) { u0 = bounds->uMin; u1 = bounds->uMax; v0 = bounds->vMin; v1 = bounds->vMax; }
-        constexpr float edgeRoundoff = 1e-6f; // much less than a pixel at the largest supported eye size
-        for (float value : {u0, u1, v0, v1}) if (!std::isfinite(value) || value < -edgeRoundoff || value > 1 + edgeRoundoff)
-            return invalid_bounds(eye, d, bounds, flags, "outside normalized texture");
-        u0 = std::clamp(u0, 0.f, 1.f); u1 = std::clamp(u1, 0.f, 1.f);
-        v0 = std::clamp(v0, 0.f, 1.f); v1 = std::clamp(v1, 0.f, 1.f);
+        for (float value : {u0,u1,v0,v1}) if (!std::isfinite(value))
+            return invalid_bounds(eye, d, bounds, flags, "non-finite texture rectangle");
+        // Alyx's depth submissions may retain an oversized viewport after a
+        // fidelity resize. Preserve that viewport for projection reconstruction.
+        if (!(flags & Submit_TextureWithDepth)) {
+            constexpr float edgeRoundoff = 1e-6f;
+            for (float value : {u0,u1,v0,v1}) if (value < -edgeRoundoff || value > 1+edgeRoundoff)
+                return invalid_bounds(eye,d,bounds,flags,"outside normalized texture");
+        }
         {   // report every change of the submitted rectangle (dynamic resolution)
             static float last[2][4] = { { -1, -1, -1, -1 }, { -1, -1, -1, -1 } };
             static int changes;
@@ -606,10 +627,36 @@ public:
                 last[ei][0] = u0; last[ei][1] = v0; last[ei][2] = u1; last[ei][3] = v1;
             }
         }
+        if (flags & Submit_TextureWithDepth) {
+            const auto &depth = (flags & Submit_TextureWithPose)
+                ? static_cast<const VRTextureWithPoseAndDepth_t *>(tex)->depth
+                : static_cast<const VRTextureWithDepth_t *>(tex)->depth;
+            const auto &p = depth.mProjection;
+            static float previous[2][4] = {};
+            static unsigned reports = 0;
+            int e = eye == Eye_Left ? 0 : 1;
+            float values[4] = {p.m[0][0], p.m[0][2], p.m[1][1], p.m[1][2]};
+            if (reports < 24 && memcmp(previous[e], values, sizeof values) != 0) {
+                memcpy(previous[e], values, sizeof values); ++reports;
+                vrrt::log("Render projection eye %d: sx %.6f ox %.6f sy %.6f oy %.6f bounds %.4f %.4f %.4f %.4f texture %ux%u",
+                    e, values[0], values[1], values[2], values[3], u0, v0, u1, v1, d->m_nWidth, d->m_nHeight);
+            }
+        }
         bool flip = v0 > v1;
         bool flipX = u0 > u1;
         if (flip) std::swap(v0, v1);
         if (u0 > u1) std::swap(u0, u1);
+        const float originalU0=u0, originalU1=u1, originalV0=v0, originalV1=v1;
+        // Alyx can retain bounds from the previous allocation when graphics
+        // settings resize the Vulkan texture. Clip BEFORE splitting the union
+        // frustum; clipping afterwards gives the two eyes different fields.
+        if (!std::isfinite(u0) || !std::isfinite(u1) || !std::isfinite(v0) || !std::isfinite(v1))
+            return VRCompositorError_InvalidBounds;
+        u0 = std::max(0.f, std::min(1.f, u0));
+        u1 = std::max(0.f, std::min(1.f, u1));
+        v0 = std::max(0.f, std::min(1.f, v0));
+        v1 = std::max(0.f, std::min(1.f, v1));
+        if (u1 <= u0 || v1 <= v0) return invalid_bounds(eye,d,bounds,flags,"empty normalized rectangle");
         {   // the eye's own frustum inside the union the game rendered (vr_runtime eye_crop)
             float cu0, cu1, cv0, cv1;
             vrrt::eye_crop(eye == Eye_Left ? 0 : 1, &cu0, &cu1, &cv0, &cv1);
@@ -623,6 +670,20 @@ public:
         uint32_t y = (uint32_t)lroundf(v0 * d->m_nHeight), y1 = (uint32_t)lroundf(v1 * d->m_nHeight);
         x1 = std::min(x1, d->m_nWidth); y1 = std::min(y1, d->m_nHeight);
         if (x1 <= x || y1 <= y) return invalid_bounds(eye, d, bounds, flags, "empty pixel rectangle after eye crop");
+        // Describe the pixels actually read, in the original render viewport.
+        // Cropping an oversized viewport changes its field, not its projection.
+        const int imageEye = eye == Eye_Left ? 0 : 1;
+        const float *rt = vrrt::render_tangents(imageEye);
+        const float du = originalU1-originalU0, dv = originalV1-originalV0;
+        if (du <= 0 || dv <= 0) return VRCompositorError_InvalidBounds;
+        float *imageT = m_imageTangents + imageEye*4;
+        imageT[0] = rt[0] + (float(x)/d->m_nWidth-originalU0)/du*(rt[1]-rt[0]);
+        imageT[1] = rt[0] + (float(x1)/d->m_nWidth-originalU0)/du*(rt[1]-rt[0]);
+        float row0=float(y)/d->m_nHeight, row1=float(y1)/d->m_nHeight;
+        if (flip) { float old0=row0; row0=1-row1; row1=1-old0; }
+        imageT[2] = rt[3] - (row1-originalV0)/dv*(rt[3]-rt[2]);
+        imageT[3] = rt[3] - (row0-originalV0)/dv*(rt[3]-rt[2]);
+
         const int e = eye == Eye_Left ? 0 : 1;
         if (m_submitted & (1u << e)) return VRCompositorError_AlreadySubmitted;
         float head[16]; memcpy(head, m_framePose.headTransform, sizeof head);
@@ -706,17 +767,17 @@ public:
             }
             Readback::Slot &sl = m_rb.slot[idx];
             bool completed = m_rb.wait(sl);
-            if (completed && sl.publish) publish_from(sl.eye[0], sl.eye[1], sl.flip, sl.flipX, sl.head, sl.visionTimestamp);
+            if (completed && sl.publish) publish_from(sl.eye[0], sl.eye[1], sl.flip, sl.flipX, sl.head, sl.visionTimestamp, m_slotTangents[idx]);
             else if (!completed) { m_skipped++; vrrt::log("readback: copy did not finish in 2 s; slot quarantined until exit"); }
             std::lock_guard<std::mutex> l(m_wmu);
             sl.state = completed ? 0 : 3;
         }
     }
     void publish() {
-        publish_from(m_rb.eye[0], m_rb.eye[1], m_eyeFlip, m_eyeFlipX, m_submitHead, m_submitTimestamp);
+        publish_from(m_rb.eye[0], m_rb.eye[1], m_eyeFlip, m_eyeFlipX, m_submitHead, m_submitTimestamp, m_imageTangents);
         m_eyeDone[0] = m_eyeDone[1] = false;
     }
-    void publish_from(const Readback::Staging &L, const Readback::Staging &R, const bool *flips, const bool *flipX, const float *head, double visionTs) {
+    void publish_from(const Readback::Staging &L, const Readback::Staging &R, const bool *flips, const bool *flipX, const float *head, double visionTs, const float *imageTangents = nullptr) {
         const uint32_t ew = std::max(L.w, R.w), h = std::max(L.h, R.h), w = ew * 2;
         uint32_t idx;
         uint8_t *dst = vrrt::frame_begin(w, h, &idx);
@@ -736,7 +797,7 @@ public:
         }
         m_color.apply_bgra(dst, (size_t)w * h);
         if (!m_published) vrrt::log("native display color: %.2f EV shadow/midtone matching, sRGB SDR, black/white preserved", m_color.exposure());
-        vrrt::frame_publish(idx, w, h, fmt, head, visionTs);
+        vrrt::frame_publish(idx, w, h, fmt, head, visionTs, imageTangents);
         m_published++;
         std::lock_guard<std::mutex> l(m_statsMu);
         m_sumConvert += vrrt::now_seconds() - tc0; m_nConvert++;
@@ -764,21 +825,14 @@ public:
     }
     void ClearLastSubmittedFrame() override {}
     void PostPresentHandoff() override {}
-    bool GetFrameTiming(Compositor_FrameTiming *t, uint32_t) override {
-        if (!t) return false;
-        uint32_t size = t->m_nSize;
-        if (size < sizeof(uint32_t)) return false;
-        Compositor_FrameTiming out = {};
-        out.m_nSize = size;
-        out.m_nFrameIndex = (uint32_t)vrrt::frame_counter();
-        out.m_nNumFramePresents = 1;
-        out.m_flSystemTimeInSeconds = vrrt::now_seconds();
-        out.m_flClientFrameIntervalMs = (float)(vrrt::display_period() * 1000.0);
-        out.m_HmdPose = vrrt::last_poses().dev[0];
-        memcpy(t, &out, std::min<uint32_t>(size, sizeof out));
-        return true;
+    bool GetFrameTiming(Compositor_FrameTiming *t, uint32_t framesAgo) override {
+        std::lock_guard<std::mutex> timing(m_frameTimingMu);
+        return m_frameTimings.get(t, framesAgo);
     }
-    uint32_t GetFrameTimings(Compositor_FrameTiming *t, uint32_t n) override { if (n && t) { GetFrameTiming(t, 0); return 1; } return 0; }
+    uint32_t GetFrameTimings(Compositor_FrameTiming *t, uint32_t n) override {
+        std::lock_guard<std::mutex> timing(m_frameTimingMu);
+        return m_frameTimings.range(t, n);
+    }
     float GetFrameTimeRemaining() override { float r = (float)(vrrt::display_period() - vrrt::seconds_since_vsync()); return r > 0 ? r : 0.f; }
     void GetCumulativeStats(Compositor_CumulativeStats *s, uint32_t n) override { if (s) memset(s, 0, n); if (s && n >= sizeof(uint32_t) * 2) s->m_nNumFramePresents = m_published; }
     void FadeToColor(float seconds, float r, float g, float b, float a, bool background) override {

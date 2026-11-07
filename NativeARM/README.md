@@ -1291,3 +1291,10 @@ excluding game-render time. Five recorded-window regressions and 14 bridge
 tests pass. Compact evidence `20261103T173122Z-alyx-stream-pressure` (`d1`–`d2`).
 The user confirms that lateral head movement is now smooth in the headset.
 This targeted retest does not change the formal playtest level or baselines.
+
+## Optional MoltenVR / Quest transport
+
+See [MoltenVRBridge](../MoltenVRBridge/README.md) for the native OpenXR bridge,
+owner-local shader preparation and optional NotProton Steam launch integration.
+The standard host build keeps Fossilize disabled; the optional builder uses a
+separate `host-fossilize` output directory.
