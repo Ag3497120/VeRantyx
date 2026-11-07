@@ -301,8 +301,14 @@ public:
 
     void update_locked() {
         vrrt::PoseSet latest = vrrt::last_poses();
+        // Action updates may happen after a newer bridge packet than the
+        // compositor frame. Do not delay release until the next rendered pose.
+        vrrt::PoseSet fresh{};vrrt::sample_poses(&fresh,0);
+        if(fresh.inputsFresh && fresh.visionTimestamp>latest.visionTimestamp)latest=fresh;
         m_snapshot = latest;
         double now = vrrt::now_seconds();
+        double eventTime = latest.inputsFresh && std::isfinite(latest.visionTimestamp) &&
+            latest.visionTimestamp<=now && now-latest.visionTimestamp<.5 ? latest.visionTimestamp : now;
         std::map<std::pair<int, std::string>, int32_t> priorities;
         for (auto &a : m_actions) for (auto &s : m_sets) if (lower(s.name) == lower(a.setName))
             for (auto &b : a.bindings) if (b.hand >= 0 && (s.active & (1u << b.hand)) && !b.input.empty()) {
@@ -332,7 +338,7 @@ public:
             }
             for (auto &h : a.hands) {
                 if (a.type != AT_Boolean) h.state = h.x != 0 || h.y != 0;
-                if (!h.updateTime || h.state != h.prevState || h.x != h.px || h.y != h.py) h.updateTime = now;
+                if (!h.updateTime || h.state != h.prevState || h.x != h.px || h.y != h.py) h.updateTime = eventTime;
                 a.active |= h.active;
             }
             int selected = a.hand >= 0 && a.hands[a.hand].active ? a.hand : a.hands[0].active ? 0 : a.hands[1].active ? 1 : -1;
@@ -342,7 +348,7 @@ public:
             }
             a.hand = selected;
             if (selected >= 0) { a.state = a.hands[selected].state; a.x = a.hands[selected].x; a.y = a.hands[selected].y; }
-            if (!a.updateTime || a.state != a.prevState || a.x != a.px || a.y != a.py) a.updateTime = now;
+            if (!a.updateTime || a.state != a.prevState || a.x != a.px || a.y != a.py) a.updateTime = eventTime;
         }
         report_locomotion(now);
     }
@@ -555,7 +561,7 @@ public:
         memcpy(d, &out, std::min<uint32_t>(size, sizeof out));
         return VRInputError_None;
     }
-    EVRInputError pose_data(VRActionHandle_t h, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t restrict_) {
+    EVRInputError pose_data(VRActionHandle_t h, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t restrict_, double at=0) {
         if (!d || size < sizeof *d) return VRInputError_InvalidParam;
         std::lock_guard<std::mutex> l(m_mu);
         m_poseReads++;
@@ -567,11 +573,14 @@ public:
         if (!s) return VRInputError_InvalidHandle;
         out.bActive = s->active && hand >= 0;
         out.activeOrigin = out.bActive ? origin_for(hand) : k_ulInvalidInputValueHandle;
-        if (hand >= 0) out.pose = m_snapshot.dev[1 + hand];
+        if (hand >= 0) {
+            out.pose = at>0 ? m_snapshot.dev[1+hand] : vrrt::last_poses().dev[1+hand];
+            if(at>0)vrrt::hand_pose_at(hand,at,&out.pose);
+        }
         memcpy(d, &out, std::min<uint32_t>(size, sizeof out));
         return VRInputError_None;
     }
-    EVRInputError GetPoseActionDataRelativeToNow(VRActionHandle_t h, ETrackingUniverseOrigin, float, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) override { return pose_data(h, d, size, r); }
+    EVRInputError GetPoseActionDataRelativeToNow(VRActionHandle_t h, ETrackingUniverseOrigin, float seconds, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) override { if(!std::isfinite(seconds))return VRInputError_InvalidParam; return pose_data(h, d, size, r,vrrt::now_seconds()+seconds); }
     EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t h, ETrackingUniverseOrigin, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) override { return pose_data(h, d, size, r); }
     // ---- skeletal input: fingers from pinch/fist/thumb (vr_skeleton.cpp) ----
     vrrt::SkeletonState m_skel[2];
