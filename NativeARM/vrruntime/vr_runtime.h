@@ -81,7 +81,7 @@ constexpr uint32_t kIpdMagic = 0x44504956; // "VIPD"
 static_assert(sizeof(SharedHaptic) == 16 && kHapticsOffset + 2 * sizeof(SharedHaptic) <= kSharedMapSize, "ALVR tail layout");
 
 // Button bits in SharedHands::{left,right}Buttons (left ones shifted by 8).
-enum : uint32_t { kBtnPrimary = 1, kBtnSecondary = 2, kBtnStickClick = 4, kBtnStickTouch = 8, kBtnMenu = 16 };
+enum : uint32_t { kBtnPrimary = 1, kBtnSecondary = 2, kBtnStickClick = 4, kBtnStickTouch = 8, kBtnMenu = 16, kBtnTriggerTouch = 32, kBtnPrimaryTouch = 64, kBtnSecondaryTouch = 128, kBtnThumbrestTouch = 256 };
 
 struct Config {
     double displayHz = 60.0;
