@@ -1,0 +1,63 @@
+{
+  "per_eye": [
+    1664,
+    1792
+  ],
+  "Hz": 72,
+  "cases": [
+    {
+      "variant": "pyro-fast",
+      "target_Mbps": 600,
+      "actual_Mbps": 599.1086665844939,
+      "mean_ms": 29.796672288812132,
+      "p95_ms": 37.14187466448493,
+      "fps": 71.98379772428034,
+      "missing_warm": 0,
+      "total_acquired": 536,
+      "sent": 576,
+      "max_gap_ms": 27.070263,
+      "one_second_counts": [
+        72,
+        71,
+        73
+      ],
+      "band": "usable"
+    },
+    {
+      "variant": "pyro-fast",
+      "target_Mbps": 600,
+      "actual_Mbps": 599.1846981831183,
+      "mean_ms": 31.670220736736432,
+      "p95_ms": 39.36612499819603,
+      "fps": 71.80327966703756,
+      "missing_warm": 0,
+      "total_acquired": 538,
+      "sent": 576,
+      "max_gap_ms": 25.019273,
+      "one_second_counts": [
+        72,
+        73,
+        71
+      ],
+      "band": "usable"
+    },
+    {
+      "variant": "pyro-old",
+      "target_Mbps": 600,
+      "actual_Mbps": 599.0754361393349,
+      "mean_ms": 59.55796380034347,
+      "p95_ms": 68.3243326648153,
+      "fps": 57.15712655559014,
+      "missing_warm": 59,
+      "total_acquired": 442,
+      "sent": 576,
+      "max_gap_ms": 27.992086,
+      "one_second_counts": [
+        57,
+        56,
+        56
+      ],
+      "band": "bad"
+    }
+  ]
+}
