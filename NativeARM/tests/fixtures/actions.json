@@ -9,6 +9,7 @@
     {"name": "/actions/main/in/leftpose", "type": "pose"},
     {"name": "/actions/main/in/hands", "type": "pose"},
     {"name": "/actions/main/in/leftskeleton", "type": "skeleton"},
+    {"name": "/actions/main/in/rightskeleton", "type": "skeleton"},
     {"name": "/actions/main/out/haptic", "type": "vibration"},
     {"name": "/actions/ui/in/select", "type": "boolean"}
   ],

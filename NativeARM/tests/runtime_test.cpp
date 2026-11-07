@@ -163,6 +163,38 @@ static void test_input(const char *manifest, vrrt::PoseSet p) {
     std::array<VRBoneTransform_t, 31> bones;
     assert(in->GetSkeletalBoneData(skeleton, VRSkeletalTransformSpace_Model, VRSkeletalMotionRange_WithController, bones.data(), 31) == VRInputError_None);
     for (auto &b : bones) assert(std::isfinite(b.orientation.w));
+    // Capacitive input is independent of presses and never leaks between hands.
+    const auto savedHands = p.hands;
+    auto rightSkeleton = action("/actions/main/in/rightskeleton");
+    auto curls = [&](bool leftHand) {
+        VRSkeletalSummaryData_t result{};
+        assert(in->GetSkeletalSummaryData(leftHand ? skeleton : rightSkeleton, VRSummaryType_FromDevice, &result) == VRInputError_None);
+        return result;
+    };
+    for (bool leftHand : {true, false}) {
+        for (uint32_t bit : {vrrt::kBtnTriggerTouch, vrrt::kBtnStickTouch, vrrt::kBtnPrimaryTouch,
+                             vrrt::kBtnSecondaryTouch, vrrt::kBtnThumbrestTouch}) {
+            p.hands.leftTrigger = p.hands.rightTrigger = p.hands.leftGrip = p.hands.rightGrip = 0;
+            p.hands.leftButtons = p.hands.rightButtons = 0;
+            p.hands.leftStickX = p.hands.leftStickY = p.hands.rightStickX = p.hands.rightStickY = 0;
+            (leftHand ? p.hands.leftButtons : p.hands.rightButtons) = bit << (leftHand ? 8 : 0);
+            update();
+            auto own = curls(leftHand), other = curls(!leftHand);
+            assert(own.flFingerCurl[bit == vrrt::kBtnTriggerTouch ? 1 : 0] > 0.f);
+            for (float value : other.flFingerCurl) assert(near(value, 0.f));
+            assert(!digital(pull, right).bState && !digital(use, left).bState && !digital(use, right).bState);
+            p.hands.leftButtons = p.hands.rightButtons = 0; update();
+            for (float value : curls(leftHand).flFingerCurl) assert(near(value, 0.f));
+        }
+    }
+    // Minor stick drift must not keep a resting hand curled.
+    p.hands.rightStickX = 0.03f; p.hands.rightStickY = -0.03f; update();
+    for (float value : curls(false).flFingerCurl) assert(near(value, 0.f));
+    // A lost input stream clears capacitive state as well as button presses.
+    p.hands.rightButtons = vrrt::kBtnTriggerTouch | vrrt::kBtnPrimaryTouch;
+    p.inputsFresh = false; update();
+    for (float value : curls(false).flFingerCurl) assert(near(value, 0.f));
+    p.inputsFresh = true; p.hands = savedHands; update();
     auto haptics = (vrrt::SharedHaptic *)(vrrt::shm_base() + vrrt::kHapticsOffset);
     auto rightSeq = haptics[1].sequence;
     assert(in->TriggerHapticVibrationAction(pulse, 0, .2f, 80, .5f, left) == VRInputError_None);
