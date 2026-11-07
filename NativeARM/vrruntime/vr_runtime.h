@@ -71,12 +71,16 @@ static_assert(sizeof(DoubleBufferHeader) == 64, "DoubleBufferHeader layout");
 constexpr size_t kMaxPixelBytes = 4096ull * 4096ull * 8ull;
 constexpr size_t kFrameBlockSize = sizeof(SharedFrame) + kMaxPixelBytes;
 constexpr size_t kHandsOffset = sizeof(DoubleBufferHeader) + kFrameBlockSize * 2;
+struct FrameProjection { uint32_t sequence; float tangents[8]; };
+constexpr size_t kProjectionOffset = kHandsOffset + 384;
 constexpr size_t kSharedMapSize = kHandsOffset + sizeof(SharedHands) + 1024;
-// MacEncoder's ALVR metadata and outgoing controller vibration slots.
+// Preserve MacEncoder/ALVR metadata offsets. Optional projection records live
+// after the original haptic slots in the reserved shared-map tail.
 struct SharedExtras { uint32_t ipdMagic; float ipdMeters; };
 struct SharedHaptic { uint32_t sequence; float durationSeconds, frequency, amplitude; };
 constexpr size_t kExtrasOffset = kHandsOffset + 320;
 constexpr size_t kHapticsOffset = kHandsOffset + 336;
+static_assert(kProjectionOffset >= kHapticsOffset + 2*sizeof(SharedHaptic) && kProjectionOffset + 2*sizeof(FrameProjection) <= kSharedMapSize, "projection metadata must not overlap optional IPD or haptics");
 constexpr uint32_t kIpdMagic = 0x44504956; // "VIPD"
 static_assert(sizeof(SharedHaptic) == 16 && kHapticsOffset + 2 * sizeof(SharedHaptic) <= kSharedMapSize, "ALVR tail layout");
 
@@ -119,7 +123,7 @@ bool haptic(int hand, float start, float duration, float frequency, float amplit
 // `format` is the DXGI code the encoder understands (28 RGBA8 / 87 BGRA8).
 uint8_t *frame_begin(uint32_t combinedWidth, uint32_t height, uint32_t *writeIndex);
 void frame_publish(uint32_t writeIndex, uint32_t combinedWidth, uint32_t height, uint32_t format,
-                   const float renderHeadTransform[16], double visionTimestamp);
+                   const float renderHeadTransform[16], double visionTimestamp, const float *imageTangents = nullptr);
 
 // Poses.
 struct PoseSet {

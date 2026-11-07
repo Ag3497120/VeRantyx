@@ -1,0 +1,1 @@
+../NativeARM/tools/prepare_native_ui.py

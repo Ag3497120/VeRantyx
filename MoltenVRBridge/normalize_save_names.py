@@ -1,0 +1,1 @@
+../NativeARM/tools/normalize_save_names.py

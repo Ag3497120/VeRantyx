@@ -1,0 +1,1227 @@
+--- a/Makefile
++++ b/Makefile
+@@ -16,7 +16,7 @@
+ # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
+ # are in the base LDLIBS rather than on one target because kl_vtdec is in
+ # RUNTIME_SHIP — everything that links the runtime needs them.
+-LDLIBS  := -lz -framework AudioToolbox \
++LDLIBS  := -lz -framework AudioToolbox -framework CoreAudio \
+            -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
+            -framework CoreFoundation -framework AVFoundation -framework Foundation
+ # The host/ship split is a source-list boundary, not a runtime getenv.
+@@ -44,7 +44,7 @@
+            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
+            runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c
+ 
+-RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
++RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_tls.c runtime/kl_tls.S runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
+            runtime/libc/kl_va_handlers.c runtime/libc/kl_va_thunks.S \
+            runtime/libc/kl_libc.c runtime/libc/kl_libc_slink.c runtime/libc/kl_pthread.c runtime/kl_dl.c \
+            runtime/guest/kl_ndk.c runtime/kl_x18.c runtime/kl_target.c \
+--- a/runtime/kl_x18.h
++++ b/runtime/kl_x18.h
+@@ -162,7 +162,7 @@
+ 
+ // Longest veneer, in instructions. Public because klepton-ld sizes its pool from
+ // the site count before it emits anything.
+-#define KLX_VEN_MAX_INSN 8
++#define KLX_VEN_MAX_INSN 12
+ 
+ typedef struct {
+     unsigned sites;     // instructions found naming x18
+--- a/runtime/klepton.h
++++ b/runtime/klepton.h
+@@ -9,6 +9,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include "kl_env.h"
++#include "kl_tls.h"
+ 
+ typedef struct kl_image kl_image;
+ 
+@@ -45,9 +46,14 @@
+ // is how an interposer calls through. Diagnostic: nothing in a shipping path
+ // registers one.
+ void       kl_interpose(const char *name, void *fn);
++// Called once per image right after it is registered (before guest code
++// of a later dlopen can run it); the host uses it for byte-checked fixes.
++extern void (*kl_image_loaded_hook)(const char *path, kl_image *img);
++void      *kl_interpose_lookup(const char *name);   // an interposer by name, or NULL
+ // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.
+ void       kl_run_init(kl_image *img);
+ void       kl_unload(kl_image *img);
++int        kl_rebind_missing(kl_image *img);   // bind imports that missed (dependency cycles)
+ const char *kl_error(void);
+ 
+ // Base address the image was mapped at, and its total vaddr span.
+@@ -87,6 +93,7 @@
+     // veneer machinery, counted apart because the x18 numbers above are exact
+     // and `make check` gates on them.
+     unsigned ctr_sites, ctr_patched, ctr_refused;
++    unsigned tls_desc, tls_tprel;                    // ELF TLS relocations (glibc guests)
+ } kl_stats;
+ const kl_stats *kl_get_stats(kl_image *img);
+ 
+@@ -130,6 +137,12 @@
+ // Search every registered guest image for an export (kl_dl.c); used by the
+ // loader's import binding after the shim misses.
+ void     *kl_guest_sym_global(const char *name);
++// ELF TLS symbols: a defined STT_TLS symbol's offset inside its module's block.
++int       kl_sym_tls(kl_image *img, const char *name, uint64_t *off);
++kl_tls_module *kl_image_tls_module(kl_image *img);
++int       kl_guest_tls_sym_global(const char *name, kl_tls_module **m, uint64_t *off);
++// A host-implemented library for the guest, by dlopen path suffix ("/vrclient.so").
++void      kl_dl_add_host_module(const char *suffix, void *(*lookup)(const char *));
+ // The image's program headers, as mapped. Every guest lib's first PT_LOAD maps
+ // file offset 0 at vaddr 0, so the phdr array is live at base + e_phoff and the
+ // load bias is simply the base. This is what dl_iterate_phdr hands the guest's
+--- a/runtime/kl_image.c
++++ b/runtime/kl_image.c
+@@ -88,6 +88,10 @@
+ #define R_AARCH64_JUMP_SLOT 1026
+ #define R_AARCH64_RELATIVE  1027
+ #define STB_WEAK 2
++#define PT_TLS 7
++#define R_AARCH64_TLS_TPREL64 1030
++#define R_AARCH64_TLSDESC 1031
++#define STT_TLS 6
+ 
+ struct kl_image {
+     uint8_t   *base;        // ELF vaddr V lives at base + V (V relative to the
+@@ -112,6 +116,7 @@
+     unsigned    missing_n, missing_cap;
+     const char **weak;         // ...and the weak ones, deliberately left NULL
+     unsigned    weak_n, weak_cap;
++    kl_tls_module *tls;        // PT_TLS, registered with kl_tls.c (glibc guests)
+     void       *dl_handle;     // set when the image arrived as a translated
+                                // Mach-O dylib; then dyld owns the mapping
+ };
+@@ -339,13 +344,30 @@
+     return (uint32_t *)(c->base + (va - c->lo));
+ }
+ 
++// A `svc #0` with no x8 write in the six words before it (any instruction
++// whose destination register is x8/w8).
++static int kl_svc_is_bare(const uint32_t *w, size_t i) {
++    for (size_t k = 1; k <= 6 && k <= i; k++)
++        if ((w[i - k] & 0x1fu) == 8u) return 0;
++    return 1;
++}
++
+ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
+                         kl_stats *st) {
+     uint32_t *w = (uint32_t *)p;
+     size_t words = n / 4;
+     for (size_t i = 0; i < words; i++) {
++        if (w[i] == 0xd4000001u && kl_svc_is_bare(w, i)) {
++            static int said;
++            if (!said++) fprintf(stderr, "  [klepton] %s: bare svc #0 (no syscall number) at +0x%llx and "
++                                         "others -> nop (Darwin would run syscall x16)\n",
++                                 path, (unsigned long long)(va + i * 4));
++            w[i] = 0xd503201fu;
++            st->svc_sites++;
++            continue;
++        }
+         if ((w[i] & 0xffffffe0u) == 0xd53bd040u) {
+-            if (kl_x18_is_data(w, n, i)) {
++            if (!kl_env_on("KL_TLS_REWRITE_FORCE", 0) && kl_x18_is_data(w, n, i)) {
+                 st->tls_refused++;
+                 fprintf(stderr, "  [klepton] %s: TLS site at +0x%llx left alone — its "
+                                 "neighbourhood reads as data. If it IS code, "
+@@ -363,14 +385,20 @@
+ // Registered interposers, consulted for defined and undefined symbols alike.
+ // Small and fixed: this is an instrument, and a table that has to grow is a sign
+ // the question being asked wants a different tool.
+-static struct { const char *name; void *fn; } g_interpose[8];
++static struct { const char *name; void *fn; } g_interpose[64];
+ static unsigned g_interpose_n;
+ 
+ void kl_interpose(const char *name, void *fn) {
+-    if (!name || !fn || g_interpose_n >= 8) return;
++    if (!name || !fn || g_interpose_n >= 64) return;
+     g_interpose[g_interpose_n].name = name;
+     g_interpose[g_interpose_n].fn = fn;
+     g_interpose_n++;
++}
++
++void *kl_interpose_lookup(const char *name) {
++    for (unsigned i = 0; i < g_interpose_n; i++)
++        if (!strcmp(name, g_interpose[i].name)) return g_interpose[i].fn;
++    return NULL;
+ }
+ 
+ static uint64_t sym_value(kl_image *img, uint32_t idx, const char **name_out) {
+@@ -442,6 +470,38 @@
+             else img->stats.jump_slot++;
+             break;
+         }
++        case R_AARCH64_TLS_TPREL64:
++        case R_AARCH64_TLSDESC: {
++            // ELF TLS (glibc guests). The symbol, if any, is an STT_TLS whose
++            // value is an offset inside its module's TLS block — this image's
++            // when defined here, another loaded image's when imported.
++            kl_tls_module *m = img->tls;
++            uint64_t off = 0;
++            if (sidx) {
++                const Elf64_Sym *s = &img->symtab[sidx];
++                nm = img->strtab + s->st_name;
++                if (s->st_shndx != 0) off = s->st_value;
++                else if (kl_guest_tls_sym_global(nm, &m, &off) != 0) m = NULL;
++            }
++            if (!m) {
++                img->stats.imports_missing++;
++                record_missing(img, nm ? nm : "(TLS without PT_TLS)");
++                if (type == R_AARCH64_TLSDESC) { slot[0] = (uint64_t)(uintptr_t)unresolved_stub(nm ? nm : "tlsdesc"); slot[1] = 0; }
++                else *slot = 0;
++                break;
++            }
++            off += (uint64_t)r->r_addend;
++            if (type == R_AARCH64_TLS_TPREL64) {
++                uint64_t v;
++                if (kl_tls_tprel(m, off, &v) != 0) { err("%s: %s", img->path, kl_tls_error()); return -1; }
++                *slot = v;
++                img->stats.tls_tprel++;
++            } else {
++                kl_tls_desc(m, off, slot);
++                img->stats.tls_desc++;
++            }
++            break;
++        }
+         default:
+             err("unhandled relocation type %u at %#llx", type, (unsigned long long)r->r_offset);
+             return -1;
+@@ -563,6 +623,24 @@
+         }
+     }
+     if (!img->symtab || !img->strtab) { err("missing DT_SYMTAB/DT_STRTAB"); return -1; }
++
++    // PT_TLS: register the module's thread-local block before any TLS
++    // relocation asks for an offset into it. A module with TPREL64 relocations
++    // needs TP-relative placement; everything else goes in the per-thread block.
++    for (int i = 0; i < phnum; i++) {
++        if (ph[i].p_type != PT_TLS) continue;
++        int fixed = 0;
++        const Elf64_Rela *tabs[2] = { rela, jmprel };
++        size_t cnts[2] = { relasz / sizeof(Elf64_Rela), pltsz / sizeof(Elf64_Rela) };
++        for (int t = 0; t < 2 && !fixed; t++)
++            for (size_t k = 0; tabs[t] && k < cnts[t]; k++)
++                if (ELF64_R_TYPE(tabs[t][k].r_info) == R_AARCH64_TLS_TPREL64) { fixed = 1; break; }
++        img->tls = kl_tls_register(img->path, img->base + ph[i].p_vaddr - lo,
++                                   (size_t)ph[i].p_filesz, (size_t)ph[i].p_memsz,
++                                   (size_t)ph[i].p_align, fixed);
++        if (!img->tls) { err("%s: %s", img->path, kl_tls_error()); return -1; }
++        break;
++    }
+ 
+     // Order is independent — RELA, RELR and APS2 relocate disjoint slots — but
+     // every relative table must run before kl_run_init: the .init_array pointers
+@@ -1197,8 +1275,24 @@
+ }
+ 
+ void kl_run_init(kl_image *img) {
+-    for (size_t i = 0; i < img->init_count; i++)
+-        if (img->init_array[i]) img->init_array[i]();
++    int trace = kl_env_on("KL_TRACE_INIT", 0);
++    for (size_t i = 0; i < img->init_count; i++) {
++        if (!img->init_array[i]) continue;
++        if (trace) fprintf(stderr, "  [init] %s [%zu/%zu] -> +%#llx\n", img->path, i, img->init_count,
++                           (unsigned long long)((const uint8_t *)img->init_array[i] - img->base));
++        // KL_INIT_SLEEP=<basename>:<index>:<ms> pauses before that constructor; KL_INIT_SKIP=<basename>:<index> skips it.
++        { const char *sl = getenv("KL_INIT_SLEEP"); const char *sk = getenv("KL_INIT_SKIP");
++          const char *b = strrchr(img->path, '/'); b = b ? b + 1 : img->path;
++          if (sl) { const char *c1 = strchr(sl, ':'); const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
++                    if (c1 && c2 && (size_t)(c1 - sl) == strlen(b) && !strncmp(sl, b, strlen(b)) && (size_t)atoi(c1 + 1) == i) usleep((useconds_t)atoi(c2 + 1) * 1000); }
++          if (sk) { const char *c1 = strrchr(sk, ':');
++                    if (c1 && (size_t)(c1 - sk) == strlen(b) && !strncmp(sk, b, strlen(b)) && (size_t)atoi(c1 + 1) == i) { fprintf(stderr, "  [init] skipping %s [%zu]\n", b, i); continue; } } }
++        // KL_INIT_BREAK=<basename>:<index> traps into the debugger just before that constructor.
++        { const char *brk = getenv("KL_INIT_BREAK");
++          if (brk) { const char *colon = strrchr(brk, ':'); const char *b = strrchr(img->path, '/'); b = b ? b + 1 : img->path;
++                     if (colon && (size_t)(colon - brk) == strlen(b) && !strncmp(brk, b, strlen(b)) && (size_t)atoi(colon + 1) == i) __builtin_debugtrap(); } }
++        img->init_array[i]();
++    }
+ }
+ 
+ void *kl_sym(kl_image *img, const char *name) {
+@@ -1226,6 +1320,7 @@
+     for (size_t i = 0; i < n; i++) {
+         const Elf64_Sym *s = &img->symtab[i];
+         if ((const char *)(s + 1) > hi_p) break;             // past the mapping
++        if ((s->st_info & 0xf) == STT_TLS) continue;         // an offset, not an address: kl_sym_tls
+         if (s->st_shndx == 0 || !s->st_name) continue;
+         const char *nm = img->strtab + s->st_name;
+         if (nm < lo_p || nm >= hi_p) continue;               // not a real name
+@@ -1233,6 +1328,83 @@
+             return img->base + s->st_value;
+     }
+     return NULL;
++}
++
++int kl_sym_tls(kl_image *img, const char *name, uint64_t *off) {
++    if (!img || !img->tls) return -1;
++    size_t n = img->nsyms;
++    if (!n) n = ((const char *)img->strtab - (const char *)img->symtab) / sizeof(Elf64_Sym);
++    const char *lo_p = (const char *)img->base, *hi_p = lo_p + img->span;
++    for (size_t i = 0; i < n; i++) {
++        const Elf64_Sym *s = &img->symtab[i];
++        if ((const char *)(s + 1) > hi_p) break;
++        if (s->st_shndx == 0 || !s->st_name || (s->st_info & 0xf) != STT_TLS) continue;
++        const char *nm = img->strtab + s->st_name;
++        if (nm < lo_p || nm >= hi_p) continue;
++        if (strcmp(nm, name) == 0) { if (off) *off = s->st_value; return 0; }
++    }
++    return -1;
++}
++
++kl_tls_module *kl_image_tls_module(kl_image *img) { return img ? img->tls : NULL; }
++
++// Bind again the imports that were unresolved when this image was relocated:
++// a dependency cycle loads one side before the other exists. Only the names in
++// the missing list are touched; GOT pages that RELRO made read-only are opened.
++int kl_rebind_missing(kl_image *img) {
++    if (!img || !img->missing_n || !img->symtab || !img->strtab) return 0;
++    unsigned phnum = 0;
++    const Elf64_Phdr *ph = (const Elf64_Phdr *)kl_phdrs(img, &phnum);
++    if (!ph) return 0;
++    uint64_t lo = UINT64_MAX;
++    for (unsigned i = 0; i < phnum; i++) if (ph[i].p_type == PT_LOAD && ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
++    if (lo == UINT64_MAX) lo = 0;
++    const Elf64_Rela *tabs[2] = { NULL, NULL }; size_t cnts[2] = { 0, 0 };
++    for (unsigned i = 0; i < phnum; i++) {
++        if (ph[i].p_type != PT_DYNAMIC) continue;
++        for (const Elf64_Dyn *dp = (const Elf64_Dyn *)(img->base + ph[i].p_vaddr - lo); dp->d_tag != DT_NULL; dp++) {
++            if (dp->d_tag == DT_RELA) tabs[0] = (const Elf64_Rela *)(img->base + dp->d_val);
++            else if (dp->d_tag == DT_RELASZ) cnts[0] = dp->d_val / sizeof(Elf64_Rela);
++            else if (dp->d_tag == DT_JMPREL) tabs[1] = (const Elf64_Rela *)(img->base + dp->d_val);
++            else if (dp->d_tag == DT_PLTRELSZ) cnts[1] = dp->d_val / sizeof(Elf64_Rela);
++        }
++    }
++    int fixed = 0;
++    const uintptr_t pg = (uintptr_t)getpagesize();
++    for (int t = 0; t < 2; t++) {
++        for (size_t k = 0; tabs[t] && k < cnts[t]; k++) {
++            const Elf64_Rela *r = &tabs[t][k];
++            uint32_t type = ELF64_R_TYPE(r->r_info), sidx = ELF64_R_SYM(r->r_info);
++            if (!sidx || (type != R_AARCH64_ABS64 && type != R_AARCH64_GLOB_DAT && type != R_AARCH64_JUMP_SLOT)) continue;
++            const Elf64_Sym *s = &img->symtab[sidx];
++            if (s->st_shndx != 0) continue;
++            const char *nm = img->strtab + s->st_name;
++            unsigned m;
++            for (m = 0; m < img->missing_n; m++) if (!strcmp(img->missing[m], nm)) break;
++            if (m == img->missing_n) continue;
++            void *v = kl_shim_lookup(nm);
++            if (!v) v = kl_guest_sym_global(nm);
++            if (!v) continue;
++            uint64_t *slot = (uint64_t *)(img->base + r->r_offset);
++            mprotect((void *)((uintptr_t)slot & ~(pg - 1)), pg, PROT_READ | PROT_WRITE);
++            *slot = (uint64_t)(uintptr_t)v + (uint64_t)r->r_addend;
++            fixed++;
++        }
++    }
++    if (fixed) {
++        // Drop the names that now resolve.
++        unsigned w = 0;
++        for (unsigned m = 0; m < img->missing_n; m++) {
++            const char *nm = img->missing[m];
++            if (kl_shim_lookup(nm) || kl_guest_sym_global(nm)) continue;
++            img->missing[w++] = nm;
++        }
++        img->missing_n = w;
++        img->stats.imports_bound += (unsigned)fixed;
++        if (kl_env_on("KL_TRACE_NEEDED", 1))
++            fprintf(stderr, "  [dl] %s: %d import(s) bound late (dependency cycle)\n", img->path, fixed);
++    }
++    return fixed;
+ }
+ 
+ void kl_unload(kl_image *img) {
+--- a/runtime/kl_dl.c
++++ b/runtime/kl_dl.c
+@@ -20,8 +20,9 @@
+ #include "kl_aaudio.h"
+ #include "kl_openxr.h"
+ 
+-#define KL_MAX_IMAGES 64
+-typedef struct { char soname[128]; kl_image *img; } entry;
++#define KL_MAX_IMAGES 1024   // VeRantyx: was 64; Alyx loads ~110 images
++typedef struct { char soname[128]; kl_image *img;     char real[1024];       // realpath of the file, so two names for one file are one image
++} entry;
+ static entry  g_imgs[KL_MAX_IMAGES];
+ static int    g_nimgs = 0;
+ static char   g_libdir[512] = ".";
+@@ -85,11 +86,16 @@
+ }
+ 
+ // Register an image so guest dlsym/dladdr can see it (also used for the root libs).
++void (*kl_image_loaded_hook)(const char *path, kl_image *img);
++
+ void kl_register_image(const char *soname, kl_image *img) {
+     const char *base = basename_of(soname);
+     pthread_mutex_lock(&g_lock);
++    if (g_nimgs >= KL_MAX_IMAGES)
++        fprintf(stderr, "  [klepton] image table full (%d): %s is not visible to dlsym\n", KL_MAX_IMAGES, soname);
+     if (g_nimgs < KL_MAX_IMAGES) {
+         snprintf(g_imgs[g_nimgs].soname, sizeof g_imgs[0].soname, "%s", base);
++        if (!realpath(soname, g_imgs[g_nimgs].real)) snprintf(g_imgs[g_nimgs].real, sizeof g_imgs[0].real, "%s", soname);
+         g_imgs[g_nimgs].img = img;
+         g_nimgs++;
+     }
+@@ -103,12 +109,15 @@
+     // here — not searching for any GL library, which klepton.h warns breaks Steam
+     // Link/VRChat/RE4 — routes them to gl4es for every driver.
+     if (!strcmp(base, "libgl4es.so")) kl_shim_set_guest_gl(img);
++    if (kl_image_loaded_hook) kl_image_loaded_hook(soname, img);
+ }
+ 
+ kl_image *kl_find_image(const char *soname) {
+     const char *b = basename_of(soname);
++    char rp[1024];
++    const char *real = strchr(soname, '/') && realpath(soname, rp) ? rp : NULL;
+     for (int i = 0; i < g_nimgs; i++)
+-        if (strcmp(g_imgs[i].soname, b) == 0) return g_imgs[i].img;
++        if (strcmp(g_imgs[i].soname, b) == 0 || (real && strcmp(g_imgs[i].real, real) == 0)) return g_imgs[i].img;
+     return NULL;
+ }
+ 
+@@ -302,6 +311,15 @@
+     return v;
+ }
+ 
++int kl_guest_tls_sym_global(const char *name, kl_tls_module **m, uint64_t *off) {
++    int rc = -1;
++    pthread_mutex_lock(&g_lock);
++    for (int i = 0; i < g_nimgs && rc != 0; i++)
++        if (kl_sym_tls(g_imgs[i].img, name, off) == 0) { *m = kl_image_tls_module(g_imgs[i].img); rc = 0; }
++    pthread_mutex_unlock(&g_lock);
++    return rc;
++}
++
+ // Load an .so together with its DT_NEEDED chain, dependencies first, so each
+ // image's relocation-time imports can bind against the images it needs
+ // (kl_guest_sym_global). Names with no file in the library path are assumed
+@@ -320,6 +338,12 @@
+         // kl_guest_sym_global — not a packaging gap.
+         "libOVRPlugin.so", "libovrplatformloader.so", "libvrapi.so",
+         "libopenxr_loader.so", "libOpenMAXAL.so",
++        // glibc guests: the C runtime is served by the host shim, never loaded
++        // as a guest image; windowing and device libraries are stubbed by name.
++        "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1",
++        "libutil.so.1", "libresolv.so.2", "ld-linux-aarch64.so.1",
++        "libX11.so.6", "libXext.so.6", "libxcb.so.1", "libwayland-client.so.0",
++        "libudev.so.1", "libdrm.so.2", "libmimalloc.so",
+     };
+     for (unsigned i = 0; i < sizeof shim / sizeof shim[0]; i++)
+         if (!strcmp(name, shim[i])) return 1;
+@@ -348,9 +372,37 @@
+             b, r);
+ }
+ 
++// Libraries whose DT_NEEDED chain is being walked right now. A dependency that
++// is already on this list is skipped (its symbols bind late, see
++// kl_rebind_missing), and when the outermost load finishes every image's
++// missing imports are tried again.
++static kl_image *kl_load_recursive_inner(const char *path);
++static char g_loading_names[64][128];
++static int g_loading_n;
++static int g_loading_sentinel_storage;
++static int loading_has(const char *b) { for (int i = 0; i < g_loading_n; i++) if (!strcmp(g_loading_names[i], b)) return 1; return 0; }
++
+ kl_image *kl_load_recursive(const char *path) {
+     kl_image *have = kl_find_image(path);
+-    if (have) return have;                       // cycle guard / already loaded
++    if (have) return have;                       // already loaded
++    const char *bname = strrchr(path, '/'); bname = bname ? bname + 1 : path;
++    if (loading_has(bname)) {
++        if (kl_env_on("KL_TRACE_NEEDED", 1)) fprintf(stderr, "  [dl] %s is already being loaded (dependency cycle) — bound late\n", bname);
++        return (kl_image *)&g_loading_sentinel_storage;      // non-NULL: the dependent carries on
++    }
++    if (g_loading_n < 64) snprintf(g_loading_names[g_loading_n++], 128, "%s", bname);
++    kl_image *result = kl_load_recursive_inner(path);
++    if (g_loading_n > 0) g_loading_n--;
++    if (g_loading_n == 0) {
++        pthread_mutex_lock(&g_lock);
++        int n = g_nimgs;
++        pthread_mutex_unlock(&g_lock);
++        for (int i = 0; i < n; i++) kl_rebind_missing(g_imgs[i].img);
++    }
++    return result;
++}
++
++static kl_image *kl_load_recursive_inner(const char *path) {
+ 
+     char names[32][128];
+     int nn = kl_list_needed(path, names, 32);
+@@ -696,6 +748,32 @@
+ 
+ static int kl_core_shim_is_handle(void *h) { return h == (void *)&g_core_shim_handle; }
+ 
++// ---- host modules ----
++// A library the HOST implements for the guest, keyed by a path suffix
++// ("/vrclient.so"): dlopen of such a path returns a handle whose dlsym asks the
++// registered lookup. Up to 8; the handle is the registry entry's address.
++struct kl_host_module { const char *suffix; void *(*lookup)(const char *); };
++static struct kl_host_module g_host_mods[8];
++static unsigned g_host_mods_n;
++void kl_dl_add_host_module(const char *suffix, void *(*lookup)(const char *)) {
++    if (g_host_mods_n < 8) { g_host_mods[g_host_mods_n].suffix = suffix; g_host_mods[g_host_mods_n].lookup = lookup; g_host_mods_n++; }
++}
++static void *kl_host_module_dlopen(const char *path) {
++    size_t n = strlen(path);
++    for (unsigned i = 0; i < g_host_mods_n; i++) {
++        size_t m = strlen(g_host_mods[i].suffix);
++        if (n >= m && !strcmp(path + n - m, g_host_mods[i].suffix)) {
++            fprintf(stderr, "  [klepton] guest dlopen(%s) -> host module\n", path);
++            return &g_host_mods[i];
++        }
++    }
++    return NULL;
++}
++static struct kl_host_module *kl_host_module_handle(void *h) {
++    for (unsigned i = 0; i < g_host_mods_n; i++) if (h == (void *)&g_host_mods[i]) return &g_host_mods[i];
++    return NULL;
++}
++
+ void *klb_dlopen(const char *path, int flags) {
+     (void)flags;
+     { static int once; if (!once) { once = 1; kl_dl_trace_shims(); } }
+@@ -747,6 +825,7 @@
+     // The always-resident Android system libraries (libc/libdl/libm/...). No file
+     // to open; served with a handle whose dlsym routes to the shim table. Must
+     // come before the file-load fallthrough, which would fail and hand back NULL.
++    { void *hm = kl_host_module_dlopen(path); if (hm) return hm; }
+     if (kl_core_shim_claims(path)) {
+         fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> shim-served handle\n", path);
+         return (void *)&g_core_shim_handle;
+@@ -835,6 +914,7 @@
+ }
+ 
+ void *klb_dlsym(void *handle, const char *name) {
++    { struct kl_host_module *hm = kl_host_module_handle(handle); if (hm) return hm->lookup(name); }
+     if (kl_egl_is_handle(handle)) return kl_egl_sym(name);
+     if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
+     if (kl_ovrp_is_handle(handle)) return kl_ovrp_sym(name);
+@@ -880,6 +960,7 @@
+     void *v = kl_sym((kl_image *)handle, name);
+     if (!v) { snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
+               return klb_dlsym_null(name); }
++    { void *w = kl_interpose_lookup(name); if (w) return w; }
+     { void *w = kl_dl_interpose(name, v); if (w) return w; }
+     return v;
+ }
+--- a/runtime/kl_x18.c
++++ b/runtime/kl_x18.c
+@@ -828,6 +828,85 @@
+             continue;
+         }
+ 
++        // ---- glibc guest shapes (x18 is a general register on Linux) ----
++        if (out + VEN_MAX_INSN <= pool_end) {
++            uint32_t body[VEN_MAX_INSN], patch;
++            unsigned k = 0;
++            int ok = 1, served = 0;
++            if (word == 0xD63F0240u) {
++                // blr x18: call through the shadow via x16 (IP0, which every
++                // call may clobber), never through the real x18: the kernel can
++                // zero x18 between loading it and the blr, and the race
++                // recovery then resumed the callee with the wrong return
++                // address (libmpg123's dct36 calls: corrupted state, crash).
++                // Return lands in the veneer, which branches back behind the site.
++                body[k++] = enc_mrs_tpidrro(16);
++                body[k++] = enc_ldr(16, 16, (unsigned)KLX_TSD_SLOT * 8);
++                body[k++] = 0xD63F0200u;                 // blr x16
++                ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
++                served = 1;
++            } else if (in.pcrel == KLX_PC_ADR && (word & 0x9F000000u) == 0x10000000u && (word & 31u) == 18) {
++                // adr x18, label: the address is a constant, materialised into the shadow.
++                int64_t imm = (int64_t)(((word >> 5) & 0x7FFFFu) << 2 | ((word >> 29) & 3u));
++                if (imm & (1LL << 20)) imm -= (1LL << 21);
++                uint64_t target = spc + (uint64_t)imm;
++                unsigned a, b;
++                pick_scratch(in.gp_used, &a, &b);
++                body[k++] = enc_stp(a, b, -16);
++                body[k++] = enc_mrs_tpidrro(a);
++                k += enc_mov_imm64(b, target, body + k);
++                body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
++                body[k++] = enc_ldp(a, b, -16);
++                ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
++                served = 1;
++            } else if (in.hazard == KLX_HZ_SPWRITE && (word & 0xFFC00000u) == 0xA9800000u && ((word >> 5) & 31u) == 31u) {
++                // stp Xt, Xt2, [sp, #imm]!  — scratch spilled below the pair's
++                // destination, the pair written (x18 read from the shadow) with
++                // the original writeback, scratch restored from the new sp.
++                int imm = (int)((word >> 15) & 0x7Fu); if (imm & 0x40) imm -= 0x80; imm *= 8;
++                if (imm - 16 >= -512 && imm <= 0) {
++                    unsigned a, b;
++                    pick_scratch(in.gp_used, &a, &b);
++                    body[k++] = enc_stp(a, b, imm - 16);
++                    body[k++] = enc_mrs_tpidrro(a);
++                    body[k++] = enc_ldr(b, a, (unsigned)KLX_TSD_SLOT * 8);
++                    body[k++] = klx_substitute(word, &in, b);
++                    body[k++] = enc_ldp(a, b, -16);
++                    ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
++                    served = 1;
++                }
++            } else if (in.hazard == KLX_HZ_SPWRITE && (word & 0xFFC00000u) == 0xA8C00000u && ((word >> 5) & 31u) == 31u) {
++                // ldp Xt, Xt2, [sp], #imm — the pair is loaded (x18's value into
++                // scratch b) with the original writeback, b goes to the shadow,
++                // scratch is restored from where it was spilled (old sp - 16).
++                int imm = (int)((word >> 15) & 0x7Fu); if (imm & 0x40) imm -= 0x80; imm *= 8;
++                if (imm >= 0 && -16 - imm >= -512) {
++                    unsigned a, b;
++                    pick_scratch(in.gp_used, &a, &b);
++                    body[k++] = enc_stp(a, b, -16);
++                    body[k++] = klx_substitute(word, &in, b);
++                    body[k++] = enc_mrs_tpidrro(a);
++                    body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
++                    body[k++] = enc_ldp(a, b, -16 - imm);
++                    ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
++                    served = 1;
++                }
++            }
++            if (served) {
++                ok &= (k <= VEN_MAX_INSN) && enc_b(spc, vpc, &patch);
++                if (!ok) {
++                    note_refusal(word); st->refused++;
++                    if (out_of_reach(spc, vpc)) st->far_refused++;
++                    continue;
++                }
++                memcpy(out, body, k * 4);
++                out += k;
++                w[i] = patch;
++                st->patched++;
++                continue;
++            }
++        }
++
+         if (in.hazard || in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL ||
+             out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
+ 
+--- a/runtime/libc/kl_pthread.c
++++ b/runtime/libc/kl_pthread.c
+@@ -100,10 +100,8 @@
+ // deadlock (2026-08-06 capture hang). So mutexes are keyed by guest
+ // *address* instead: a copied or recycled address is the same mutex, a
+ // different address is a different mutex, and guest storage is never read.
+-// Keyed by guest ADDRESS, and slots are only reclaimed on an explicit
+-// pthread_mutex_destroy — which many guests never call (freeing the containing
+-// object is legal on Linux, where a pthread_mutex_t needs no destroy). So the
+-// table fills monotonically with the working set of distinct mutex addresses.
++// Entries survive destroy so probe chains and pooled condvar associations stay
++// valid. The table grows with the working set of distinct mutex addresses.
+ // TWD2's UE4 load creates ~32k mutexes without destroying any and overflowed the
+ // old 32768 table: mtx_entry_for's unbounded probe then spun FOREVER on the first
+ // insert into a full table (the "abort past it" below was never implemented), which
+@@ -296,15 +294,6 @@
+             { i--; continue; }          // lost the race; re-read this slot
+         atomic_store(&g_mtx_map[i].m, fresh);
+         return &g_mtx_map[i];
+-    }
+-}
+-
+-static mtx_entry *mtx_find(void *g) {
+-    uintptr_t want = (uintptr_t)g;
+-    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+-        uintptr_t k = atomic_load(&g_mtx_map[i].key);
+-        if (k == want) return &g_mtx_map[i];
+-        if (!k) return NULL;
+     }
+ }
+ 
+@@ -632,8 +621,9 @@
+ }
+ int klb_pthread_mutex_destroy(void *p) {
+     mtx_log("destroy", p, 0);
+-    mtx_entry *e = mtx_find(p);
+-    if (e) atomic_store(&e->key, 0);    // host leaks; it may be held
++    // Destroy keeps the address key: clearing it breaks a linear-probe chain,
++    // so another live mutex beyond it can acquire a second host object. Keep
++    // the unlocked host mutex for address reuse, just as init and conds do.
+     return 0;
+ }
+ 
+--- a/runtime/libc/kl_shim.c
++++ b/runtime/libc/kl_shim.c
+@@ -97,6 +97,7 @@
+ void kl_thread_init(void) {
+     uint64_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+     ((uint64_t *)tp)[TLS_SLOT_STACK_GUARD] = g_canary;
++    kl_tls_thread_init();
+ }
+ 
+ // The guest installs its own fatal-signal handlers — IL2CPP does this for crash
+--- a/runtime/libc/kl_libc.c
++++ b/runtime/libc/kl_libc.c
+@@ -1315,6 +1315,27 @@
+         snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
+         proc_put(rel, "1024\n");
+     }
++    {
++        int perf = 0; size_t sz = sizeof perf;
++        if (sysctlbyname("hw.perflevel0.logicalcpu", &perf, &sz, NULL, 0) != 0 || perf <= 0 || perf > ncpu) perf = (int)ncpu;
++        char sib[64];
++        if (ncpu > 1) snprintf(sib, sizeof sib, "0-%ld\n", ncpu - 1); else snprintf(sib, sizeof sib, "0\n");
++        for (long i = 0; i < ncpu; i++) {
++            char rel[256], val[32];
++            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_id", i);
++            snprintf(val, sizeof val, "%ld\n", i); proc_put(rel, val);
++            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/physical_package_id", i);
++            proc_put(rel, "0\n");
++            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
++            proc_put(rel, val);
++            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_siblings_list", i);
++            proc_put(rel, sib);
++            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/package_cpus_list", i);
++            proc_put(rel, sib);
++            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
++            proc_put(rel, i < perf ? "1024\n" : "400\n");          // performance cores first
++        }
++    }
+     // Some guests size their core loop from kernel_max (highest possible CPU
+     // index) rather than from /possible. Pin it to the last slot we serve so the
+     // loop's upper bound and the nodes that exist agree.
+@@ -1612,12 +1633,19 @@
+     static int mode = -1;   // 0 off, 1 failures only, 2 everything
+     if (mode < 0) {
+         const char *e = kl_env_str("KL_TRACE_FS", NULL);
+-        mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 1 : 2);
++        mode = !kl_env_on("KL_TRACE_FS", 0) ? 0 : (e && strcmp(e, "fail") == 0 ? 1 : 2);
+     }
+     return mode;
+ }
+ static void kl_fs_trace(const char *op, const char *path, const char *extra, int failed) {
+     if (!extra) extra = "";
++    if (kl_env_on("ALYX_SETTINGS_TRACE", 0) && path && strstr(path, "cfg/") && (strstr(path, "video") || strstr(path, "machine"))) {
++        static unsigned reports;
++        int saved_errno = errno;
++        if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 240)
++            fprintf(stderr, "[settings-fs] %s %s %s: %s errno %d\n", op, path, extra, failed ? "FAILED" : "OK", failed ? saved_errno : 0);
++        errno = saved_errno;
++    }
+     int mode = kl_fs_trace_mode();
+     if (!mode || (mode == 1 && !failed)) return;
+     if (failed) fprintf(stderr, "[fs] %s(\"%s\", \"%s\") FAILED: %s\n", op, path, extra, strerror(errno));
+@@ -2868,10 +2896,23 @@
+     // with l_type/l_whence, Darwin with l_start/l_len), so forwarding the
+     // pointer would silently lock a different range. Refused by name until
+     // something needs it — no guest has yet.
+-    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:
+-        warn_once("fcntl file locking (struct flock layout differs) — refused");
+-        errno = EINVAL;
+-        return -1;
++    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW: {
++        // Linux/aarch64 struct flock leads with l_type/l_whence, Darwin's with
++        // l_start/l_len, and the F_RDLCK/F_WRLCK/F_UNLCK values differ (0/1/2 vs
++        // 1/3/2), so the record is translated both ways.
++        struct lx_flock { int16_t l_type, l_whence; int32_t pad; int64_t l_start, l_len; int32_t l_pid, pad2; };
++        struct lx_flock *lx = (struct lx_flock *)arg;
++        struct flock d; memset(&d, 0, sizeof d);
++        d.l_type = lx->l_type == 0 ? F_RDLCK : lx->l_type == 1 ? F_WRLCK : F_UNLCK;
++        d.l_whence = lx->l_whence; d.l_start = lx->l_start; d.l_len = lx->l_len; d.l_pid = lx->l_pid;
++        int dcmd = cmd == LX_F_GETLK ? F_GETLK : cmd == LX_F_SETLK ? F_SETLK : F_SETLKW;
++        int r = fcntl(fd, dcmd, &d);
++        if (r == 0 && cmd == LX_F_GETLK) {
++            lx->l_type = d.l_type == F_RDLCK ? 0 : d.l_type == F_WRLCK ? 1 : 2;
++            lx->l_whence = d.l_whence; lx->l_start = d.l_start; lx->l_len = d.l_len; lx->l_pid = d.l_pid;
++        }
++        return r;
++    }
+     default:
+         fcntl_warn_once("fcntl", cmd);
+         errno = EINVAL;
+--- a/runtime/gfx/kl_vulkan.c
++++ b/runtime/gfx/kl_vulkan.c
+@@ -113,6 +113,14 @@
+ // defined, which it is not here.
+ #define VK_USE_PLATFORM_METAL_EXT 1
+ #include <vulkan/vulkan.h>
++#include "kl_vk_pipe_hooks.h"
++static const klvk_pipe_hooks *g_pipe_hooks;
++static _Thread_local int t_pipe_replay;
++void klvk_set_pipe_hooks(const klvk_pipe_hooks *hooks) { g_pipe_hooks=hooks; }
++void klvk_set_replay_thread(int on) { t_pipe_replay=on; }
++static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice,const char *);
++#define PIPE_HOOK(fn,...) do { if(g_pipe_hooks && g_pipe_hooks->fn && !t_pipe_replay) g_pipe_hooks->fn(__VA_ARGS__); } while(0)
++
+ #include "kl_glfb.h"
+ 
+ #include <zlib.h>
+@@ -239,6 +247,16 @@
+     }
+     real_gipa = (PFN_vkGetInstanceProcAddr)mvk_sym("vkGetInstanceProcAddr");
+     real_gdpa = (PFN_vkGetDeviceProcAddr)mvk_sym("vkGetDeviceProcAddr");
++    // Opt-in recording sees the actual MoltenVK inputs after our rewrites.
++    const char *recorderPath = getenv("ALYX_PIPELINE_RECORDER_LIBRARY");
++    if (recorderPath && *recorderPath) {
++        void *rec = dlopen(recorderPath, RTLD_NOW | RTLD_LOCAL);
++        if (rec) {
++            PFN_vkGetDeviceProcAddr (*install)(PFN_vkGetDeviceProcAddr) = dlsym(rec,"alyx_recorder_install");
++            PFN_vkGetInstanceProcAddr (*installInstance)(PFN_vkGetInstanceProcAddr) = dlsym(rec,"alyx_recorder_instance_install");
++            if (install && installInstance) { real_gdpa = install(real_gdpa); real_gipa = installInstance(real_gipa); }
++        } else VKI("pipeline recorder load failed: %s\n", dlerror());
++    }
+     if (!real_gipa) { VKI("MoltenVK has no vkGetInstanceProcAddr\n"); return; }
+     g_avail = 1;
+ 
+@@ -443,7 +461,7 @@
+ 
+     uint32_t n = 0;
+     real(layer, &n, NULL);
+-    VkExtensionProperties *tmp = calloc(n + 2, sizeof *tmp);
++    VkExtensionProperties *tmp = calloc(n + 8, sizeof *tmp);
+     if (!tmp) return VK_ERROR_OUT_OF_HOST_MEMORY;
+     real(layer, &n, tmp);
+ 
+@@ -455,6 +473,18 @@
+                  VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+         tmp[n].specVersion = 6;
+         n++;
++    }
++    // ...and the Linux window-system surfaces, for a Linux guest (Source 2 asks
++    // for xcb/xlib/wayland and fails Vulkan init without one). Same synthetic
++    // surface behind all of them.
++    if (!layer) {
++        static const char *linux_wsi[] = { "VK_KHR_xcb_surface", "VK_KHR_xlib_surface", "VK_KHR_wayland_surface" };
++        for (unsigned k = 0; k < 3; k++)
++            if (!ext_supported(tmp, n, linux_wsi[k])) {
++                snprintf(tmp[n].extensionName, sizeof tmp[n].extensionName, "%s", linux_wsi[k]);
++                tmp[n].specVersion = 6;
++                n++;
++            }
+     }
+ 
+     VkResult r = VK_SUCCESS;
+@@ -488,7 +518,8 @@
+     extlist keep = {{0}, 0};
+     for (uint32_t i = 0; ci && i < ci->enabledExtensionCount; i++) {
+         const char *e = ci->ppEnabledExtensionNames[i];
+-        if (!strcmp(e, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
++        if (!strcmp(e, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME) || !strcmp(e, "VK_KHR_xcb_surface") ||
++            !strcmp(e, "VK_KHR_xlib_surface") || !strcmp(e, "VK_KHR_wayland_surface")) {
+             VKT("instance ext %s -> ours (MoltenVK has no Android WSI)\n", e);
+             continue;
+         }
+@@ -571,6 +602,117 @@
+ #undef R
+ }
+ 
++// Every feature struct is { sType, pNext, VkBool32... }; knowing a struct's size
++// is enough to query what the device supports (vkGetPhysicalDeviceFeatures2 with
++// a zeroed copy chained) and AND the request against it.
++static const struct { VkStructureType st; size_t size; const char *name; } klvk_feature_structs[] = {
++#define FS(T, ST) { ST, sizeof(T), #T }
++    FS(VkPhysicalDeviceVulkan11Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES),
++    FS(VkPhysicalDeviceVulkan12Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES),
++    FS(VkPhysicalDeviceVulkan13Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES),
++    FS(VkPhysicalDeviceMultiviewFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES),
++    FS(VkPhysicalDevice16BitStorageFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES),
++    FS(VkPhysicalDevice8BitStorageFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES),
++    FS(VkPhysicalDeviceShaderFloat16Int8Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES),
++    FS(VkPhysicalDeviceDynamicRenderingFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES),
++    FS(VkPhysicalDeviceDynamicRenderingLocalReadFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES),
++    FS(VkPhysicalDeviceExtendedDynamicStateFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT),
++    FS(VkPhysicalDeviceExtendedDynamicState2FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT),
++    FS(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT),
++    FS(VkPhysicalDeviceHostImageCopyFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES),
++    FS(VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES),
++    FS(VkPhysicalDeviceImagelessFramebufferFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES),
++    FS(VkPhysicalDeviceDescriptorIndexingFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES),
++    FS(VkPhysicalDeviceBufferDeviceAddressFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES),
++    FS(VkPhysicalDeviceTimelineSemaphoreFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES),
++    FS(VkPhysicalDeviceShaderDrawParametersFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES),
++    FS(VkPhysicalDeviceSamplerYcbcrConversionFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES),
++    FS(VkPhysicalDeviceVariablePointersFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES),
++    FS(VkPhysicalDeviceUniformBufferStandardLayoutFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES),
++    FS(VkPhysicalDeviceScalarBlockLayoutFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES),
++    FS(VkPhysicalDeviceHostQueryResetFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES),
++    FS(VkPhysicalDeviceVulkanMemoryModelFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES),
++    FS(VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES),
++    FS(VkPhysicalDeviceShaderAtomicInt64Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES),
++    FS(VkPhysicalDeviceFragmentDensityMapFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT),
++    FS(VkPhysicalDeviceMemoryPriorityFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT),
++    FS(VkPhysicalDeviceRobustness2FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT),
++    FS(VkPhysicalDeviceSynchronization2Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES),
++    FS(VkPhysicalDeviceMaintenance4Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES),
++    FS(VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES),
++    FS(VkPhysicalDeviceImageRobustnessFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES),
++    FS(VkPhysicalDeviceInlineUniformBlockFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES),
++    FS(VkPhysicalDevicePipelineCreationCacheControlFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES),
++    FS(VkPhysicalDevicePrivateDataFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES),
++    FS(VkPhysicalDeviceShaderIntegerDotProductFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES),
++    FS(VkPhysicalDeviceShaderTerminateInvocationFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES),
++    FS(VkPhysicalDeviceSubgroupSizeControlFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES),
++    FS(VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES),
++    FS(VkPhysicalDeviceCustomBorderColorFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT),
++    FS(VkPhysicalDeviceIndexTypeUint8Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES),
++    FS(VkPhysicalDeviceLineRasterizationFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES),
++    FS(VkPhysicalDeviceVertexAttributeDivisorFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES),
++    FS(VkPhysicalDeviceDepthClipEnableFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT),
++    FS(VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT),
++    FS(VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT),
++    FS(VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT),
++    FS(VkPhysicalDeviceTextureCompressionASTCHDRFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES),
++    FS(VkPhysicalDeviceMultiDrawFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT),
++    FS(VkPhysicalDeviceDepthClampZeroOneFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_ZERO_ONE_FEATURES_KHR),
++    FS(VkPhysicalDeviceShaderClockFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR),
++    FS(VkPhysicalDeviceConditionalRenderingFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT),
++    FS(VkPhysicalDeviceTransformFeedbackFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT),
++    FS(VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT),
++    FS(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT),
++    FS(VkPhysicalDeviceMaintenance5Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES),
++    FS(VkPhysicalDeviceMaintenance6Features, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES),
++#undef FS
++};
++static size_t klvk_feature_struct_size(VkStructureType st, const char **name) {
++    for (size_t i = 0; i < sizeof klvk_feature_structs / sizeof *klvk_feature_structs; i++)
++        if (klvk_feature_structs[i].st == st) { if (name) *name = klvk_feature_structs[i].name; return klvk_feature_structs[i].size; }
++    return 0;
++}
++// AND the requested features (pEnabledFeatures and every known feature struct in
++// the pNext chain, which is modified in place: it is the guest's memory, but a
++// bit the device lacks could never have been honoured) against what MoltenVK
++// reports. Returns the number of features turned off.
++static unsigned klvk_clamp_features(VkPhysicalDevice phys, VkDeviceCreateInfo *ci) {
++    PFN_vkGetPhysicalDeviceFeatures gf = (PFN_vkGetPhysicalDeviceFeatures)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures");
++    PFN_vkGetPhysicalDeviceFeatures2 gf2 = (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2");
++    if (!gf2) gf2 = (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR");
++    unsigned off = 0;
++    VkPhysicalDeviceFeatures have; memset(&have, 0, sizeof have);
++    if (gf) gf(phys, &have);
++    VkBool32 *hb = (VkBool32 *)&have;
++    if (ci->pEnabledFeatures && gf) {
++        VkBool32 *rb = (VkBool32 *)ci->pEnabledFeatures;
++        for (size_t i = 0; i < sizeof have / sizeof(VkBool32); i++)
++            if (rb[i] && !hb[i]) { rb[i] = VK_FALSE; off++; VKI("device feature #%zu (VkPhysicalDeviceFeatures) not supported — turned off\n", i); }
++    }
++    for (VkBaseOutStructure *p = (VkBaseOutStructure *)ci->pNext; p; p = p->pNext) {
++        if (p->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
++            VkBool32 *rb = (VkBool32 *)&((VkPhysicalDeviceFeatures2 *)p)->features;
++            for (size_t i = 0; gf && i < sizeof have / sizeof(VkBool32); i++)
++                if (rb[i] && !hb[i]) { rb[i] = VK_FALSE; off++; VKI("device feature #%zu (VkPhysicalDeviceFeatures2) not supported — turned off\n", i); }
++            continue;
++        }
++        const char *name = NULL;
++        size_t size = klvk_feature_struct_size(p->sType, &name);
++        if (!size || !gf2) continue;
++        uint8_t *probe = calloc(1, size);
++        if (!probe) continue;
++        ((VkBaseOutStructure *)probe)->sType = p->sType;
++        VkPhysicalDeviceFeatures2 q = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, probe };
++        gf2(phys, &q);
++        VkBool32 *rb = (VkBool32 *)((uint8_t *)p + 16), *sb = (VkBool32 *)(probe + 16);
++        for (size_t i = 0; i < (size - 16) / sizeof(VkBool32); i++)
++            if (rb[i] && !sb[i]) { rb[i] = VK_FALSE; off++; VKI("device feature %s field #%zu not supported — turned off\n", name, i); }
++        free(probe);
++    }
++    return off;
++}
++
+ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
+                                   const VkAllocationCallbacks *alloc, VkDevice *out) {
+     PFN_vkCreateDevice real = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
+@@ -621,7 +763,15 @@
+     mine.enabledLayerCount = 0;
+     mine.ppEnabledLayerNames = NULL;
+ 
++    PIPE_HOOK(device_info,ci);
+     VkResult r = real(phys, &mine, alloc, out);
++    if (r == VK_ERROR_FEATURE_NOT_PRESENT) {
++        // Source 2 asks for a superset of features and copes with what it
++        // gets; a feature MoltenVK lacks is turned off and the create retried.
++        unsigned off = klvk_clamp_features(phys, &mine);
++        VKI("vkCreateDevice: VK_ERROR_FEATURE_NOT_PRESENT — %u feature(s) turned off, retrying\n", off);
++        r = real(phys, &mine, alloc, out);
++    }
+     free(have);
+     if (r != VK_SUCCESS) { VKI("vkCreateDevice FAILED %d\n", r); return r; }
+ 
+@@ -641,6 +791,7 @@
+     pthread_mutex_unlock(&g_lock);
+ 
+     VKI("vkCreateDevice ok — %u extension(s), queue family %u\n", keep.n, d->queue_family);
++    PIPE_HOOK(device_created,d->dev,klvk_GetDeviceProcAddr);
+     return VK_SUCCESS;
+ }
+ 
+@@ -663,6 +814,18 @@
+     *out = (VkSurfaceKHR)s;
+     VKI("vkCreateAndroidSurfaceKHR -> synthetic surface %ux%u\n", s->w, s->h);
+     return VK_SUCCESS;
++}
++
++// The Linux WSI entry points: the create-info is window-system specific and
++// ignored; the surface is the same synthetic one.
++static VkResult klvk_CreateLinuxSurfaceKHR(VkInstance inst, const void *ci,
++        const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
++    (void)ci;
++    return klvk_CreateAndroidSurfaceKHR(inst, NULL, alloc, out);
++}
++static VkBool32 klvk_GetPhysicalDeviceLinuxPresentationSupportKHR(VkPhysicalDevice p, uint32_t fam, void *a, void *b) {
++    (void)p; (void)fam; (void)a; (void)b;
++    return VK_TRUE;
+ }
+ 
+ static klvk_surface *surf_of(VkSurfaceKHR h) {
+@@ -3118,6 +3281,29 @@
+             g_pipe_gfx, g_pipe_comp, tot, (double)g_pipe_ns / 1e9, kind, n, dt_ms);
+     }
+ }
++#define KVA_REPLAY_THREAD() (t_pipe_replay)
++#include "kl_vk_async.inc"
++VkResult klvk_wait_replay_pipeline(VkPipeline pipeline) {
++    if(!pipeline)return VK_ERROR_INITIALIZATION_FAILED;
++    kva_pipe *p=kva_of((uint64_t)pipeline);
++    if(!p)return VK_SUCCESS;
++    pthread_mutex_lock(&g_kva_mu);
++    while(atomic_load(&p->state)==0)pthread_cond_wait(&g_kva_ready,&g_kva_mu);
++    int state=atomic_load(&p->state);
++    pthread_mutex_unlock(&g_kva_mu);
++    return state==1?VK_SUCCESS:VK_ERROR_INITIALIZATION_FAILED;
++}
++void klvk_finish_replay(VkDevice dev) {
++    pthread_mutex_lock(&g_kva_mu);
++    while(g_kva_pending || g_kva_finishing)pthread_cond_wait(&g_kva_ready,&g_kva_mu);
++    pthread_mutex_unlock(&g_kva_mu);
++    pthread_mutex_lock(&g_kva_archive_mu);
++    kva_archive *a=kva_archive_locked(dev);
++    if(a)kva_archive_save_locked(a,1);
++    pthread_mutex_unlock(&g_kva_archive_mu);
++}
++
++
+ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
+         VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci,
+         const VkAllocationCallbacks *alloc, VkPipeline *out) {
+@@ -3189,9 +3375,9 @@
+         }
+         fflush(stderr);
+     }
++    if (kva_create(dev, cache, n, use, out, real)) { free(mod); free(ias); g_pipe_gfx += n; return VK_SUCCESS; }
+     double t0 = kl_pipe_ms();
+-    VkResult r = real ? real(dev, cache, n, use, alloc, out)
+-                      : VK_ERROR_INITIALIZATION_FAILED;
++    VkResult r = kva_inline_graphics(real, dev, cache, n, use, alloc, out);
+     if (pipe_trace) { VKI("pipe-trace: DONE through #%llu (r=%d)\n", g_pipe_enter, (int)r); fflush(stderr); }
+     free(mod); free(ias);
+     if (fixed) { static int said; if (said < 8) { said++;
+@@ -3209,8 +3395,21 @@
+     if (!real && real_gdpa)
+         real = (PFN_vkCreateComputePipelines)real_gdpa(dev, "vkCreateComputePipelines");
+     double t0 = kl_pipe_ms();
+-    VkResult r = real ? real(dev, cache, n, ci, alloc, out)
+-                      : VK_ERROR_INITIALIZATION_FAILED;
++    VkPipelineCache prepared=VK_NULL_HANDLE;
++    if(t_pipe_replay && !cache && kva_private_archive()) {
++        PFN_vkCreatePipelineCache create=(PFN_vkCreatePipelineCache)real_gdpa(dev,"vkCreatePipelineCache");
++        VkPipelineCacheCreateInfo info={.sType=VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
++        if(create && create(dev,&info,NULL,&prepared)==VK_SUCCESS) {
++            kva_archive_seed_replay(dev,prepared); cache=prepared;
++        }
++    }
++    VkResult r = kva_inline_compute(real, dev, cache, n, ci, alloc, out);
++    if(prepared) {
++        if(r==VK_SUCCESS)kva_archive_publish_replay(dev,prepared);
++        PFN_vkDestroyPipelineCache destroy=(PFN_vkDestroyPipelineCache)real_gdpa(dev,"vkDestroyPipelineCache");
++        if(destroy)destroy(dev,prepared,NULL);
++    }
++
+     g_pipe_comp += n;
+     kl_pipe_report("compute", n, kl_pipe_ms() - t0);
+     return r;
+@@ -3382,6 +3581,7 @@
+     static PFN_vkCreateRenderPass real;
+     if (!real && real_gdpa) real = (PFN_vkCreateRenderPass)real_gdpa(dev, "vkCreateRenderPass");
+     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
++    if (r == VK_SUCCESS && ci && out) kva_record_pass(*out, ci, NULL);
+     if (ci && (r != VK_SUCCESS || klvk_trace())) {
+         unsigned inputs = 0;
+         for (uint32_t i = 0; i < ci->subpassCount; i++)
+@@ -3468,6 +3668,7 @@
+         }
+     }
+     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
++    if (r == VK_SUCCESS && ci && out) kva_record_pass(*out, NULL, ci);
+     if (r == VK_SUCCESS && out && probe_att != VK_ATTACHMENT_UNUSED)
+         klvk_clearpass_add(*out, probe_att);
+     if (ci && (r != VK_SUCCESS || klvk_trace())) {
+@@ -3504,6 +3705,8 @@
+ // KL_TRACE: dynamic-rendering census (vkCmdBeginRendering). If the guest renders
+ // its eye/menu with VK_KHR_dynamic_rendering there is NO framebuffer and NO
+ // render pass object, so this is the only place those renders are visible.
++#include "kl_vk_shadow.inc"
++
+ static void VKAPI_CALL klvk_CmdBeginRendering(VkCommandBuffer cb,
+         const VkRenderingInfo *ri) {
+     static PFN_vkCmdBeginRendering real;
+@@ -3511,6 +3714,7 @@
+         real = (PFN_vkCmdBeginRendering)mvk_sym("vkCmdBeginRendering");
+         if (!real) real = (PFN_vkCmdBeginRendering)mvk_sym("vkCmdBeginRenderingKHR");
+     }
++    klvs_trace_rendering(cb,ri);
+     if (klvk_trace() && ri) {
+         klvk_trace_log("[dynr] begin area %ux%u layers %u colorAtts %u depth %s\n",
+             ri->renderArea.extent.width, ri->renderArea.extent.height,
+@@ -3962,6 +4166,8 @@
+     if (count) *count = 0;
+     return VK_SUCCESS;
+ }
++#include "kl_vk_compat.inc"
++
+ static VkResult VKAPI_CALL klvk_EnumerateDeviceExtensionProperties(
+         VkPhysicalDevice pd, const char *layer, uint32_t *count,
+         VkExtensionProperties *props) {
+@@ -3969,7 +4175,11 @@
+     if (!t) { t = 1; if (real_gipa) real = (PFN_vkEnumerateDeviceExtensionProperties)
+         real_gipa(g_instance, "vkEnumerateDeviceExtensionProperties"); }
+     pd = KLVK_PHYS_OR_SUB(pd, "EnumerateDeviceExtensionProperties");
+-    if (real) return real(pd, layer, count, props);
++    PFN_vkGetPhysicalDeviceFeatures2 features = real_gipa ?
++        (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2") : NULL;
++    if (!features && real_gipa) features =
++        (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR");
++    if (real) return kvc_enumerate_extensions(real, features, pd, layer, count, props);
+     if (count) *count = 0;
+     return VK_SUCCESS;
+ }
+@@ -4186,6 +4396,7 @@
+     static VkResult (*real)(void *, const void *);
+     if (!real && real_gdpa) real = (VkResult (*)(void *, const void *))
+         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkBeginCommandBuffer");
++    kva_set_skip(cb, 0);
+     klvk_cb_set_idx(cb, 0);
+     return real ? real(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;
+ }
+@@ -4217,6 +4428,7 @@
+     static void (*real)(void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
+     if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t))
+         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdDrawIndexed");
++    if (kva_skip(cb)) return;
+     // KL_VK_DRAW_GUARD (default OFF): the skip below drops a draw whenever it
+     // cannot find a live MTLBuffer for the index binding. That decision rests on
+     // g_cb_idx, a 64-slot, UNLOCKED table that is never drained (no
+@@ -4257,6 +4469,11 @@
+     static void (*real)(void *, uint32_t, uint64_t);
+     if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint64_t))
+         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdBindPipeline");
++    {   // async pipelines: a placeholder still compiling binds nothing (draws skipped)
++        uint64_t b = kva_bind(cb, bindPoint, pipeline);
++        if (!b && pipeline && kva_of(pipeline)) return;
++        pipeline = b;
++    }
+     if (!pipeline) { static int said; if (said < 8) { said++;
+         VKI("vkCmdBindPipeline: NULL pipeline bound (bindPoint %u) — a following "
+             "draw will dereference null in MoltenVK\n", bindPoint); } }
+@@ -5895,6 +6112,12 @@
+     E(EnumeratePhysicalDevices),
+     E(CreateDevice),
+     E(CreateAndroidSurfaceKHR), E(DestroySurfaceKHR),
++    { "vkCreateXcbSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateLinuxSurfaceKHR },
++    { "vkCreateXlibSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateLinuxSurfaceKHR },
++    { "vkCreateWaylandSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateLinuxSurfaceKHR },
++    { "vkGetPhysicalDeviceXcbPresentationSupportKHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceLinuxPresentationSupportKHR },
++    { "vkGetPhysicalDeviceXlibPresentationSupportKHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceLinuxPresentationSupportKHR },
++    { "vkGetPhysicalDeviceWaylandPresentationSupportKHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceLinuxPresentationSupportKHR },
+     E(GetPhysicalDeviceSurfaceSupportKHR), E(GetPhysicalDeviceSurfaceCapabilitiesKHR),
+     E(GetPhysicalDeviceSurfaceFormatsKHR), E(GetPhysicalDeviceSurfacePresentModesKHR),
+     E(CreateSwapchainKHR), E(DestroySwapchainKHR), E(GetSwapchainImagesKHR),
+@@ -5934,6 +6157,14 @@
+     E(CmdBlitImage), E(CmdResolveImage), E(CmdClearColorImage),
+     E(CmdCopyBufferToImage), E(CmdCopyImageToBuffer), E(CmdPipelineBarrier),
+     E(CreateGraphicsPipelines), E(CreateComputePipelines),
++    E(DestroyDevice),
++    E(CreatePipelineCache), E(GetPipelineCacheData), E(MergePipelineCaches), E(DestroyPipelineCache),
++    E(CmdDraw), E(CmdDrawIndirect), E(CmdDrawIndexedIndirect),
++    E(CmdDrawIndirectCount), E(CmdDrawIndexedIndirectCount),
++    { "vkCmdDrawIndirectCountKHR", (PFN_vkVoidFunction)klvk_CmdDrawIndirectCount },
++    { "vkCmdDrawIndexedIndirectCountKHR", (PFN_vkVoidFunction)klvk_CmdDrawIndexedIndirectCount },
++    E(DestroyPipeline), E(DestroyShaderModule), E(DestroyPipelineLayout),
++    E(DestroyRenderPass), E(DestroyDescriptorSetLayout),
+     E(CreateFramebuffer), E(CmdBeginRenderPass),
+     E(CmdBeginRenderPass2),
+     { "vkCmdBeginRenderPass2KHR", (PFN_vkVoidFunction)klvk_CmdBeginRenderPass2 },
+@@ -5945,7 +6176,76 @@
+ #undef E
+ };
+ 
++static PFN_vkVoidFunction foz_original(VkDevice dev,const char *name) {
++    for(size_t i=0;i<sizeof(g_ours)/sizeof(*g_ours);i++)
++        if(!strcmp(name,g_ours[i].name))return g_ours[i].fn;
++    return real_gdpa ? real_gdpa(dev,name) : NULL;
++}
++static VkResult VKAPI_CALL foz_CreateSampler(VkDevice d,const VkSamplerCreateInfo *ci,const VkAllocationCallbacks *a,VkSampler *out) {
++    PFN_vkCreateSampler fn=(PFN_vkCreateSampler)foz_original(d,"vkCreateSampler");
++    VkResult r=fn ? fn(d,ci,a,out) : VK_ERROR_INITIALIZATION_FAILED;
++    if(r==VK_SUCCESS && ci && out)PIPE_HOOK(sampler,*out,ci);
++    return r;
++}
++static VkResult VKAPI_CALL foz_CreateDescriptorSetLayout(VkDevice d,const VkDescriptorSetLayoutCreateInfo *ci,const VkAllocationCallbacks *a,VkDescriptorSetLayout *out) {
++    PFN_vkCreateDescriptorSetLayout fn=(PFN_vkCreateDescriptorSetLayout)foz_original(d,"vkCreateDescriptorSetLayout");
++    VkResult r=fn ? fn(d,ci,a,out) : VK_ERROR_INITIALIZATION_FAILED;
++    if(r==VK_SUCCESS && ci && out)PIPE_HOOK(set_layout,*out,ci);
++    return r;
++}
++static VkResult VKAPI_CALL foz_CreatePipelineLayout(VkDevice d,const VkPipelineLayoutCreateInfo *ci,const VkAllocationCallbacks *a,VkPipelineLayout *out) {
++    PFN_vkCreatePipelineLayout fn=(PFN_vkCreatePipelineLayout)foz_original(d,"vkCreatePipelineLayout");
++    VkResult r=fn ? fn(d,ci,a,out) : VK_ERROR_INITIALIZATION_FAILED;
++    if(r==VK_SUCCESS && ci && out)PIPE_HOOK(pipeline_layout,*out,ci);
++    return r;
++}
++static VkResult VKAPI_CALL foz_CreateShaderModule(VkDevice d,const VkShaderModuleCreateInfo *ci,const VkAllocationCallbacks *a,VkShaderModule *out) {
++    PFN_vkCreateShaderModule fn=(PFN_vkCreateShaderModule)foz_original(d,"vkCreateShaderModule");
++    VkResult r=fn ? fn(d,ci,a,out) : VK_ERROR_INITIALIZATION_FAILED;
++    if(r==VK_SUCCESS && ci && out)PIPE_HOOK(shader_module,*out,ci);
++    return r;
++}
++static VkResult VKAPI_CALL foz_CreateRenderPass(VkDevice d,const VkRenderPassCreateInfo *ci,const VkAllocationCallbacks *a,VkRenderPass *out) {
++    PFN_vkCreateRenderPass fn=(PFN_vkCreateRenderPass)foz_original(d,"vkCreateRenderPass");
++    VkResult r=fn ? fn(d,ci,a,out) : VK_ERROR_INITIALIZATION_FAILED;
++    if(r==VK_SUCCESS && ci && out)PIPE_HOOK(render_pass,*out,ci);
++    return r;
++}
++static VkResult VKAPI_CALL foz_CreateRenderPass2(VkDevice d,const VkRenderPassCreateInfo2 *ci,const VkAllocationCallbacks *a,VkRenderPass *out) {
++    PFN_vkCreateRenderPass2 fn=(PFN_vkCreateRenderPass2)foz_original(d,"vkCreateRenderPass2");
++    VkResult r=fn ? fn(d,ci,a,out) : VK_ERROR_INITIALIZATION_FAILED;
++    if(r==VK_SUCCESS && ci && out)PIPE_HOOK(render_pass2,*out,ci);
++    return r;
++}
++static VkResult VKAPI_CALL foz_CreateGraphicsPipelines(VkDevice d,VkPipelineCache cache,uint32_t n,const VkGraphicsPipelineCreateInfo *ci,const VkAllocationCallbacks *a,VkPipeline *out) {
++    PFN_vkCreateGraphicsPipelines fn=(PFN_vkCreateGraphicsPipelines)foz_original(d,"vkCreateGraphicsPipelines");
++    double t=kl_pipe_ms();
++    VkResult r=fn ? fn(d,cache,n,ci,a,out) : VK_ERROR_INITIALIZATION_FAILED;
++    if(ci && out)for(uint32_t i=0;i<n;i++)if(out[i]) { PIPE_HOOK(graphics_pipeline,out[i],&ci[i]); PIPE_HOOK(pipeline_time,out[i],(kl_pipe_ms()-t)/(n?n:1)); }
++    return r;
++}
++static VkResult VKAPI_CALL foz_CreateComputePipelines(VkDevice d,VkPipelineCache cache,uint32_t n,const VkComputePipelineCreateInfo *ci,const VkAllocationCallbacks *a,VkPipeline *out) {
++    PFN_vkCreateComputePipelines fn=(PFN_vkCreateComputePipelines)foz_original(d,"vkCreateComputePipelines");
++    double t=kl_pipe_ms();
++    VkResult r=fn ? fn(d,cache,n,ci,a,out) : VK_ERROR_INITIALIZATION_FAILED;
++    if(ci && out)for(uint32_t i=0;i<n;i++)if(out[i]) { PIPE_HOOK(compute_pipeline,out[i],&ci[i]); PIPE_HOOK(pipeline_time,out[i],(kl_pipe_ms()-t)/(n?n:1)); }
++    return r;
++}
++static PFN_vkVoidFunction foz_wrapper(const char *name) {
++    if(!strcmp(name,"vkCreateSampler"))return (PFN_vkVoidFunction)foz_CreateSampler;
++    if(!strcmp(name,"vkCreateDescriptorSetLayout"))return (PFN_vkVoidFunction)foz_CreateDescriptorSetLayout;
++    if(!strcmp(name,"vkCreatePipelineLayout"))return (PFN_vkVoidFunction)foz_CreatePipelineLayout;
++    if(!strcmp(name,"vkCreateShaderModule"))return (PFN_vkVoidFunction)foz_CreateShaderModule;
++    if(!strcmp(name,"vkCreateRenderPass"))return (PFN_vkVoidFunction)foz_CreateRenderPass;
++    if(!strcmp(name,"vkCreateRenderPass2"))return (PFN_vkVoidFunction)foz_CreateRenderPass2;
++    if(!strcmp(name,"vkCreateRenderPass2KHR"))return (PFN_vkVoidFunction)foz_CreateRenderPass2;
++    if(!strcmp(name,"vkCreateGraphicsPipelines"))return (PFN_vkVoidFunction)foz_CreateGraphicsPipelines;
++    if(!strcmp(name,"vkCreateComputePipelines"))return (PFN_vkVoidFunction)foz_CreateComputePipelines;
++    return NULL;
++}
+ static PFN_vkVoidFunction ours(const char *name) {
++    PFN_vkVoidFunction recording=foz_wrapper(name);
++    if(recording)return recording;
+     // KL_TRACE: reveal which render-pass / dynamic-rendering entry points the
+     // guest actually resolves, and whether we hand back our wrapper or fall
+     // through to the real MoltenVK one. This is how we learn why the compositing
+--- a/tools/klepton_ld.c
++++ b/tools/klepton_ld.c
+@@ -103,7 +103,7 @@
+     size_t words = n / 4;
+     for (size_t i = 0; i < words; i++) {
+         if ((w[i] & 0xffffffe0u) != 0xd53bd040u) continue;
+-        if (kl_x18_is_data(w, n, i)) {
++        if (!getenv("KL_TLS_REWRITE_FORCE") && kl_x18_is_data(w, n, i)) {
+             (*refused)++;
+             fprintf(stderr, "klepton-ld: TLS site at +0x%llx left alone — its "
+                             "neighbourhood reads as data. If it IS code, "
