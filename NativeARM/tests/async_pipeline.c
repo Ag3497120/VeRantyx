@@ -289,6 +289,81 @@ static void test_pending_bind(VkResult result, int destroy_cache, int colour) {
     assert(kva_destroy_pipeline(test_device.dev, (uint64_t)pipeline, fake_destroy));
 }
 
+static VkResult VKAPI_CALL fake_create_required_colour(VkDevice dev, VkPipelineCache cache, uint32_t count,
+        const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipeline *out) {
+    assert(count == 1 && kva_render_usage(ci) == 1 && !ci->pDepthStencilState);
+    VkPipelineDepthStencilStateCreateInfo dummy = { .depthWriteEnable = VK_TRUE };
+    VkGraphicsPipelineCreateInfo copy = *ci; copy.pDepthStencilState = &dummy;
+    return fake_create(dev, cache, count, &copy, alloc, out);
+}
+
+static void test_first_use_policy(void) {
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { .stage = VK_SHADER_STAGE_VERTEX_BIT }, { .stage = VK_SHADER_STAGE_FRAGMENT_BIT }
+    };
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    VkPipelineRenderingCreateInfo rendering = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = 1, .pColorAttachmentFormats = &format, .depthAttachmentFormat = VK_FORMAT_D32_SFLOAT };
+    VkPipelineColorBlendAttachmentState attachment = { .colorWriteMask = 15 };
+    VkPipelineColorBlendStateCreateInfo blend = { .attachmentCount = 1, .pAttachments = &attachment };
+    VkPipelineMultisampleStateCreateInfo samples = { .rasterizationSamples = VK_SAMPLE_COUNT_4_BIT };
+    VkGraphicsPipelineCreateInfo ci = { .stageCount = 2, .pStages = stages, .pNext = &rendering,
+        .pColorBlendState = &blend, .pMultisampleState = &samples };
+    assert(!kva_required_first_use(&ci)); // ordinary 4x scene material stays nonblocking
+    samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    assert(kva_required_first_use(&ci)); // coloured cached mask with depth
+    samples.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+    rendering.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+    assert(kva_required_first_use(&ci)); // offscreen resolve/lighting
+    ci.stageCount = 1;
+    assert(kva_required_first_use(&ci)); // depth-only work
+}
+
+static void test_required_depth(VkResult result, int colour_only) {
+    VkPipelineDepthStencilStateCreateInfo depth = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthWriteEnable = VK_TRUE
+    };
+    VkPipelineShaderStageCreateInfo stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = (VkShaderModule)1, .pName = "shadow" };
+    VkGraphicsPipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 1, .pStages = &stage, .pDepthStencilState = &depth };
+    pthread_mutex_lock(&test_mu);
+    compiling = release_compile = bind_entered = bind_done = 0; compile_result = result;
+    int previous_draws = draws;
+    pthread_mutex_unlock(&test_mu);
+    VkPipelineShaderStageCreateInfo stages[2] = {stage, stage};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    VkPipelineRenderingCreateInfo rendering = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = 1, .pColorAttachmentFormats = &format };
+    VkPipelineColorBlendAttachmentState attachment = { .colorWriteMask = 15 };
+    VkPipelineColorBlendStateCreateInfo blend = { .attachmentCount = 1, .pAttachments = &attachment };
+    if (colour_only) {
+        ci.stageCount = 2; ci.pStages = stages; ci.pNext = &rendering; ci.pColorBlendState = &blend;
+    }
+    g_kva_preserve_required = 1;
+    VkPipeline pipeline;
+    assert(kva_create(test_device.dev, (VkPipelineCache)&test_cache, 1, &ci, &pipeline, colour_only ? fake_create_required_colour : fake_create));
+    pthread_mutex_lock(&test_mu); wait_for(&compiling, 1); pthread_mutex_unlock(&test_mu);
+    bind_request request = { .cb = &request, .pipeline = (uint64_t)pipeline };
+    pthread_t thread; assert(!pthread_create(&thread, NULL, bind_and_draw, &request));
+    pthread_mutex_lock(&test_mu); wait_for(&bind_entered, 1); pthread_mutex_unlock(&test_mu);
+    usleep(20000);
+    pthread_mutex_lock(&test_mu);
+    assert(bind_done == 0 && draws == previous_draws);
+    release_compile = 1; pthread_cond_broadcast(&test_cv);
+    wait_for(&bind_done, 1); pthread_mutex_unlock(&test_mu);
+    assert(!pthread_join(thread, NULL));
+    // No frame-boundary advance: the first shadow pass must already draw.
+    assert((request.bound != 0) == (result == VK_SUCCESS));
+    assert(draws == previous_draws + (result == VK_SUCCESS ? 1 : 0));
+    pthread_mutex_lock(&g_kva_mu);
+    while (g_kva_pending || g_kva_finishing) pthread_cond_wait(&g_kva_ready, &g_kva_mu);
+    pthread_mutex_unlock(&g_kva_mu);
+    assert(kva_destroy_pipeline(test_device.dev, (uint64_t)pipeline, fake_destroy));
+    g_kva_preserve_required = 0;
+}
+
 static void test_demand_priority(void) {
     VkPipelineDepthStencilStateCreateInfo depth = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthWriteEnable = VK_TRUE
@@ -585,6 +660,7 @@ int main(void) {
     VkPipelineCache cache;
     assert(klvk_CreatePipelineCache(test_device.dev, &cache_info, NULL, &cache) == VK_SUCCESS);
     assert(cache_created == 1 && cache_info.flags == VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT);
+    g_kva_preserve_required = 0;
     test_pending_bind(VK_SUCCESS, 0, 0);
     test_pending_bind(VK_ERROR_OUT_OF_DEVICE_MEMORY, 0, 0);
     test_pending_bind(VK_SUCCESS, 1, 0);
@@ -603,6 +679,11 @@ int main(void) {
     assert(private_created > 0 && private_created == private_destroyed);
     assert(kva_bind(&test_device, VK_PIPELINE_BIND_POINT_COMPUTE,
         (uint64_t)&real_pipeline) == (uint64_t)&real_pipeline);
-    puts("async pipelines: nonblocking colour/depth binds, stereo activation, demand priority, cache snapshots and lifetime OK");
+    test_first_use_policy();
+    test_required_depth(VK_SUCCESS, 0);
+    test_required_depth(VK_SUCCESS, 1);
+    test_required_depth(VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
+    test_required_depth(VK_ERROR_OUT_OF_DEVICE_MEMORY, 1);
+    puts("async pipelines: required first-use offscreen/depth, nonblocking scene materials, stereo activation, demand priority, cache snapshots and lifetime OK");
     return 0;
 }
