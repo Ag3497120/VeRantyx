@@ -49,10 +49,7 @@ static void test_shadow_depth(VkPhysicalDevice physical, uint32_t family, const 
     VkPipeline pipeline; assert(kva_create(device.dev, cache, 1, &ci, &pipeline, pCreateGraphicsPipelines));
     // This test verifies GPU depth after the background material is available.
     // The nonblocking recording path is covered by the stalled-compiler test.
-    pthread_mutex_lock(&g_kva_mu);
-    while (g_kva_pending || g_kva_finishing) pthread_cond_wait(&g_kva_ready, &g_kva_mu);
-    pthread_mutex_unlock(&g_kva_mu);
-    kl_vulkan_async_begin_frame();
+    // Bind immediately: the first depth draw must survive cold compilation.
     VkPipeline real = (VkPipeline)kva_bind(&ci, VK_PIPELINE_BIND_POINT_GRAPHICS, (uint64_t)pipeline); assert(real);
 
     VkImageCreateInfo image_ci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
@@ -115,7 +112,7 @@ static void test_shadow_depth(VkPhysicalDevice physical, uint32_t family, const 
     float *pixels; assert(pMapMemory(device.dev, buffer_memory, 0, 64, 0, (void **)&pixels) == VK_SUCCESS);
     for (int i = 0; i < 16; i++) assert(pixels[i] == 0.0f);
     pUnmapMemory(device.dev, buffer_memory);
-    puts("shadow depth: ignored blend state, ready-frame draw retained, 16 GPU depth pixels verified");
+    puts("shadow depth: ignored blend state, first-use draw retained, 16 GPU depth pixels verified");
     pDestroyFence(device.dev, fence, NULL); pDestroyCommandPool(device.dev, pool, NULL);
     pDestroyFramebuffer(device.dev, framebuffer, NULL); pDestroyImageView(device.dev, view, NULL);
     pDestroyImage(device.dev, image, NULL); pFreeMemory(device.dev, image_memory, NULL);
