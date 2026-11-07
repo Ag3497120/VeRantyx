@@ -1,0 +1,224 @@
+{
+  "date": "2026-10-26",
+  "environment": "M3 Max / 36 GB, Quest 3, USB, MoltenVR; original and paired modified clients",
+  "measurement": "Reported stream/headset telemetry, not optical motion-to-photon. No VeRantyx harness measurement.",
+  "rows": [
+    {
+      "source_record": "Live-20261026-123213.json",
+      "source_sha256": "a573aa594b4fcc4c0c1bc6ff672919f1f3617fb9bb7eff596757985ef473cc2b",
+      "variant": "modified-high-resolution",
+      "per_eye": [
+        2368,
+        2560
+      ],
+      "samples": 21,
+      "target_mbps": 2000,
+      "requested_hz": 72,
+      "metrics": {
+        "actual_mbps": {
+          "mean": 2000.022380952381,
+          "min": 1988.58,
+          "max": 2020.81
+        },
+        "sender_fps": {
+          "mean": 72.00952380952381,
+          "min": 71.6,
+          "max": 72.8
+        },
+        "encode_ms": {
+          "mean": 5.372857142857143,
+          "min": 5.05,
+          "max": 5.81
+        },
+        "decode_ms": {
+          "mean": 9.77047619047619,
+          "min": 9.22,
+          "max": 10.37
+        },
+        "reported_headset_e2e_ms": {
+          "mean": 47.84285714285714,
+          "min": 43.2,
+          "max": 58.0
+        },
+        "reported_headset_fps": {
+          "mean": 71.98571428571428,
+          "min": 71.0,
+          "max": 73.2
+        }
+      }
+    },
+    {
+      "source_record": "Live-Test-20261026.json",
+      "source_sha256": "924294cc1e87d8d6d198f129926841ca6b5bf9a88745ddd238de7b3e89588740",
+      "variant": "modified-2144-a",
+      "per_eye": [
+        2144,
+        2304
+      ],
+      "samples": 21,
+      "target_mbps": 2000,
+      "requested_hz": 72,
+      "metrics": {
+        "actual_mbps": {
+          "mean": 1953.9090476190477,
+          "min": 1825.9,
+          "max": 2024.32
+        },
+        "sender_fps": {
+          "mean": 72.0,
+          "min": 70.9,
+          "max": 73.0
+        },
+        "encode_ms": {
+          "mean": 4.962380952380952,
+          "min": 4.54,
+          "max": 5.6
+        },
+        "decode_ms": {
+          "mean": 7.225238095238096,
+          "min": 6.68,
+          "max": 8.31
+        },
+        "reported_headset_e2e_ms": {
+          "mean": 43.542857142857144,
+          "min": 42.0,
+          "max": 47.3
+        },
+        "reported_headset_fps": {
+          "mean": 71.99047619047619,
+          "min": 70.9,
+          "max": 73.1
+        }
+      }
+    },
+    {
+      "source_record": "Live-Test-Repeat-20261026.json",
+      "source_sha256": "38cd2aac6a4af66b99683b78c0a65c440b51420d806787024de01fb7063f5894",
+      "variant": "modified-2144-b",
+      "per_eye": [
+        2144,
+        2304
+      ],
+      "samples": 21,
+      "target_mbps": 2000,
+      "requested_hz": 72,
+      "metrics": {
+        "actual_mbps": {
+          "mean": 1962.4276190476191,
+          "min": 1826.96,
+          "max": 2020.71
+        },
+        "sender_fps": {
+          "mean": 71.98571428571428,
+          "min": 71.6,
+          "max": 72.8
+        },
+        "encode_ms": {
+          "mean": 4.41,
+          "min": 4.19,
+          "max": 4.58
+        },
+        "decode_ms": {
+          "mean": 8.039523809523809,
+          "min": 7.53,
+          "max": 8.81
+        },
+        "reported_headset_e2e_ms": {
+          "mean": 46.39523809523809,
+          "min": 42.6,
+          "max": 54.0
+        },
+        "reported_headset_fps": {
+          "mean": 71.99047619047619,
+          "min": 71.0,
+          "max": 73.0
+        }
+      }
+    },
+    {
+      "source_record": "Live-Original-Repeat-20261026.json",
+      "source_sha256": "b582f632baecaa3dc862cc8a31cba021ace8ea354821cfb92d51bf1266d77891",
+      "variant": "original-2144",
+      "per_eye": [
+        2144,
+        2304
+      ],
+      "samples": 21,
+      "target_mbps": 2000,
+      "requested_hz": 72,
+      "metrics": {
+        "actual_mbps": {
+          "mean": 1978.5580952380951,
+          "min": 1828.04,
+          "max": 2022.63
+        },
+        "sender_fps": {
+          "mean": 71.97619047619048,
+          "min": 71.6,
+          "max": 72.9
+        },
+        "encode_ms": {
+          "mean": 4.088571428571429,
+          "min": 3.86,
+          "max": 4.54
+        },
+        "decode_ms": {
+          "mean": 11.132857142857143,
+          "min": 10.45,
+          "max": 12.13
+        },
+        "reported_headset_e2e_ms": {
+          "mean": 48.68571428571428,
+          "min": 45.9,
+          "max": 55.4
+        },
+        "reported_headset_fps": {
+          "mean": 71.96666666666667,
+          "min": 70.9,
+          "max": 73.0
+        }
+      }
+    },
+    {
+      "source_record": "Live-HighBitrate-20261026.json",
+      "source_sha256": "c2409764797539c579961e219a049013a23f3731348a23ac6dec00e29914c137",
+      "variant": "overload-reference",
+      "per_eye": null,
+      "samples": 21,
+      "target_mbps": 2000,
+      "requested_hz": 72,
+      "metrics": {
+        "actual_mbps": {
+          "mean": 1995.1976190476191,
+          "min": 1889.34,
+          "max": 2022.55
+        },
+        "sender_fps": {
+          "mean": 72.01904761904763,
+          "min": 71.7,
+          "max": 72.8
+        },
+        "encode_ms": {
+          "mean": 5.08,
+          "min": 4.08,
+          "max": 5.93
+        },
+        "decode_ms": {
+          "mean": 28.67809523809524,
+          "min": 27.65,
+          "max": 30.55
+        },
+        "reported_headset_e2e_ms": {
+          "mean": 88.52380952380952,
+          "min": 71.7,
+          "max": 205.1
+        },
+        "reported_headset_fps": {
+          "mean": 65.70476190476191,
+          "min": 61.9,
+          "max": 66.9
+        }
+      }
+    }
+  ]
+}
