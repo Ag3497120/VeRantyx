@@ -1,7 +1,9 @@
 // Shared state of the VeRantyx OpenVR runtime: shared memory with the Mac
 // encoder, pose sampling, display pacing, events. See vr_runtime.h.
+#include "display_cadence.h"
 #include "vr_runtime.h"
 #include "json_mini.h"
+#include "pose_history.h"
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -107,6 +109,7 @@ static uint8_t *g_pixels[2];
 static std::mutex g_mu;
 static PoseSet g_last;
 static std::mutex g_sampleMu;
+static HandPoseHistory g_handHistory;
 static std::deque<vr::VREvent_t> g_events;
 static std::mutex g_evmu;
 static double g_epoch;
@@ -514,6 +517,12 @@ void sample_poses(PoseSet *out, double predictSeconds) {
             p.bPoseIsValid = false;
         }
     }
+    if(inputsFresh)g_handHistory.add(out->visionTimestamp,out->dev+1);
+}
+
+bool hand_pose_at(int hand,double time,vr::TrackedDevicePose_t *out) {
+    std::lock_guard<std::mutex> guard(g_sampleMu);
+    return g_handHistory.sample(hand,time,out);
 }
 
 PoseSet last_poses() { std::lock_guard<std::mutex> l(g_mu); return g_last; }
@@ -525,6 +534,36 @@ uint64_t frame_counter() { return g_frameCounter.load(std::memory_order_relaxed)
 double seconds_since_vsync() { return now_seconds() - g_lastVsync.load(std::memory_order_relaxed); }
 
 void wait_next_vsync() {
+    // The bridge publishes tracking on xrWaitFrame. Follow that cadence instead
+    // of a second free-running clock, while retaining a bounded fallback.
+    static const bool bridgeSync = env_number("VERANTYX_SYNC_TRACKING", 0, 0, 1) >= 1.0;
+    static uint32_t lastBridgeSequence = 0;
+    static bool bridgeSequenceValid = false;
+    static double lastBridgeAt = 0;
+    if (bridgeSync && !g_cfg.bench && g_hdr) {
+        const double deadline = now_seconds() + 2.0 * display_period();
+        do {
+            uint32_t seq = (uint32_t)__atomic_load_n(&g_hdr->poseSequence, __ATOMIC_ACQUIRE);
+            if (!(seq & 1) && (!bridgeSequenceValid || seq != lastBridgeSequence)) {
+                SharedHands hands{};
+                if (read_hands(&hands) && hands.headTracked &&
+                    now_seconds() - hands.visionTimestamp < 0.1) {
+                    const double sampledAt = now_seconds();
+                    const uint64_t intervals = bridgeSequenceValid
+                        ? bridge_display_intervals(seq, lastBridgeSequence, sampledAt-lastBridgeAt, display_period()) : 1;
+                    lastBridgeSequence = seq; lastBridgeAt = sampledAt; bridgeSequenceValid = true;
+                    g_lastVsync = sampledAt;
+                    g_frameCounter.fetch_add(intervals, std::memory_order_relaxed);
+                    return;
+                }
+            }
+            struct timespec pause{0, 200000};
+            nanosleep(&pause, nullptr);
+        } while (now_seconds() < deadline);
+    }
+    // A fallback already advances the engine clock; do not count those same
+    // bridge intervals again when tracking resumes.
+    bridgeSequenceValid = false;
     const double period = display_period();
     double now = now_seconds();
     uint64_t prev = g_frameCounter.load(std::memory_order_relaxed);
@@ -544,7 +583,8 @@ void wait_next_vsync() {
     }
     while (now_seconds() < target) { /* spin the last millisecond */ }
     g_lastVsync = target;
-    g_frameCounter = n;
+    const uint64_t previous = g_frameCounter.load(std::memory_order_relaxed);
+    g_frameCounter = std::max(n, previous+1);
 }
 
 // ---- events ----

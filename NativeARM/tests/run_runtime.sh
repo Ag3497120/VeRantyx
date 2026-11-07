@@ -11,3 +11,5 @@ printf '%s\n' '-1.2 0.8 -1 1 -0.8 1.2 -1 1' > "$TMP/vr_verantyx_tangents.txt"
 mkdir -p "$TMP/prefix/drive_c"
 "$TEST" --without-shared "$TMP/prefix"
 [[ -z "$(ls -A "$TMP/prefix/drive_c")" ]]
+
+"$TEST" "$TMP/cadence.dat" --cadence-only
