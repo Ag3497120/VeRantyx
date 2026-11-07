@@ -5,6 +5,7 @@
 #include "vr_runtime.h"
 #include "json_mini.h"
 #include "display_color.h"
+#include "frame_timing.h"
 #include <cstring>
 #include <cmath>
 #include <vector>
@@ -430,6 +431,8 @@ public:
     std::mutex m_poseMu;                    // pose queries never wait for render/vsync
     std::mutex m_mu;
     std::mutex m_statsMu;
+    std::mutex m_frameTimingMu;
+    vrrt::FrameCpuTimings m_frameTimings;
 
     ~Compositor() { shutdown(); }
     void resume() {
@@ -441,6 +444,7 @@ public:
         m_rb = Readback();
         m_stopping = false; m_submitted = 0; m_dropFrame = false;
         m_startup = true; m_startupClears = 0;
+        { std::lock_guard<std::mutex> timing(m_frameTimingMu); m_frameTimings.clear(); }
         { std::lock_guard<std::mutex> poses(m_poseMu); m_poseHistory.clear(); m_posePredictionId = 0; }
         m_eyeDone[0] = m_eyeDone[1] = false;
     }
@@ -514,6 +518,8 @@ public:
             m_poseHistory.push_back({m_posePredictionId, sampledAt, set});
             while (m_poseHistory.size() > 64 || sampledAt - m_poseHistory.front().sampledAt > .1) m_poseHistory.pop_front();
         }
+        { std::lock_guard<std::mutex> timing(m_frameTimingMu);
+          m_frameTimings.begin(m_posePredictionId, t0, m_tWaitEnd, set.dev[0]); }
         if (render) copy_poses(set, render, nr);
         if (game) copy_poses(set, game, ng);
         return VRCompositorError_None;
@@ -555,6 +561,14 @@ public:
     }
     EVRCompositorError submit(EVREye eye, const Texture_t *tex, uint32_t layer, const VRTextureBounds_t *bounds, EVRSubmitFlags flags) {
         std::lock_guard<std::mutex> l(m_mu);
+        struct SubmitTimer {
+            Compositor *c; double started = vrrt::now_seconds();
+            ~SubmitTimer() {
+                const double finished = vrrt::now_seconds();
+                std::lock_guard<std::mutex> timing(c->m_frameTimingMu);
+                c->m_frameTimings.submit(finished-started, finished, c->m_submitted == 3 && !c->m_dropFrame);
+            }
+        } submitTimer{this};
         m_submits++;
         if (m_stopping) return VRCompositorError_RequestFailed;
         if (eye != Eye_Left && eye != Eye_Right) return VRCompositorError_IndexOutOfRange;
@@ -764,21 +778,14 @@ public:
     }
     void ClearLastSubmittedFrame() override {}
     void PostPresentHandoff() override {}
-    bool GetFrameTiming(Compositor_FrameTiming *t, uint32_t) override {
-        if (!t) return false;
-        uint32_t size = t->m_nSize;
-        if (size < sizeof(uint32_t)) return false;
-        Compositor_FrameTiming out = {};
-        out.m_nSize = size;
-        out.m_nFrameIndex = (uint32_t)vrrt::frame_counter();
-        out.m_nNumFramePresents = 1;
-        out.m_flSystemTimeInSeconds = vrrt::now_seconds();
-        out.m_flClientFrameIntervalMs = (float)(vrrt::display_period() * 1000.0);
-        out.m_HmdPose = vrrt::last_poses().dev[0];
-        memcpy(t, &out, std::min<uint32_t>(size, sizeof out));
-        return true;
+    bool GetFrameTiming(Compositor_FrameTiming *t, uint32_t framesAgo) override {
+        std::lock_guard<std::mutex> timing(m_frameTimingMu);
+        return m_frameTimings.get(t, framesAgo);
     }
-    uint32_t GetFrameTimings(Compositor_FrameTiming *t, uint32_t n) override { if (n && t) { GetFrameTiming(t, 0); return 1; } return 0; }
+    uint32_t GetFrameTimings(Compositor_FrameTiming *t, uint32_t n) override {
+        std::lock_guard<std::mutex> timing(m_frameTimingMu);
+        return m_frameTimings.range(t, n);
+    }
     float GetFrameTimeRemaining() override { float r = (float)(vrrt::display_period() - vrrt::seconds_since_vsync()); return r > 0 ? r : 0.f; }
     void GetCumulativeStats(Compositor_CumulativeStats *s, uint32_t n) override { if (s) memset(s, 0, n); if (s && n >= sizeof(uint32_t) * 2) s->m_nNumFramePresents = m_published; }
     void FadeToColor(float seconds, float r, float g, float b, float a, bool background) override {
