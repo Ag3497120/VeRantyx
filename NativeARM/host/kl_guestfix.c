@@ -28,6 +28,12 @@ typedef struct {
 } fix_t;
 
 static const fix_t g_fixes[] = {
+    // Preserve the Deckard three-preset selection through the engine's own
+    // archived-convar save/load path. Keep every existing flag and callback.
+    { "libclient.so", 0xfab1cc, 1, 0xeec63887f56b000cull,
+      { 0xd2841003u },
+      "archive vr_perf_mode_override2 (preserve selected graphics preset)" },
+
     // libvideo: the video decoder's profiling-scope exit (a CVProfNode-style
     // ExitScope) reads node->recursion at +0x48 with no check. The NULL node
     // came from a wrong tgkill answer (fixed in kl_glibc.c: the profiler
