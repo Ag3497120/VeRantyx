@@ -331,7 +331,7 @@ public:
         if (buttons & vrrt::kBtnStickTouch) s.ulButtonTouched |= ButtonMaskFromId(k_EButton_SteamVR_Touchpad);
         if (buttons & vrrt::kBtnMenu) s.ulButtonPressed |= ButtonMaskFromId(k_EButton_System);
         if (trig >= 0.75f) s.ulButtonPressed |= ButtonMaskFromId(k_EButton_SteamVR_Trigger);
-        if (trig > 0.05f) s.ulButtonTouched |= ButtonMaskFromId(k_EButton_SteamVR_Trigger);
+        if ((buttons & vrrt::kBtnTriggerTouch) || trig > 0.05f) s.ulButtonTouched |= ButtonMaskFromId(k_EButton_SteamVR_Trigger);
         if (grip >= 0.75f) s.ulButtonPressed |= ButtonMaskFromId(k_EButton_Grip);
         s.rAxis[0].x = p.inputsFresh ? (left ? h.leftStickX : h.rightStickX) : 0.f;
         s.rAxis[0].y = p.inputsFresh ? (left ? h.leftStickY : h.rightStickY) : 0.f;
