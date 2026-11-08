@@ -30,7 +30,17 @@ static wgl_context *create_context(int core, wgl_context *share) {
         kCGLPFAAccelerated, kCGLPFAAllowOfflineRenderers, (CGLPixelFormatAttribute)0 };
     CGLPixelFormatObj pf = NULL;
     GLint n = 0;
-    if (CGLChoosePixelFormat(attrs, &pf, &n) != kCGLNoError || !pf) { vx_log("OpenGL: no %s pixel format", core ? "core" : "legacy"); return NULL; }
+    if (CGLChoosePixelFormat(attrs, &pf, &n) != kCGLNoError || !pf) {
+        // No accelerated renderer (a VM, or a Mac where the GPU is off): the software renderer, as Windows'
+        // GDI Generic would be (a game without GPU OpenGL still gets a context, not a failure).
+        CGLPixelFormatAttribute soft[] = {
+            kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)(core ? kCGLOGLPVersion_GL4_Core : kCGLOGLPVersion_Legacy),
+            kCGLPFAColorSize, (CGLPixelFormatAttribute)24, kCGLPFAAlphaSize, (CGLPixelFormatAttribute)8,
+            kCGLPFADepthSize, (CGLPixelFormatAttribute)24, kCGLPFAStencilSize, (CGLPixelFormatAttribute)8,
+            (CGLPixelFormatAttribute)0 };
+        if (CGLChoosePixelFormat(soft, &pf, &n) != kCGLNoError || !pf) { vx_log("OpenGL: no %s pixel format", core ? "core" : "legacy"); return NULL; }
+        vx_log("OpenGL: %s profile on the software renderer (no accelerated pixel format)", core ? "core" : "legacy");
+    }
     pthread_mutex_lock(&g_lock);
     CGLContextObj ctx = NULL;
     CGLError e = CGLCreateContext(pf, share && share->core == core ? share->cgl : g_share[core], &ctx);

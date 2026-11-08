@@ -1,0 +1,41 @@
+name: CI
+
+# The full VXRuntime test suite (`make -C VXRuntime check`): host unit tests, the Windows
+# .exe tests run through build/vxrt (an x86-64 binary: Rosetta 2, preinstalled on the arm64
+# macOS images), the shader translators, and the Python tests of the launch scripts.
+# One suite needs Hypervisor.framework (the x86->ARM64 difftest), which GitHub's macOS
+# runners do not have (VMs, no nested virtualization): the Makefile skips it there.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vxrt-tests:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image's default Xcode is 16.4; the runtime uses the macOS 26 SDK's Metal 4 and
+      # MetalFX APIs, so build with the newest Xcode 26 on the image (the dev Mac: 26.3).
+      - name: Select Xcode 26 (macOS 26 SDK)
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+
+      - name: Ensure Rosetta 2 (for the x86-64 build/vxrt)
+        run: |
+          if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: Install the MinGW cross compiler (Windows test .exe)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install mingw-w64
+
+      - name: make -C VXRuntime check
+        run: make -C VXRuntime check

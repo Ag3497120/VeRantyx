@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 
@@ -18,6 +19,9 @@ def run(cache, *args, **extra):
 with tempfile.TemporaryDirectory(prefix="shader-cache-", dir="build") as directory:
     root = Path(directory).resolve()
     cold = run(root / "normal")
+    if cold.get("skipped"):
+        print(f"shader cache: skipped ({cold.get('device', 'unknown device')}: no binary-archive round-trip in a VM) -> ok")
+        sys.exit(0)
     assert cold["source_compiles"] == 3 and cold["library_memory_hits"] == 32, cold
     assert cold["pipeline_misses"] == 6 and cold["archives_saved"] == 6 and cold["errors"] == 0, cold
     warm = run(root / "normal")

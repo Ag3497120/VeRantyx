@@ -4362,17 +4362,22 @@ static int texture_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     CHECK(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&occ));
     qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     qd.Count = 2;
-    CHECK(ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&ts));
+    // Timestamps are a GPU counter feature (Metal's counter sampling); where the GPU has none, the runtime refuses
+    // the heap (E_FAIL) and the timestamp parts are skipped. Windows has no feature flag for direct-queue timestamps
+    // to ask instead (CopyQueueTimestampQueriesSupported is copy queues only).
+    int timestamps = ID3D12Device_CreateQueryHeap(dev, &qd, &IID_ID3D12QueryHeap, (void **)&ts) == S_OK;
     UINT64 freq = 0, gpu0 = 0, cpu0 = 0;
-    CHECK(ID3D12CommandQueue_GetTimestampFrequency(queue, &freq));
-    CHECK(ID3D12CommandQueue_GetClockCalibration(queue, &gpu0, &cpu0));
+    if (timestamps) {
+        CHECK(ID3D12CommandQueue_GetTimestampFrequency(queue, &freq));
+        CHECK(ID3D12CommandQueue_GetClockCalibration(queue, &gpu0, &cpu0));
+    }
     if (bad) return 1;
 
     ID3D12CommandAllocator *alloc;
     CHECK(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc));
     ID3D12GraphicsCommandList *list;
     CHECK(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
-    ID3D12GraphicsCommandList_EndQuery(list, ts, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    if (timestamps) ID3D12GraphicsCommandList_EndQuery(list, ts, D3D12_QUERY_TYPE_TIMESTAMP, 0);
     D3D12_TEXTURE_COPY_LOCATION from = { up, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
     from.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 256 };
     D3D12_TEXTURE_COPY_LOCATION to = { tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
@@ -4414,7 +4419,7 @@ static int texture_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, grey, 0, NULL);
     ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
     ID3D12GraphicsCommandList_EndQuery(list, occ, D3D12_QUERY_TYPE_OCCLUSION, 3);
-    ID3D12GraphicsCommandList_EndQuery(list, ts, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    if (timestamps) ID3D12GraphicsCommandList_EndQuery(list, ts, D3D12_QUERY_TYPE_TIMESTAMP, 1);
     ID3D12DescriptorHeap *shader_heaps[] = { srvs, sampler_heap };
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, shader_heaps);
     ID3D12GraphicsCommandList_SetPipelineState(list, sampler_pso);
@@ -4426,7 +4431,7 @@ static int texture_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     ID3D12GraphicsCommandList_ResolveQueryData(list, occ, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, qrb, 0);
     ID3D12GraphicsCommandList_ResolveQueryData(list, occ, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1, qrb, 8);
     ID3D12GraphicsCommandList_ResolveQueryData(list, occ, D3D12_QUERY_TYPE_OCCLUSION, 2, 1, qrb, 16);
-    ID3D12GraphicsCommandList_ResolveQueryData(list, ts, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, qrb, 24);
+    if (timestamps) ID3D12GraphicsCommandList_ResolveQueryData(list, ts, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, qrb, 24);
     ID3D12GraphicsCommandList_ResolveQueryData(list, occ, D3D12_QUERY_TYPE_OCCLUSION, 3, 1, qrb, 40);
     D3D12_TEXTURE_COPY_LOCATION dst = { rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
     dst.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256 };
@@ -4593,12 +4598,17 @@ static int texture_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     UINT64 *q;
     CHECK(ID3D12Resource_Map(qrb, 0, NULL, (void **)&q));
     UINT64 gpu1 = 0, cpu1 = 0;
-    ID3D12CommandQueue_GetClockCalibration(queue, &gpu1, &cpu1);
-    int queries = q[0] == 4096 && q[1] == 1 && q[2] == 0 && q[5] == 8192 && freq == 1000000000 && q[3] >= gpu0 && q[4] >= q[3] && q[4] <= gpu1;
-    printf("d3d12 queries: occlusion %llu samples (want 4096), binary %llu (want 1), empty %llu (want 0), across two passes %llu (want 8192), timestamps %.3f ms apart "
-           "within the calibrations' %.3f ms: %s\n", (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2],
-           (unsigned long long)q[5], (q[4] - q[3]) / 1e6, (gpu1 - gpu0) / 1e6, queries ? "ok" : "FAILED");
-    if (!queries) { printf("  timestamps %llu %llu, calibration %llu .. %llu\n", (unsigned long long)q[3], (unsigned long long)q[4], (unsigned long long)gpu0, (unsigned long long)gpu1); bad++; }
+    if (timestamps) ID3D12CommandQueue_GetClockCalibration(queue, &gpu1, &cpu1);
+    int queries = q[0] == 4096 && q[1] == 1 && q[2] == 0 && q[5] == 8192 &&
+                  (!timestamps || (freq == 1000000000 && q[3] >= gpu0 && q[4] >= q[3] && q[4] <= gpu1));
+    if (timestamps)
+        printf("d3d12 queries: occlusion %llu samples (want 4096), binary %llu (want 1), empty %llu (want 0), across two passes %llu (want 8192), timestamps %.3f ms apart "
+               "within the calibrations' %.3f ms: %s\n", (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2],
+               (unsigned long long)q[5], (q[4] - q[3]) / 1e6, (gpu1 - gpu0) / 1e6, queries ? "ok" : "FAILED");
+    else
+        printf("d3d12 queries: occlusion %llu samples (want 4096), binary %llu (want 1), empty %llu (want 0), across two passes %llu (want 8192), timestamps unsupported: %s\n",
+               (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[5], queries ? "ok" : "FAILED");
+    if (!queries) { if (timestamps) printf("  timestamps %llu %llu, calibration %llu .. %llu\n", (unsigned long long)q[3], (unsigned long long)q[4], (unsigned long long)gpu0, (unsigned long long)gpu1); bad++; }
     ID3D12Resource_Unmap(qrb, 0, NULL);
     printf("d3d12 texture: heaps, placed buffers and textures (aliased buffers share memory, one past the end refused), "
            "texture upload and CopyResource, SRV descriptor table, static and descriptor-table samplers, %d of 4096 pixels wrong: %s\n",

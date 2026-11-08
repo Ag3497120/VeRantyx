@@ -407,7 +407,9 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 5; i++) CHECK(DwmFlush() == S_OK);
     QueryPerformanceCounter(&t1);
     double flush_ms = (double)(t1.QuadPart - t0.QuadPart) / f.QuadPart * 1e3 / 5;
-    CHECK(flush_ms > 1 && flush_ms < 60);
+    // One compositor flush: a frame on a real display, up to ~67 ms on a virtual one at 15 Hz. The bounds reject
+    // only an instant return and a pathological hang, not the display's own rate.
+    CHECK(flush_ms > 1 && flush_ms < 500);
     printf("present: ready; perf frame %08lx\n", (unsigned long)last);
     fflush(stdout);
     if (alone) PostMessageA(g_main, WM_CLOSE, 0, 0);

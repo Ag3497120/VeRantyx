@@ -65,7 +65,7 @@ static int run(id<MTLDevice> dev, int mode, MTLPixelFormat cf, MTLPixelFormat of
         [e endEncoding];
         vxu_frame f = { (__bridge void *)color, (__bridge void *)depth, (__bridge void *)mv, (__bridge void *)out, rw, rh, W, H,
                         jx * (getenv("VXU_JSX") ? (float)atof(getenv("VXU_JSX")) : js), jy * (getenv("VXU_JSY") ? (float)atof(getenv("VXU_JSY")) : js), (float)rw, (float)rh, 1.0f, i == 0, 1, 0, 1, getenv("VXU_SYNC") != NULL };
-        char why[512]; int note;
+        char why[512]; int note = 0;
         if ((i < 100 || !getenv("VXU_BASE")) && vxu_encode((__bridge void *)cb, mode, &f, why, sizeof why, &note)) { printf("  encode failed: %s\n", why); return 1; }
         if (note && i == 0) printf("  %s\n", why);
         if (i < 100) { [cb commit]; [cb waitUntilCompleted]; if (cb.error) { printf("  GPU error: %s\n", cb.error.localizedDescription.UTF8String); return 1; } }

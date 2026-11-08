@@ -1441,7 +1441,7 @@ check-run:
 	build/dxil2msl -vs tests/shaders12/tess_vs.dxil -hs tests/shaders12/tess_hs.dxil tests/shaders12/tess_ds.dxil
 	build/dxil2msl -vs tests/shaders12/passcolor_vs.dxil tests/shaders12/quad_gs.dxil
 	build/dxilrun tests/shaders12
-	build/difftest build/ref_x86 200
+	@if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$$'; then build/difftest build/ref_x86 200; else echo "difftest: no Hypervisor.framework here (a VM, e.g. a CI runner), skipped"; fi
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
