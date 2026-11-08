@@ -268,19 +268,27 @@ static void macvr_draw_floating_hud(id<MTLCommandBuffer> cb,
 // ============================================================================
 // Pass Hook: Capture Scene Reversed-Z Depth Buffer
 // ============================================================================
-static void macvr_on_pass(id cbObj, id colorObj, id depthObj, int loadAction) {
+static void macvr_on_pass(id cbObj, id colorObj, id depthObj, int storesDepth, unsigned draws) {
+    (void)colorObj;
     id<MTLCommandBuffer> cb = cbObj;
     id<MTLTexture> dt = depthObj;
-    if (!cb || !dt) return;
+    if (!cb || !dt || !storesDepth || !draws) return;
+    if (dt.parentTexture && dt.parentTexture.pixelFormat == dt.pixelFormat && dt.parentTexture.width == dt.width) {
+        dt = dt.parentTexture;
+    }
+    if (dt.sampleCount > 1) return;
+    if (!(dt.textureType == MTLTextureType2D || (dt.textureType == MTLTextureType2DArray && dt.arrayLength == 1))) return;
 
-    // Capture the primary scene depth buffer (cleared at start of G-buffer, >= 640x360)
+    // Capture the primary scene depth buffer (>= 640x360, Depth32Float or Depth32Float_Stencil8)
     MTLPixelFormat fmt = dt.pixelFormat;
     if (fmt != MTLPixelFormatDepth32Float_Stencil8 && fmt != MTLPixelFormatDepth32Float) return;
-    if (dt.width < 640 || dt.height < 360 || dt.textureType != MTLTextureType2D) return;
-    if (loadAction != (int)MTLLoadActionClear) return;
+    if (dt.width < 640 || dt.height < 360) return;
 
     unsigned pf = atomic_load(&g_present_frame) + 1;
-    if (atomic_exchange(&g_depth_captured_frame, pf) == pf) return;
+    // Allow later passes at the same or larger resolution in the same frame to overwrite the depth buffer
+    // (just like VXpro xros_vr.m line 256: "The last pass of the frame at that size wins")
+    if (atomic_load(&g_depth_captured_frame) == pf && dt.width < g_depth_w) return;
+    atomic_store(&g_depth_captured_frame, pf);
 
     NSUInteger w = dt.width, h = dt.height;
     NSUInteger row_bytes = ((w * 4) + 255) & ~(NSUInteger)255;
@@ -295,7 +303,8 @@ static void macvr_on_pass(id cbObj, id colorObj, id depthObj, int loadAction) {
         td.usage = MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
         g_depth_tex = [g_depth_buf newTextureWithDescriptor:td offset:0 bytesPerRow:row_bytes];
-        macvr_log("Scene depth capture buffer allocated: %lux%lu (fmt=%lu)", (unsigned long)w, (unsigned long)h, (unsigned long)fmt);
+        macvr_log("Scene depth capture buffer allocated: %lux%lu (fmt=%lu, type=%lu)",
+                  (unsigned long)w, (unsigned long)h, (unsigned long)fmt, (unsigned long)dt.textureType);
     }
     if (!g_depth_buf) return;
 

@@ -13,7 +13,7 @@ extern "C" {
 void macvr_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // Hooks installed by macvr_metal.m and called per pass / per drawable present
-typedef void (*macvr_pass_fn)(id commandBuffer, id colorTex, id depthTex, int loadAction);
+typedef void (*macvr_pass_fn)(id commandBuffer, id colorTex, id depthTex, int storesDepth, unsigned draws);
 typedef void (*macvr_present_fn)(id commandBuffer, id drawable);
 
 void macvr_set_pass_hook(macvr_pass_fn fn);

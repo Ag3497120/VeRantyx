@@ -4,6 +4,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -358,7 +359,7 @@ void *macvr_hud_take(void) {
 @property (nonatomic, strong) id<MTLCommandBuffer> cb;
 @property (nonatomic, strong) id<MTLTexture> color;
 @property (nonatomic, strong) id<MTLTexture> depth;
-@property (nonatomic, assign) int loadAction;
+@property (nonatomic, assign) int storesDepth;
 @property (nonatomic, assign) int ui;
 @property (nonatomic, assign) int ui_hud;
 @property (nonatomic, assign) NSUInteger slice;
@@ -726,7 +727,7 @@ static void h_end_enc(id self, SEL s) {
         objc_setAssociatedObject(self, kEncActionKey, nil, OBJC_ASSOCIATION_ASSIGN);
         if (act.ui == 2) macvr_ui_end(act);
         if (g_pass_hook && (act.color || act.depth)) {
-            g_pass_hook(act.cb, act.color, act.depth, act.loadAction);
+            g_pass_hook(act.cb, act.color, act.depth, act.storesDepth, act.draws);
         }
     }
 }
@@ -946,7 +947,9 @@ static id h_render_enc(id self, SEL s, MTLRenderPassDescriptor *desc) {
         act.cb = self;
         act.color = c0;
         act.depth = dt;
-        act.loadAction = dt ? (int)desc.depthAttachment.loadAction : -1;
+        MTLStoreAction dsa = dt ? desc.depthAttachment.storeAction : MTLStoreActionDontCare;
+        act.storesDepth = (dt && (dsa == MTLStoreActionStore || dsa == MTLStoreActionStoreAndMultisampleResolve) &&
+                           desc.depthAttachment.loadAction != MTLLoadActionClear && c0 != nil) ? 1 : 0;
         act.ui = ui_cand ? 1 : 0;
         act.ui_hud = (ui_cand && c0.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB && c0.mipmapLevelCount > 1);
         act.slice = desc.colorAttachments[0].slice;
@@ -1005,6 +1008,128 @@ static BOOL h_fi_supports_device(id self, SEL s, id<MTLDevice> dev) {
     return NO;
 }
 
+// ============================================================================
+// BackgroundAssets Stand-In (for Cyberpunk 2.5.0, from vxkit.m)
+// ============================================================================
+@interface MacVRAssetPack : NSObject
+@property (copy) NSString *identifier;
+@property NSInteger downloadSize;
+@property NSInteger version;
+@property (copy) NSData *userInfo;
+@end
+@implementation MacVRAssetPack
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)s { return [NSMethodSignature signatureWithObjCTypes:"v@:"]; }
+- (void)forwardInvocation:(NSInvocation *)i { (void)i; }
+@end
+
+@interface MacVRAssetPackManager : NSObject
+@property (weak) id delegate;
+@end
+
+static NSString *macvr_ap_root(void) {
+    static NSString *root = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *exe = [[NSBundle mainBundle] executablePath];
+        NSString *contents = exe ? [[exe stringByDeletingLastPathComponent] stringByDeletingLastPathComponent] : nil;
+        for (NSString *sub in @[ @"Data/archive/mac", @"Data/archive/Mac", @"Data/archive/pc" ]) {
+            NSString *p = [contents stringByAppendingPathComponent:sub];
+            BOOL isDir = NO;
+            if (p && [[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&isDir] && isDir) {
+                root = p;
+                break;
+            }
+        }
+        macvr_log("BackgroundAssets stand-in root: %s", root ? root.UTF8String : "(none)");
+    });
+    return root;
+}
+
+static NSString *macvr_ap_lang(NSString *ident) {
+    NSString *s = ident ?: @"";
+    for (NSString *p in @[ @"bg-lang--", @"lang_", @"lang-" ]) {
+        if ([s hasPrefix:p]) s = [s substringFromIndex:p.length];
+    }
+    if ([s hasSuffix:@"_voice"]) s = [s substringToIndex:s.length - 6];
+    return s;
+}
+
+static BOOL macvr_ap_present(NSString *ident) {
+    NSString *r = macvr_ap_root();
+    NSString *l = macvr_ap_lang(ident);
+    if (!r || !l.length) return NO;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    return [fm fileExistsAtPath:[r stringByAppendingFormat:@"/content/lang_%@_voice.archive", l]] ||
+           [fm fileExistsAtPath:[r stringByAppendingFormat:@"/content/%@_voice.archive", l]];
+}
+
+static NSError *macvr_ap_err(NSString *msg) {
+    return [NSError errorWithDomain:@"BAManagedErrorDomain" code:0 userInfo:@{ NSLocalizedDescriptionKey: msg }];
+}
+
+static MacVRAssetPack *macvr_ap_make(NSString *ident) {
+    MacVRAssetPack *p = [MacVRAssetPack new];
+    p.identifier = ident;
+    p.version = 1;
+    return p;
+}
+
+@implementation MacVRAssetPackManager
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)s { return [NSMethodSignature signatureWithObjCTypes:"v@:"]; }
+- (void)forwardInvocation:(NSInvocation *)i { (void)i; }
+- (void)getAllAssetPacksWithCompletionHandler:(void (^)(NSSet *, NSError *))h {
+    NSMutableSet *s = [NSMutableSet set];
+    NSString *r = macvr_ap_root();
+    NSArray *files = r ? [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[r stringByAppendingPathComponent:@"content"] error:nil] : @[];
+    for (NSString *f in files) {
+        if ([f hasPrefix:@"lang_"] && [f hasSuffix:@"_voice.archive"]) {
+            [s addObject:macvr_ap_make([f stringByDeletingPathExtension])];
+        }
+    }
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(s, nil); });
+}
+- (void)getAssetPackWithIdentifier:(NSString *)i completionHandler:(void (^)(id, NSError *))h {
+    BOOL ok = macvr_ap_present(i);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(ok ? macvr_ap_make(i) : nil, ok ? nil : macvr_ap_err(@"not on this device")); });
+}
+- (void)getStatusOfAssetPackWithIdentifier:(NSString *)i completionHandler:(void (^)(NSUInteger, NSError *))h {
+    BOOL ok = macvr_ap_present(i);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(ok ? (1u << 2) : 0, ok ? nil : macvr_ap_err(@"not on this device")); });
+}
+- (void)ensureLocalAvailabilityOfAssetPack:(id)p completionHandler:(void (^)(NSError *))h {
+    NSString *i = [p respondsToSelector:@selector(identifier)] ? [p identifier] : nil;
+    BOOL ok = i && macvr_ap_present(i);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(ok ? nil : macvr_ap_err(@"not on this device")); });
+}
+- (void)checkForUpdatesWithCompletionHandler:(void (^)(NSSet *, NSSet *, NSError *))h {
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h([NSSet set], [NSSet set], nil); });
+}
+- (void)removeAssetPackWithIdentifier:(NSString *)i completionHandler:(void (^)(NSError *))h {
+    (void)i;
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(nil); });
+}
+- (int)fileDescriptorForPath:(NSString *)path searchingInAssetPackWithIdentifier:(NSString *)i error:(NSError **)err {
+    (void)i;
+    NSString *r = macvr_ap_root();
+    int fd = r ? open([r stringByAppendingPathComponent:path].fileSystemRepresentation, O_RDONLY) : -1;
+    if (fd < 0 && err) *err = macvr_ap_err(@"no such file in asset packs");
+    return fd;
+}
+- (NSData *)contentsAtPath:(NSString *)path searchingInAssetPackWithIdentifier:(NSString *)i options:(NSDataReadingOptions)o error:(NSError **)err {
+    (void)i;
+    NSString *r = macvr_ap_root();
+    return r ? [NSData dataWithContentsOfFile:[r stringByAppendingPathComponent:path] options:o error:err] : nil;
+}
+- (NSURL *)URLForPath:(NSString *)path error:(NSError **)err {
+    (void)err;
+    NSString *r = macvr_ap_root();
+    return r ? [NSURL fileURLWithPath:[r stringByAppendingPathComponent:path]] : nil;
+}
+@end
+
+static id g_macvr_apm = nil;
+static id h_ap_shared(id self, SEL s) { (void)self; (void)s; return g_macvr_apm; }
+
 __attribute__((constructor))
 static void macvr_init(void) {
     @autoreleasepool {
@@ -1022,6 +1147,15 @@ static void macvr_init(void) {
                 Class fc = objc_getClass(fi_classes[i]);
                 if (fc) macvr_swizzle_class(fc, @selector(supportsDevice:), (IMP)h_fi_supports_device);
             }
+        }
+
+        // Install BAAssetPackManager stand-in for Cyberpunk 2.5.0
+        dlopen("/System/Library/Frameworks/BackgroundAssets.framework/BackgroundAssets", RTLD_LAZY);
+        Class bac = objc_getClass("BAAssetPackManager");
+        if (bac) {
+            g_macvr_apm = [MacVRAssetPackManager new];
+            macvr_swizzle_class(bac, sel_registerName("sharedManager"), (IMP)h_ap_shared);
+            macvr_log("Hooked BAAssetPackManager +sharedManager for Cyberpunk 2.5.0 asset packs");
         }
 
         macvr_input_init();
