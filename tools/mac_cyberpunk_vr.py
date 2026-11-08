@@ -95,9 +95,10 @@ def prepare_wrapper_bundle(source_app: Path, wrapper_app: Path) -> Path:
 
 # VR-friendly settings adjustments (referenced from VXpro/tools/cp_settings.py)
 VR_SETTINGS_OVERRIDES = {
+    ("/interface/hudSafezones", "HudSafezoneHor"): 0.0,
     ("/accessibility/hud", "HudSafezoneHor"): 0.0,
     ("/accessibility/hud", "HudSafezoneVer"): 0.0,
-    ("/accessibility/interface", "SubtitleFontSize"): 36,
+    ("/accessibility/interface", "HudScaling"): False,
     ("/gameplay/misc", "CameraHeadBobbing"): 0.0,
     ("/graphics/basic", "ChromaticAberration"): False,
     ("/graphics/basic", "DepthOfField"): False,
@@ -111,7 +112,10 @@ VR_SETTINGS_OVERRIDES = {
     ("/graphics/advanced", "DistantShadowsResolution"): "Low",
     ("/graphics/advanced", "ScreenSpaceReflectionQuality"): "Low",
     ("/graphics/advanced", "SubsurfaceScatteringQuality"): "Low",
-    ("/graphics/advanced", "AmbientOcclusion"): "Low",
+    ("/graphics/advanced", "AmbientOcclusion"): "Off",
+    ("/graphics/advanced", "LocalShadowsQuality"): "Off",
+    ("/graphics/advanced", "ContactShadows"): False,
+    ("/graphics/advanced", "FacialTangentUpdates"): False,
     ("/graphics/advanced", "ColorPrecision"): "Medium",
     ("/graphics/advanced", "MirrorQuality"): "Low",
     ("/graphics/raytracing", "RayTracing"): False,
@@ -120,17 +124,20 @@ VR_SETTINGS_OVERRIDES = {
     ("/graphics/raytracing", "RayTracedLocalShadows"): False,
     ("/graphics/raytracing", "RayTracedLighting"): "Off",
     ("/graphics/raytracing", "RayTracedPathTracing"): False,
-    ("/graphics/drs", "DynamicResolutionScaling"): False,
-    ("/graphics/upscaling", "UpscalingType"): "MetalFX",
-    ("/graphics/upscaling", "MetalFXPreset"): "Balanced",
+    ("/graphics/presets", "DynamicResolutionScaling"): False,
+    ("/graphics/presets", "ResolutionScaling"): "MetalFX",
+    ("/graphics/presets", "MetalFX"): "Balanced",
     # Critical for Cyberpunk 2.5.0: disable FrameGeneration so every presented frame is a real camera frame
-    ("/graphics/framegen", "FrameGeneration"): "Off",
+    ("/graphics/presets", "FrameGeneration"): "Off",
+    ("/graphics/presets", "MetalFX_FrameGeneration"): False,
+    ("/graphics/presets", "FSR3_FrameGeneration"): False,
     ("/video/display", "VSync"): "Off",
+    ("/video/display", "MaximumFPS_OnOff"): False,
     ("/video/display", "WindowMode"): "Windowed",
 }
 
 
-def apply_vr_settings(settings_file: Path, resolution: str = "1600x900", fov: float = 100.0) -> None:
+def apply_vr_settings(settings_file: Path, resolution: str = "1512x982", fov: float = 100.0) -> None:
     if not settings_file.exists():
         return
     try:
@@ -146,16 +153,20 @@ def apply_vr_settings(settings_file: Path, resolution: str = "1600x900", fov: fl
     changed = 0
     for group in doc.get("data", []):
         gname = group.get("group_name")
-        for var in group.get("vars", []):
-            key = (gname, var.get("var_name"))
+        items = group.get("options") or group.get("vars") or []
+        for var in items:
+            vname = var.get("name") or var.get("var_name")
+            key = (gname, vname)
             if key in overrides:
                 val = overrides[key]
                 if var.get("value") != val:
                     var["value"] = val
+                    if "values" in var and val in var["values"]:
+                        var["index"] = var["values"].index(val)
                     changed += 1
 
     if changed > 0:
-        settings_file.write_text(json.dumps(doc, indent=4) + "\n", encoding="utf-8")
+        settings_file.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
         print(f"[MacVR] Updated {changed} VR setting(s) in {settings_file} (res={resolution}, fov={fov})", file=sys.stderr)
 
 
