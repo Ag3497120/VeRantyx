@@ -425,21 +425,27 @@ static void kva_archive_save_locked(kva_archive *a, int force) {
 static void kva_archive_seed(VkDevice dev, VkPipelineCache cache) {
     if (!cache) return;
     // Restoring/saving the archive is optional; busy cache work must never
-    // monopolize the material workers. Their private/engine caches still work.
-    if (pthread_mutex_trylock(&g_kva_archive_mu)) return;
+    // monopolize the material workers. When KL_VK_WAIT_ARCHIVE_LOAD is enabled,
+    // wait on the in-memory archive lock so every worker seeds from the archive.
+    int wait_load = kl_env_on("KL_VK_WAIT_ARCHIVE_LOAD", 0);
+    if (wait_load) pthread_mutex_lock(&g_kva_archive_mu);
+    else if (pthread_mutex_trylock(&g_kva_archive_mu)) return;
     kva_archive *a = kva_archive_locked(dev);
     PFN_vkMergePipelineCaches merge = (PFN_vkMergePipelineCaches)real_gdpa(dev, "vkMergePipelineCaches");
-    if (a && merge) merge(dev, cache, 1, &a->cache);
+    if (a && !a->loading && merge) merge(dev, cache, 1, &a->cache);
     pthread_mutex_unlock(&g_kva_archive_mu);
 }
 static void kva_archive_publish(VkDevice dev, VkPipelineCache cache) {
     if (!cache) return;
-    if (pthread_mutex_trylock(&g_kva_archive_mu)) return;
+    int wait_load = kl_env_on("KL_VK_WAIT_ARCHIVE_LOAD", 0);
+    if (wait_load) pthread_mutex_lock(&g_kva_archive_mu);
+    else if (pthread_mutex_trylock(&g_kva_archive_mu)) return;
     kva_archive *a = kva_archive_locked(dev);
     PFN_vkMergePipelineCaches merge = (PFN_vkMergePipelineCaches)real_gdpa(dev, "vkMergePipelineCaches");
     if (a && merge && merge(dev, a->cache, 1, &cache) == VK_SUCCESS) {
         a->dirty = 1;
-        kva_archive_save_locked(a, 0);
+        if (!wait_load || __atomic_load_n(&g_kva_pending, __ATOMIC_RELAXED) == 0)
+            kva_archive_save_locked(a, 0);
     }
     pthread_mutex_unlock(&g_kva_archive_mu);
 }
@@ -704,13 +710,40 @@ static void kva_prioritize_locked(kva_pipe *p) {
     }
 }
 
-// Never wait for a graphics pipeline on the thread recording a frame.
+static int kva_bind_wait_ms(void) {
+    const char *e = getenv("KL_VK_BIND_WAIT_MS");
+    if (!e || !*e) return 0;
+    int v = atoi(e);
+    return v < 0 ? 0 : (v > 2000 ? 2000 : v);
+}
+
+// Never wait for a graphics pipeline on the thread recording a frame unless
+// KL_VK_BIND_WAIT_MS requests bounded demand waiting so multi-pass draws
+// (such as character eyes or lit surfaces) never omit a companion pass.
 static inline uint64_t kva_bind(void *cb, uint32_t bindPoint, uint64_t pipeline) {
     if (!kva_on() || bindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS) return pipeline;
     kva_pipe *p = kva_of(pipeline);
     if (!p) { kva_set_skip(cb, 0); return pipeline; }
+    int wait_ms = kva_bind_wait_ms();
     int state = atomic_load(&p->state);
-    if (state == 1 && p->ready_serial <= atomic_load(&g_kva_visible_serial)) {
+    if (state == 0 && wait_ms > 0) {
+        atomic_store(&p->demanded, 1);
+        pthread_mutex_lock(&g_kva_mu);
+        kva_prioritize_locked(p);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)wait_ms * 1000000L;
+        ts.tv_sec += ts.tv_nsec / 1000000000L;
+        ts.tv_nsec %= 1000000000L;
+        while ((state = atomic_load(&p->state)) == 0) {
+            if (pthread_cond_timedwait(&g_kva_ready, &g_kva_mu, &ts) == ETIMEDOUT) {
+                state = atomic_load(&p->state);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_kva_mu);
+    }
+    if (state == 1 && (wait_ms > 0 || p->ready_serial <= atomic_load(&g_kva_visible_serial))) {
         kva_set_skip(cb, 0); return atomic_load(&p->real);
     }
     kva_set_skip(cb, 1);
@@ -851,6 +884,13 @@ static VkResult VKAPI_CALL klvk_CreatePipelineCache(VkDevice dev, const VkPipeli
     }
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
     if (r == VK_SUCCESS && ci) VKI("[async] engine pipeline cache: %zu initial bytes\n", ci->initialDataSize);
+    if (r == VK_SUCCESS && kl_env_on("KL_VK_WAIT_ARCHIVE_LOAD", 0)) {
+        pthread_mutex_lock(&g_kva_archive_mu);
+        kva_archive *arch = kva_archive_locked(dev);
+        while (arch && arch->loading)
+            pthread_cond_wait(&g_kva_archive_ready, &g_kva_archive_mu);
+        pthread_mutex_unlock(&g_kva_archive_mu);
+    }
     return r;
 }
 static VkResult VKAPI_CALL klvk_GetPipelineCacheData(VkDevice dev, VkPipelineCache cache, size_t *size, void *data) {

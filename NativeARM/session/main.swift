@@ -217,7 +217,7 @@ enum NativeSupervisor {
             // The app sets the eye pixel budget. As on the Windows Alyx path,
             // keep Source 2 from independently changing viewport scale when a
             // graphics preset is applied while the streaming session is live.
-            let args = ["--libdir", config.lib.path, "--game", config.game.path, "--", "-vr", "-steam", "-noasserts", "-nopassiveasserts", "-vulkan", "-nowindow", "-noautofidelity", "+vr_fidelity_level", "3", "+map", "startup"]
+            let args = ["--libdir", config.lib.path, "--game", config.game.path, "--", "-vr", "-steam", "-noasserts", "-nopassiveasserts", "-vulkan", "-nowindow", "-noautofidelity", "+vr_fidelity_level", "3", "+hlvr_movetype_default", "1", "+vr_movetype_set", "1", "+map", "startup"]
             record["command"] = [config.host.path] + args
             record["settings"] = config.environment.filter { $0.key.hasPrefix("VERANTYX_") || $0.key.hasPrefix("KL_") }
             host = try start(config.host, args, config, log: hostLog)

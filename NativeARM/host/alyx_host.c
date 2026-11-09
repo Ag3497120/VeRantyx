@@ -167,6 +167,10 @@ int main(int argc, char **argv) {
     // VERANTYX_ASYNC_PIPELINES=0 uses synchronous creation instead.
     if (!getenv("VERANTYX_ASYNC_PIPELINES") || strcmp(getenv("VERANTYX_ASYNC_PIPELINES"), "0") != 0)
         setenv("KL_VK_ASYNC_PIPELINES", "1", 0);
+    setenv("KL_VK_ASYNC_THREADS", "6", 0);
+    setenv("KL_VK_WAIT_ARCHIVE_LOAD", "1", 0);
+    setenv("KL_VK_BIND_WAIT_MS", "500", 0);
+    setenv("VERANTYX_SUPPRESS_BLINK_BLACK", "1", 0);
     // Deckard assumes EDS3 includes dynamic colour masks. Select static variants
     // on drivers without those masks; feature clamping after selection is late.
     setenv("KL_VK_ALYX_STATIC_COLOR_WRITE", "1", 0);
@@ -211,6 +215,19 @@ int main(int argc, char **argv) {
     { char cache[PATH_MAX]; snprintf(cache, sizeof cache, "%s/cache", game); mkdir(cache, 0755); setenv("XDG_CACHE_HOME", cache, 0); }
     char hlvrdir[PATH_MAX];
     snprintf(hlvrdir, sizeof hlvrdir, "%s/game/hlvr", game);
+    // Restore panorama/videos if the source installation had it renamed to
+    // videos.bak (an old Wine workaround); without it, Panorama in-game video
+    // panels (such as Eli Vance's balcony call) fail with an empty URL.
+    {
+        char vids[PATH_MAX], bak[PATH_MAX];
+        snprintf(vids, sizeof vids, "%s/panorama/videos", hlvrdir);
+        snprintf(bak, sizeof bak, "%s/panorama/videos.bak", hlvrdir);
+        struct stat st;
+        if (lstat(vids, &st) != 0 && errno == ENOENT && stat(bak, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (symlink("videos.bak", vids) == 0)
+                fprintf(stderr, "  [native] restored %s -> videos.bak\n", vids);
+        }
+    }
     vrrt_init(hlvrdir);
 
     char path[PATH_MAX];
