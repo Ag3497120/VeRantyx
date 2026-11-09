@@ -807,6 +807,7 @@ static id<MTLComputeCommandEncoder> compute_encoder(vk_enc *e) {
         e->compute = [e->cb computeCommandEncoderWithDescriptor:cd];
     } else if (e->compute_concurrent) e->compute = [e->cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
     else e->compute = [e->cb computeCommandEncoder];
+    if (vk_trace()) e->compute.label = @"Vulkan compute";
     e->wait_dst = 0;
     VK_STAT(VKS_ENCODERS, 1);
     [e->compute waitForFence:e->fence];
@@ -824,6 +825,7 @@ static id<MTLBlitCommandEncoder> blit_encoder(vk_enc *e) {
         bd.sampleBufferAttachments[0].endOfEncoderSampleIndex = i + 1;
         e->blit = [e->cb blitCommandEncoderWithDescriptor:bd];
     } else e->blit = [e->cb blitCommandEncoder];
+    if (vk_trace()) e->blit.label = @"Vulkan blit";
     e->wait_dst = 0;
     VK_STAT(VKS_ENCODERS, 1);
     [e->blit waitForFence:e->fence];
@@ -898,6 +900,7 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
         d.sampleBufferAttachments[0].endOfFragmentSampleIndex = i + 1;
     }
     e->render = [e->cb renderCommandEncoderWithDescriptor:d];
+    if (vk_trace()) e->render.label = @"Vulkan render pass";
     rc_start(e);
     VK_STAT(VKS_ENCODERS, 1);
     VK_STAT(VKS_PASSES, 1);

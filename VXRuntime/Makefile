@@ -1447,6 +1447,8 @@ check-run:
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
 # translator (make check-arm64).
 VXRT ?= build/vxrt
+# After a GPU fault a Vulkan wait can stall. Bound the test and keep Metal encoder diagnostics in the log.
+VULKAN_TEST = VXRT_TRACE_VULKAN=1 python3 -c 'import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:], timeout=60))' $(VXRT)
 runtime-tests: export VXRT_ROOT = build/root
 runtime-tests: export VXRT_NO_ACTIVATE = 1
 runtime-tests: $(VXRT) tests
@@ -1545,10 +1547,10 @@ runtime-tests-run:
 	$(VXRT) build/d3d12_engine.exe
 	$(VXRT) build/d3d12_fxc.exe
 	$(VXRT) build/d3d11on12.exe
-	python3 -c 'import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:], timeout=60))' $(VXRT) build/vulkan_features.exe
-	$(VXRT) build/vulkan_shaders.exe
-	$(VXRT) build/vulkan_external.exe
-	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
+	$(VULKAN_TEST) build/vulkan_features.exe
+	$(VULKAN_TEST) build/vulkan_shaders.exe
+	$(VULKAN_TEST) build/vulkan_external.exe
+	$(VULKAN_TEST) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
 		build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(VXRT) build/input.exe
 	$(VXRT) build/audio.exe
