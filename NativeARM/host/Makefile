@@ -1,3 +1,4 @@
+.DEFAULT_GOAL := all
 # alyx_host: loads Valve's Linux ARM64 Half-Life: Alyx libraries on macOS
 # through Klepton's loader, with VeRantyx's glibc shim layer on top.
 #
@@ -7,7 +8,8 @@
 # Klepton (patched by ../klepton-patches/apply.py) lives in ../build/Klepton;
 # its runtime source list is read from its own Makefile so the two never drift.
 KL  ?= ../build/Klepton
-OUT ?= ../build/host
+FOSSILIZE ?= 0
+OUT ?= ../build/host$(if $(filter 1,$(FOSSILIZE)),-fossilize,)
 CC  := clang
 MACOS_MIN ?= 14.2
 
@@ -35,12 +37,30 @@ CXXFLAGS  := -std=c++17 -g -O2 -Wall -Wno-unused-parameter -arch arm64 -mmacosx-
 MVK_DIR   := $(abspath $(KL)/vendor-moltenvk/out/macos)
 HDRS      := $(wildcard $(KL)/runtime/*.h) $(wildcard $(KL)/runtime/*/*.h) $(wildcard *.h)
 
+ifeq ($(FOSSILIZE),1)
+CFLAGS += -DVERANTYX_FOSSILIZE=1
+FZ_DIR ?= $(abspath ../build/Fossilize)
+FZ_NAMES := fossilize.cpp fossilize_db.cpp varint.cpp path.cpp fossilize_application_filter.cpp
+FOZ_OBJS := $(addprefix $(OUT)/foz/,$(addsuffix .o,$(FZ_NAMES))) $(OUT)/foz/miniz.o $(OUT)/foz/kl_fossilize.o
+FOZ_FLAGS := -ffile-prefix-map=$(FZ_DIR)=Fossilize -std=c++17 -g -O2 -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -fno-exceptions -Wno-unused-parameter -I$(FZ_DIR) -I$(FZ_DIR)/rapidjson/include -I$(FZ_DIR)/khronos -I$(FZ_DIR)/miniz -I$(KL)/runtime/gfx -I$(KL)/vendor-moltenvk/out/include
+$(OUT)/foz/%.cpp.o: $(FZ_DIR)/%.cpp
+	@mkdir -p $(dir $@)
+	clang++ $(FOZ_FLAGS) -c -o $@ $<
+$(OUT)/foz/miniz.o: $(FZ_DIR)/miniz/miniz.c
+	@mkdir -p $(dir $@)
+	clang -g -O2 -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -c -o $@ $<
+$(OUT)/foz/kl_fossilize.o: kl_fossilize.cpp
+	@mkdir -p $(dir $@)
+	clang++ $(FOZ_FLAGS) -c -o $@ $<
+
+endif
+
 all: $(OUT)/alyx_host
 
 # (No -pagezero_size: arm64 macOS SIGKILLs an executable whose __PAGEZERO is
 # under 4 GB, and vm_map_min is 4 GB anyway — see kl_luafix.c for how Valve's
 # low-2 GB LuaJIT arena is handled instead.)
-$(OUT)/alyx_host: $(RT_OBJS) $(HOST_OBJS) $(VRRT_OBJS)
+$(OUT)/alyx_host: $(RT_OBJS) $(HOST_OBJS) $(VRRT_OBJS) $(FOZ_OBJS)
 	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -g $(SANITIZE) -o $@ $^ $(LDLIBS)
 
 $(OUT)/vrrt/%.o: $(VRRT_DIR)/% $(VRRT_HDRS)
@@ -71,19 +91,19 @@ clean:
 $(OUT)/host_files.o: ../tests/host_files.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
-$(OUT)/host_files: $(OUT)/host_files.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS)
+$(OUT)/host_files: $(OUT)/host_files.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS) $(FOZ_OBJS)
 	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(SANITIZE) -o $@ $^ $(LDLIBS)
 
 $(OUT)/host_sync.o: ../tests/host_sync.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
-$(OUT)/host_sync: $(OUT)/host_sync.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS)
+$(OUT)/host_sync: $(OUT)/host_sync.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS) $(FOZ_OBJS)
 	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(SANITIZE) -o $@ $^ $(LDLIBS)
 
 $(OUT)/host_memory.o: ../tests/host_memory.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
-$(OUT)/host_memory: $(OUT)/host_memory.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS)
+$(OUT)/host_memory: $(OUT)/host_memory.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS) $(FOZ_OBJS)
 	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(SANITIZE) -o $@ $^ $(LDLIBS)
 
 check: $(OUT)/host_files $(OUT)/host_sync $(OUT)/host_memory

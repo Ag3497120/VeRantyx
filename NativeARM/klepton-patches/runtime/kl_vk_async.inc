@@ -6,10 +6,10 @@
 // hitches when characters or new areas appear). With KL_VK_ASYNC_PIPELINES=1
 // the create info is deep-copied, the guest gets a placeholder handle at once,
 // and worker threads compile ahead of use. Pending graphics draws are omitted
-// without waiting for ordinary scene materials. Required offscreen lighting,
-// single-sample masks and depth passes complete on first use so cached shadow
-// contents cannot retain an omitted draw. Ordinary materials still activate
-// together at a stereo frame boundary.
+// without waiting for ordinary colour materials. Depth/stencil-only and colour-only offscreen passes
+// must complete at first use: Source 2 may cache their shadow contents and
+// never redraw an omitted occluder. Colour materials activate together at
+// the next stereo frame boundary; depth is available before its consumers.
 // Anything the copy does not understand is compiled synchronously as before.
 //
 // While compiles are in flight, destroys of shader modules, pipeline layouts,
@@ -187,6 +187,7 @@ typedef struct kva_pipe {
     struct kva_pipe *next_job;
     struct kva_pipe *next_active;
     double queued_ms, started_ms, compiled_ms;
+    int prewarm;
 } kva_pipe;
 
 static pthread_mutex_t g_kva_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -202,6 +203,8 @@ static int kva_private_archive(void) {
 static pthread_cond_t g_kva_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_kva_ready = PTHREAD_COND_INITIALIZER;
 static kva_pipe *g_kva_head, *g_kva_tail, *g_kva_active;
+static int g_kva_game_compiling;
+static int g_kva_game_limit = 8;
 static int g_kva_preserve_required = 1;
 static int g_kva_preserve_all;
 static int g_kva_pending;                   // queued + compiling
@@ -343,7 +346,9 @@ static void *kva_archive_load(void *arg) {
     pthread_setname_np("kl-shader-cache-load");
     VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
     void *data = NULL;
-    FILE *file = fopen(a->path, "rb");
+    // FOZ preparation reconstructs the entire known shader set in parallel.
+    // Do not first recompile its large serialized MSL cache serially.
+    FILE *file = kl_env_on("KL_VK_FOZ_REBUILD_CACHE",0) ? NULL : fopen(a->path, "rb");
     if (file) {
         if (!fseek(file, 0, SEEK_END)) {
             long size = ftell(file);
@@ -407,6 +412,7 @@ static kva_archive *kva_archive_locked(VkDevice dev) {
     return a;
 }
 static void kva_archive_save_locked(kva_archive *a, int force) {
+    if(!force && kl_env_on("KL_VK_FOZ_REBUILD_CACHE",0))return;
     // Do not replace the old file with a partial cold cache before import ends.
     if (a->loading || !a->dirty || (!force && a->saved_ms && kl_pipe_ms() - a->saved_ms < 5000)) return;
     PFN_vkGetPipelineCacheData get = (PFN_vkGetPipelineCacheData)real_gdpa(a->dev, "vkGetPipelineCacheData");
@@ -458,6 +464,29 @@ static void kva_archive_publish(VkDevice dev, VkPipelineCache cache) {
         a->dirty = 1;
         if (!wait_load || __atomic_load_n(&g_kva_pending, __ATOMIC_RELAXED) == 0)
             kva_archive_save_locked(a, 0);
+    }
+    pthread_mutex_unlock(&g_kva_archive_mu);
+}
+// Preparation may wait for cache IO; gameplay retains upstream nonblocking
+// seeding/publication. Every prepared shader must reach the persistent archive.
+static void kva_archive_seed_replay(VkDevice dev,VkPipelineCache cache) {
+    if(!cache || !kva_private_archive())return;
+    pthread_mutex_lock(&g_kva_archive_mu);
+    kva_archive *a=kva_archive_locked(dev);
+    if(a) {
+        while(a->loading)pthread_cond_wait(&g_kva_archive_ready,&g_kva_archive_mu);
+        PFN_vkMergePipelineCaches merge=(PFN_vkMergePipelineCaches)real_gdpa(dev,"vkMergePipelineCaches");
+        if(merge)merge(dev,cache,1,&a->cache);
+    }
+    pthread_mutex_unlock(&g_kva_archive_mu);
+}
+static void kva_archive_publish_replay(VkDevice dev,VkPipelineCache cache) {
+    if(!cache || !kva_private_archive())return;
+    pthread_mutex_lock(&g_kva_archive_mu);
+    kva_archive *a=kva_archive_locked(dev);
+    PFN_vkMergePipelineCaches merge=(PFN_vkMergePipelineCaches)real_gdpa(dev,"vkMergePipelineCaches");
+    if(a && merge && merge(dev,a->cache,1,&cache)==VK_SUCCESS) {
+        a->dirty=1; kva_archive_save_locked(a,0);
     }
     pthread_mutex_unlock(&g_kva_archive_mu);
 }
@@ -545,22 +574,31 @@ static void *kva_worker(void *arg) {
     pthread_setname_np("kl-pipeline-compile");
     for (;;) {
         pthread_mutex_lock(&g_kva_mu);
-        while (!g_kva_head) pthread_cond_wait(&g_kva_cv, &g_kva_mu);
-        for (kva_pipe *job = g_kva_head; job; job = job->next_job) {
-            if (atomic_load(&job->demanded)) { kva_prioritize_locked(job); break; }
+        for (;;) {
+            while (!g_kva_head) pthread_cond_wait(&g_kva_cv, &g_kva_mu);
+            for (kva_pipe *job = g_kva_head; job; job = job->next_job) {
+                if (atomic_load(&job->demanded)) { kva_prioritize_locked(job); break; }
+            }
+            // Recheck the selected job AFTER demand prioritization: a demanded
+            // gameplay job must not escape the budget behind a preparation job.
+            if (g_kva_head->prewarm || g_kva_game_compiling < g_kva_game_limit) break;
+            pthread_cond_wait(&g_kva_cv, &g_kva_mu);
         }
         kva_pipe *p = g_kva_head;
         g_kva_head = p->next_job;
         if (!g_kva_head) g_kva_tail = NULL;
+        if (!p->prewarm) g_kva_game_compiling++;
         p->started_ms = kl_pipe_ms();
         pthread_mutex_unlock(&g_kva_mu);
 
         VkPipelineCache private_cache = kva_private_cache(p);
-        kva_archive_seed(p->dev, private_cache);
+        if(p->prewarm) kva_archive_seed_replay(p->dev, private_cache);
+        else kva_archive_seed(p->dev, private_cache);
         double t0 = kl_pipe_ms();
         VkPipeline real = VK_NULL_HANDLE;
         VkResult r = p->create(p->dev, private_cache, 1, p->ci, NULL, &real);
         double dt = kl_pipe_ms() - t0;
+        if(getenv("ALYX_V2_COMPILE_METRICS") && dt>=20) VKI("[prewarm-v2] %s compile %.2f ms\n",p->prewarm?"preparation":"game",dt);
 
         if (!kva_private_archive()) {
             pthread_mutex_lock(&g_kva_cache_mu);
@@ -587,8 +625,11 @@ static void *kva_worker(void *arg) {
         while (*active && *active != p) active = &(*active)->next_active;
         if (*active) *active = p->next_active;
         VkDevice dev = p->dev;
+        int prewarm=p->prewarm;
         g_kva_finishing++;
         g_kva_pending--;
+        if (!prewarm) g_kva_game_compiling--;
+        pthread_cond_broadcast(&g_kva_cv);
         kva_deferred *deferred = NULL; size_t deferred_count = 0;
         if (g_kva_pending == 0) {
             deferred = g_kva_def; deferred_count = g_kva_ndef;
@@ -606,7 +647,10 @@ static void *kva_worker(void *arg) {
         }
         kva_flush_deferred(deferred, deferred_count);
         // Publish outside the recording/queue mutex; no frame waits for the disk cache.
-        if (r == VK_SUCCESS) kva_archive_publish(dev, private_cache);
+        if (r == VK_SUCCESS) {
+            if(prewarm) kva_archive_publish_replay(dev,private_cache);
+            else kva_archive_publish(dev, private_cache);
+        }
         PFN_vkDestroyPipelineCache destroy_cache = real_gdpa ?
             (PFN_vkDestroyPipelineCache)real_gdpa(dev, "vkDestroyPipelineCache") : NULL;
         if (private_cache && destroy_cache) destroy_cache(dev, private_cache, NULL);
@@ -630,8 +674,12 @@ static void kva_spawn_workers(void) {
     int n = e && *e ? atoi(e) : 3;
     if (n < 1) n = 1;
     if (n > 8) n = 8;
+    const char *game = getenv("KL_VK_ASYNC_GAME_THREADS");
+    g_kva_game_limit = game && *game ? atoi(game) : n;
+    if (g_kva_game_limit < 1) g_kva_game_limit = 1;
+    if (g_kva_game_limit > n) g_kva_game_limit = n;
     for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, kva_worker, NULL); pthread_detach(t); }
-    VKI("[async] pipeline compiles moved off the render thread (%d workers) with private caches; nonblocking scene materials; required lighting/depth first-use preserved; materials activate at stereo frame boundaries\n", n);
+    VKI("[async] pipeline compiles moved off the render thread (%d workers) with private caches; nonblocking colour binds; offscreen/depth first-use preserved; colour materials activate at stereo frame boundaries\n", n);
 }
 static void kva_start_workers(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -650,11 +698,14 @@ static int kva_create(VkDevice dev, VkPipelineCache cache, uint32_t n, const VkG
         kva_pipe *p = (kva_pipe *)calloc(1, sizeof *p);
         if (!p) goto fail;
         p->magic = KVA_MAGIC; p->dev = dev; p->cache = cache;
+#ifdef KVA_REPLAY_THREAD
+        p->prewarm=KVA_REPLAY_THREAD();
+#endif
         p->required_first_use = kva_required_first_use(&ci[i]);
         if (p->required_first_use) {
             static unsigned long long targets;
             if (__atomic_add_fetch(&targets, 1, __ATOMIC_RELAXED) <= 32)
-                VKI("[async] depth/stencil pipeline: renderPass=%#llx subpass=%u targets=%d\n",
+                VKI("[async] required lighting/depth pipeline: renderPass=%#llx subpass=%u targets=%d\n",
                     (unsigned long long)(uintptr_t)ci[i].renderPass, ci[i].subpass, kva_render_usage(&ci[i]));
         }
         p->create = real;

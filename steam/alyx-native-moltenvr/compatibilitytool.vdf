@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+ "compat_tools"
+ {
+  "alyx-native-moltenvr"
+  {
+   "install_path" "."
+   "display_name" "Alyx Native - MoltenVR"
+   "from_oslist" "windows"
+   "to_oslist" "macos"
+  }
+ }
+}

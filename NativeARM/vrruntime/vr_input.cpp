@@ -173,6 +173,12 @@ public:
                 const json::Value &params = src["parameters"];
                 for (auto &inp : src["inputs"].obj) {
                     std::string output = inp.second["output"].string_or("");
+                    // Touch's stock height-adjust action requires an accessibility mode.
+                    // Expose the explicit crouch toggle for the requested stick click.
+                    if (bindingFile == "bindings_touch.json" &&
+                        path == "/user/hand/left/input/joystick" && inp.first == "click" &&
+                        lower(output) == "/actions/move/in/adjustheight")
+                        output = "/actions/move/in/MoveCrouchToggle";
                     Action *a = find_action(output);
                     if (!a) continue;
                     Binding b;
