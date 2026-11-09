@@ -1545,7 +1545,7 @@ runtime-tests-run:
 	$(VXRT) build/d3d12_engine.exe
 	$(VXRT) build/d3d12_fxc.exe
 	$(VXRT) build/d3d11on12.exe
-	$(VXRT) build/vulkan_features.exe
+	python3 -c 'import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:], timeout=60))' $(VXRT) build/vulkan_features.exe
 	$(VXRT) build/vulkan_shaders.exe
 	$(VXRT) build/vulkan_external.exe
 	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
