@@ -284,7 +284,13 @@
  "Steam for Mac was not signed in when the game started.": "遊戲啟動時 Steam for Mac 未登入。",
  "ALVR's setting (72 Hz unless changed)": "ALVR 的設定（未更改時為 72 Hz）",
  "Refresh rate": "更新率",
- "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 60 Hz on a headset that has it (Quest 1); at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "頭戴裝置螢幕的更新率。60 fps 的遊戲在 120 Hz 下最流暢（每格畫面顯示兩次），支援 60 Hz 的頭戴裝置（Quest 1）用 60 Hz 也一樣；在 72 Hz 下有的畫面顯示兩次、有的一次，會造成頓挫。頭戴裝置會使用它支援的最接近的更新率。下次遊玩時生效。",
  "The headset's field of view changed after the game started (ALVR's FoV setting?): stop and start the game again, or the eyes do not line up.": "遊戲開始後頭戴裝置的視野變了（ALVR 的 FoV 設定？）：請停止遊戲後重新開始，否則左右眼畫面對不上。",
- "Stream over UDP (try it if the picture lags on Wi-Fi)": "透過 UDP 串流（Wi-Fi 下畫面延遲時試試）"
+ "Stream over UDP (try it if the picture lags on Wi-Fi)": "透過 UDP 串流（Wi-Fi 下畫面延遲時試試）",
+ "Mirror picture and audio on this Mac": "在此 Mac 上鏡像畫面與聲音",
+ "Shows a live single-eye view in the app (and an optional window) and keeps the Mac's speakers playing alongside the headset.": "在應用程式內（以及選用的獨立視窗）即時顯示單眼畫面，並在頭戴裝置播放聲音的同時保持 Mac 揚聲器發聲。",
+ "Mirror on this Mac (left eye + Mac speakers)": "在此 Mac 上鏡像（左眼 + Mac 揚聲器）",
+ "Open mirror window": "打開鏡像視窗",
+ "Waiting for the first VR frame…": "正在等待第一幀 VR 畫面…",
+ "%@ — Mirror": "%@ — 鏡像",
+ "The headset's display rate. Quest 2, Quest 3 and Pico support 72, 80, 90 and 120 Hz (60 Hz is Quest 1 only and falls back to 72 Hz on newer headsets). A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 72 Hz when the Mac can sustain 72 fps. Takes effect at the next play.": "頭戴裝置的顯示更新率。Quest 2、Quest 3 與 Pico 支援 72、80、90 與 120 Hz（60 Hz 僅限 Quest 1，在較新的頭戴裝置上會改用 72 Hz）。60 fps 的遊戲在 120 Hz（每幀顯示兩次）下最流暢，或是在 Mac 能穩定維持 72 fps 時使用 72 Hz。下次遊玩時生效。"
 }

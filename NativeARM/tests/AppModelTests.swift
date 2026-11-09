@@ -278,6 +278,36 @@ import Foundation
         guard !stalled.headsetConnected else { throw NativeFailure("Stopped tracking remained connected") }
         try trackingPacket(6,3); stalled.pollNative(now: testTime.addingTimeInterval(5))
         guard stalled.headsetConnected else { throw NativeFailure("Native tracking reconnect was not seen") }
+        // Mirror picture + Mac audio setting and live left-eye frame extraction.
+        let mirrorPrefs = LaunchPreferences.load(["preferredBackend": "nativeARM64", "quality": "sharp", "mirrorOnMac": true])
+        guard mirrorPrefs.mirrorOnMac, !LaunchPreferences.load([:]).mirrorOnMac else {
+            throw NativeFailure("LaunchPreferences mirrorOnMac was not loaded properly")
+        }
+        let mirroredPlay = try Play(title: alyx.name, appID: alyx.id, exe: nil, headset: .quest, wired: false,
+                                    quality: .standard, known: alyx, backend: .nativeARM64, mirrorOnMac: true)
+        for _ in 0..<100 where mirroredPlay.running { try await Task.sleep(nanoseconds: 50_000_000) }
+        guard mirroredPlay.dryRunText.contains("env: VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1"),
+              mirroredPlay.dryRunText.contains("env: VERANTYX_MIRROR=1") else {
+            throw NativeFailure("Mirror launch did not set VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1 and VERANTYX_MIRROR=1: \(mirroredPlay.dryRunText)")
+        }
+        var hdr = Data(count: 88)
+        func putHdr<T>(_ v: T, _ at: Int) { var val = v; withUnsafeBytes(of: &val) { hdr.replaceSubrange(at..<at+$0.count, with: $0) } }
+        putHdr(UInt32(12), 0); putHdr(UInt32(8), 4); putHdr(UInt32(4), 8); putHdr(UInt32(87), 12)
+        try frameHandle.seek(toOffset: 64)
+        try frameHandle.write(contentsOf: hdr)
+        try frameHandle.write(contentsOf: Data(repeating: 0x7f, count: 8 * 4 * 4))
+        var slotZero: UInt32 = 0
+        try frameHandle.seek(toOffset: 0)
+        try withUnsafeBytes(of: &slotZero) { try frameHandle.write(contentsOf: $0) }
+        let liveMirror = try Play(title: alyx.name, appID: alyx.id, exe: nil, headset: .quest, wired: false,
+                                  quality: .standard, known: alyx, backend: .nativeARM64, mirrorOnMac: true)
+        try fm.createDirectory(at: liveMirror.nativeSession!, withIntermediateDirectories: true)
+        try fm.copyItem(at: frame, to: liveMirror.nativeSession!.appendingPathComponent("frame.dat"))
+        liveMirror.phase = .playing
+        liveMirror.pollMirror()
+        guard liveMirror.mirrorImage?.width == 4, liveMirror.mirrorImage?.height == 4 else {
+            throw NativeFailure("pollMirror did not extract the left eye from frame.dat")
+        }
         try frameHandle.close()
         for (phase, notice, timedOut) in [(Play.Phase.steamVR, "Open ALVR and connect", false),
                                          (.stopping, "Waiting for the game to close normally…", false),

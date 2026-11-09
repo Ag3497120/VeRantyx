@@ -82,8 +82,9 @@ enum Entry {
             let id = a[i + 1]
             let seconds = i + 2 < a.count ? Double(a[i + 2]) ?? 90 : 90
             let flat = a.contains("--flat")
+            let mirror = a.contains("--mirror")
             if a.contains("--dry-run") { setenv("VERANTYX_DRY_RUN", "1", 1) }
-            Task { @MainActor in await Headless.play(id, seconds: seconds, flat: flat) }
+            Task { @MainActor in await Headless.play(id, seconds: seconds, flat: flat, mirror: mirror) }
             RunLoop.main.run()                            // (the run loop, not dispatchMain: the app's timers need it)
         }
         VeRantyxApp.main()
@@ -165,8 +166,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         exit(0)
     }
 
-    static func play(_ id: String, seconds: Double, flat: Bool = false) async {
+    static func play(_ id: String, seconds: Double, flat: Bool = false, mirror: Bool = false) async {
         let model = AppModel()
+        if mirror { model.mirrorOnMac = true }
         await model.refresh()
         for _ in 0..<50 where model.games.isEmpty { try? await Task.sleep(nanoseconds: 200_000_000) }
         print("ready=\(model.ready) rosetta=\(model.rosetta ?? false) steam=\(model.steamRunning) steamVR=\(model.steamVR) dlls=\(model.redistCount) games=\(model.games.map(\.id))")

@@ -284,7 +284,13 @@
  "Steam for Mac was not signed in when the game started.": "Steam для Mac не был авторизован, когда стартовала игра.",
  "ALVR's setting (72 Hz unless changed)": "Настройка ALVR (72 Гц, если не меняли)",
  "Refresh rate": "Частота обновления",
- "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 60 Hz on a headset that has it (Quest 1); at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "Частота экрана гарнитуры. Игра с 60 fps выглядит плавнее всего на 120 Гц, где каждый кадр показывается дважды, или на 60 Гц у гарнитуры, где она есть (Quest 1); на 72 Гц одни кадры показываются дважды, а другие один раз, и картинка дёргается. Гарнитура берёт ближайшую частоту, которая у неё есть. Действует со следующего запуска.",
  "The headset's field of view changed after the game started (ALVR's FoV setting?): stop and start the game again, or the eyes do not line up.": "Поле зрения гарнитуры изменилось после запуска игры (настройка FoV в ALVR?): остановите игру и запустите снова, иначе изображения для глаз не совпадут.",
- "Stream over UDP (try it if the picture lags on Wi-Fi)": "Передавать по UDP (попробуйте, если по Wi-Fi картинка запаздывает)"
+ "Stream over UDP (try it if the picture lags on Wi-Fi)": "Передавать по UDP (попробуйте, если по Wi-Fi картинка запаздывает)",
+ "Mirror picture and audio on this Mac": "Дублировать изображение и звук на этом Mac",
+ "Shows a live single-eye view in the app (and an optional window) and keeps the Mac's speakers playing alongside the headset.": "Показывает изображение для одного глаза в приложении (и в отдельном окне) и оставляет динамики Mac включёнными одновременно со шлемом.",
+ "Mirror on this Mac (left eye + Mac speakers)": "Дублирование на этом Mac (левый глаз + динамики Mac)",
+ "Open mirror window": "Открыть окно дублирования",
+ "Waiting for the first VR frame…": "Ожидание первого кадра VR…",
+ "%@ — Mirror": "%@ — Дублирование",
+ "The headset's display rate. Quest 2, Quest 3 and Pico support 72, 80, 90 and 120 Hz (60 Hz is Quest 1 only and falls back to 72 Hz on newer headsets). A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 72 Hz when the Mac can sustain 72 fps. Takes effect at the next play.": "Частота обновления экрана шлема. Quest 2, Quest 3 и Pico поддерживают 72, 80, 90 и 120 Гц (60 Гц есть только у Quest 1 и на более новых шлемах заменяется на 72 Гц). Игра при 60 кадр/с выглядит плавнее всего при 120 Гц, когда каждый кадр показывается дважды, или при 72 Гц, если Mac удерживает 72 кадр/с. Вступает в силу со следующего запуска."
 }
