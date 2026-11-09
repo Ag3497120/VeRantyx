@@ -843,6 +843,40 @@ static void test_quit(const char *framePath) {
     unsetenv("VERANTYX_NATIVE_QUIT_FILE");
 }
 
+static void test_settings(const char *map) {
+    const std::string path = std::string(map) + ".settings";
+    setenv("VERANTYX_SETTINGS_FILE", path.c_str(), 1);
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    {
+        Settings settings;
+        settings.SetBool("section", "bool", true, &error); assert(error == vr::VRSettingsError_None);
+        settings.SetInt32("section", "int", -123, &error);
+        settings.SetFloat("section", "float", .125f, &error);
+        settings.SetString("section", "text", "spaces and \"quotes\"", &error);
+        assert(error == vr::VRSettingsError_None);
+    }
+    {
+        Settings settings;
+        assert(settings.GetBool("section", "bool", &error));
+        assert(settings.GetInt32("section", "int", &error) == -123);
+        assert(near(settings.GetFloat("section", "float", &error), .125f));
+        char text[64]; settings.GetString("section", "text", text, sizeof text, &error);
+        assert(!strcmp(text, "spaces and \"quotes\""));
+        settings.GetInt32("section", "bool", &error);
+        assert(error == vr::VRSettingsError_UnsetSettingHasNoDefault);
+        settings.RemoveKeyInSection("section", "int", &error);
+        settings.RemoveSection("section", &error);
+    }
+    {
+        Settings settings; settings.GetBool("section", "bool", &error);
+        assert(error == vr::VRSettingsError_UnsetSettingHasNoDefault);
+    }
+    setenv("VERANTYX_SETTINGS_FILE", (path + "/missing/file").c_str(), 1);
+    Settings unwritable; unwritable.SetBool("s", "k", true, &error);
+    assert(error == vr::VRSettingsError_WriteFailed);
+    unsetenv("VERANTYX_SETTINGS_FILE"); unlink(path.c_str());
+}
+
 int main(int argc, char **argv) {
     assert(argc == 3);
     if (!strcmp(argv[1], "--without-shared")) {
@@ -859,6 +893,7 @@ int main(int argc, char **argv) {
     float u0, u1, v0, v1;
     vrrt::eye_crop(0, &u0, &u1, &v0, &v1); assert(near(u0, 0) && near(u1, 5/6.f));
     vrrt::eye_crop(1, &u0, &u1, &v0, &v1); assert(near(u0, 1/6.f) && near(u1, 1));
+    test_settings(argv[1]);
     auto p = test_shared_memory();
     test_legacy_input(p);
     test_input(argv[2], p); test_mixed_input_sources(p); test_pose_contention(p);
