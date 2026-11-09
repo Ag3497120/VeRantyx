@@ -127,7 +127,6 @@ int main(void) {
     VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &driver };
     vkGetPhysicalDeviceProperties2(gpu, &p2);
     CHECK(VK_API_VERSION_MINOR(p2.properties.apiVersion) >= 3 && driver.driverName[0]);
-    int paravirtual = strstr(p2.properties.deviceName, "Paravirtual") != NULL || getenv("VXRT_TEST_AS_VM") != NULL;
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(gpu, VK_FORMAT_BC7_UNORM_BLOCK, &fp);
     CHECK(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
@@ -233,10 +232,7 @@ int main(void) {
         free_image(&a); free_image(&b); free_buffer(&up);
     }
     // 5. A render pass with a 4x multisampled color attachment cleared and resolved, no draws.
-    // This pass hangs the paravirtual GPU in CI, after which subsequent submissions can also stall.
-    if (paravirtual) {
-        puts("vulkan_features: msaa resolve: skipped (clear + resolve hangs the paravirtual GPU)");
-    } else {
+    {
         test = "msaa resolve";
         img ms = make_image(VK_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         img rs = make_image(VK_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, VK_SAMPLE_COUNT_1_BIT, color_usage);
@@ -273,19 +269,16 @@ int main(void) {
         vkDestroyRenderPass(device, rp, NULL);
         free_image(&ms); free_image(&rs);
     }
-    // 6. Dynamic rendering: a color and a depth/stencil attachment cleared, then a rectangle of the color cleared again
-    //    with vkCmdClearAttachments; the depth and stencil aspects read back.
-    {
-        test = "dynamic rendering";
+    // 6. Dynamic rendering: clear a color rectangle, then repeat with a smaller depth/stencil attachment and read both aspects back.
+    for (int depth_stencil = 0; depth_stencil <= 1; depth_stencil++) {
+        test = depth_stencil ? "dynamic rendering with depth/stencil" : "dynamic rendering color only";
+        uint32_t height = depth_stencil ? 48 : 64;
         img c = make_image(VK_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, VK_SAMPLE_COUNT_1_BIT, color_usage);
         VkImageView cv = make_view(c.image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0);
         img d = { 0 };
         VkImageView dv = VK_NULL_HANDLE;
-        // The combined render and depth/stencil readback faults on the paravirtual GPU. Keep the color pass there.
-        if (paravirtual) {
-            puts("vulkan_features: dynamic rendering: testing color only on the paravirtual GPU");
-        } else {
-            d = make_image(VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 64, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+        if (depth_stencil) {
+            d = make_image(VK_FORMAT_D32_SFLOAT_S8_UINT, 64, height, 1, 1, VK_SAMPLE_COUNT_1_BIT,
                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
             dv = make_view(d.image, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0);
         }
@@ -295,7 +288,7 @@ int main(void) {
         VkRenderingAttachmentInfo da = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dv,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .depthStencil = { 0.75f, 0x5a } } };
-        VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { 64, 64 } }, .layerCount = 1,
+        VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { 64, height } }, .layerCount = 1,
                                .colorAttachmentCount = 1, .pColorAttachments = &ca,
                                .pDepthAttachment = dv ? &da : NULL, .pStencilAttachment = dv ? &da : NULL };
         VkCommandBuffer cb = begin();
@@ -305,16 +298,16 @@ int main(void) {
         vkCmdClearAttachments(cb, 1, &clr, 1, &rect);
         vkCmdEndRendering(cb);
         barrier(cb);
-        to_buffer(cb, c.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 64, 64, out.buffer, 0);
-        if (d.image) {
-            to_buffer(cb, d.image, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 64, 64, out.buffer, 65536);
-            to_buffer(cb, d.image, VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 64, 64, out.buffer, 2 * 65536);
+        to_buffer(cb, c.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 64, height, out.buffer, 0);
+        if (depth_stencil) {
+            to_buffer(cb, d.image, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 64, height, out.buffer, 65536);
+            to_buffer(cb, d.image, VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 64, height, out.buffer, 2 * 65536);
         }
         submit(cb);
         CHECK(rgba(out.map + (2 * 64 + 2) * 4, 0, 0, 255, 255));
         CHECK(rgba(out.map + (20 * 64 + 20) * 4, 255, 255, 0, 255));
         CHECK(rgba(out.map + (40 * 64 + 40) * 4, 0, 0, 255, 255));
-        if (d.image) {
+        if (depth_stencil) {
             float depth;
             memcpy(&depth, out.map + 65536 + (5 * 64 + 5) * 4, 4);
             CHECK(depth == 0.75f);

@@ -778,11 +778,12 @@ void vk_end_encoder(vk_enc *e) {
 }
 
 static void use_heaps_render(vk_enc *e) {
-    if (e->no_use_heaps) return;                          // (the queue's residency set has them)
+    if (e->no_use_heaps || e->render_heaps_used) return;
     vk_heap_list *l = &e->dev->heaps;
     pthread_mutex_lock(&l->lock);
     if (l->count) [e->render useHeaps:l->heaps count:l->count stages:MTLRenderStageVertex | MTLRenderStageFragment];
     pthread_mutex_unlock(&l->lock);
+    e->render_heaps_used = 1;
 }
 static void use_heaps_compute(vk_enc *e) {
     if (e->no_use_heaps) return;
@@ -884,9 +885,13 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
         }
         if (!w) { w = a->view->width; h = a->view->height; samples = (uint32_t)t.sampleCount; }
     }
-    if (!w) { w = p->area.offset.x + p->area.extent.width; h = p->area.offset.y + p->area.extent.height; }
-    d.renderTargetWidth = w;
-    d.renderTargetHeight = h;
+    // Metal takes the size from the attachments. An attachmentless pass needs an explicit size.
+    if (!w) {
+        w = p->area.offset.x + p->area.extent.width;
+        h = p->area.offset.y + p->area.extent.height;
+        d.renderTargetWidth = w;
+        d.renderTargetHeight = h;
+    }
     if (p->layers > 1) d.renderTargetArrayLength = p->layers;
     if (p->occlusion) d.visibilityResultBuffer = p->occlusion->results;
     if (vkprof_on(e->dev)) {
@@ -900,6 +905,7 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
         d.sampleBufferAttachments[0].endOfFragmentSampleIndex = i + 1;
     }
     e->render = [e->cb renderCommandEncoderWithDescriptor:d];
+    e->render_heaps_used = 0;
     if (vk_trace()) e->render.label = @"Vulkan render pass";
     rc_start(e);
     VK_STAT(VKS_ENCODERS, 1);
@@ -913,7 +919,6 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
     if (vertex_wait) VK_STAT(VKS_VERTEX_WAITS, 1);
     e->wait_dst = 0;
     e->vertex_wait = 0;
-    use_heaps_render(e);
     e->pass = *p;
     e->pass_width = w;
     e->pass_height = h;
@@ -968,6 +973,8 @@ static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
         if (!((sets_vertex | pl->sets_fragment) & mask)) continue;
         struct VkDescriptorSet_T *ds = b->push[s] ? b->push[s] : b->sets[s];
         if (!ds) continue;
+        // The attachments and directly bound resources are already known to Metal.
+        use_heaps_render(e);
         if (b->push[s]) {
             if (sets_vertex & mask) { [r setVertexBytes:ds->words length:ds->size atIndex:s]; e->rc.vbuf[s] = nil; e->rc.voff[s] = ~0ull; }
             if (pl->sets_fragment & mask) { [r setFragmentBytes:ds->words length:ds->size atIndex:s]; e->rc.fbuf[s] = nil; e->rc.foff[s] = ~0ull; }

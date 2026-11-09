@@ -91,6 +91,7 @@ typedef struct vk_enc {
     uint64_t wait_dst;
     int vertex_wait;
     int no_use_heaps;
+    int render_heaps_used;              // (the current render encoder has its indirect resources)
     int compute_concurrent;             // (the next compute encoder: dispatches that may run together, hoist_tessellation)
     int hoist_phase;
     __unsafe_unretained id<MTLBuffer> fan_buf;   // (triangle fans' indices: one buffer a command buffer, the Metal command buffer keeps it)
