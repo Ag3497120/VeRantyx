@@ -185,6 +185,7 @@ typedef struct {
     uint32_t count;                   // descriptors (for variable-count bindings, the most)
     uint32_t word;                    // first 8-byte word in the set's argument buffer
     uint32_t dynamic;                 // dynamic buffers: first index among the layout's dynamic offsets
+    uint32_t input;                   // input attachments: first index in the set's input views
     VkShaderStageFlags stages;
     VkDescriptorBindingFlags flags;
     VkSampler *immutable;             // immutable samplers (count of them), or NULL
@@ -196,6 +197,8 @@ struct VkDescriptorSetLayout_T {
     vk_set_binding *bindings;         // sorted by binding number
     uint32_t words;                   // argument buffer size in words (with the variable binding at its maximum)
     uint32_t dynamic_count;
+    uint32_t input_count;
+    int uses_heaps;
     VkDescriptorSetLayoutCreateFlags flags;
     int variable_binding;             // index of a VARIABLE_DESCRIPTOR_COUNT binding, -1 if none
 };
@@ -230,6 +233,7 @@ struct VkDescriptorSet_T {
     uint32_t descriptor_count;
     uint32_t *first;                  // index into descriptors of each layout binding's first
     int has_unheaped;                 // (refers to swapchain images or other textures outside the memory heaps)
+    id<MTLTexture> __weak *input_textures;  // declare reads without extending the texture's lifetime
 };
 
 struct VkPipelineLayout_T {

@@ -192,7 +192,9 @@ static void push_set(VkCommandBuffer cb, VkPipelineBindPoint point, VkPipelineLa
     uint64_t size = ((uint64_t)sl->words * 8 + 15) & ~15ull;
     if (!size) size = 16;
     uint64_t *words = calloc(1, size);
+    if (!words) return;
     struct VkDescriptorSet_T *s = vk_push_set_new(sl, words, size);
+    if (!s) { free(words); return; }
     if (tmpl) vk_apply_template(s, tmpl, data);
     else vk_push_set_write(s, n, writes);
     c_push_set *c = record(cb, C_PUSH_SET, sizeof *c);
@@ -974,13 +976,23 @@ static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
         struct VkDescriptorSet_T *ds = b->push[s] ? b->push[s] : b->sets[s];
         if (!ds) continue;
         // The attachments and directly bound resources are already known to Metal.
-        use_heaps_render(e);
+        if (ds->layout->uses_heaps) use_heaps_render(e);
         if (b->push[s]) {
             if (sets_vertex & mask) { [r setVertexBytes:ds->words length:ds->size atIndex:s]; e->rc.vbuf[s] = nil; e->rc.voff[s] = ~0ull; }
             if (pl->sets_fragment & mask) { [r setFragmentBytes:ds->words length:ds->size atIndex:s]; e->rc.fbuf[s] = nil; e->rc.foff[s] = ~0ull; }
         } else {
             if (sets_vertex & mask) rc_vbuf(e, ds->pool->buffer, ds->offset, s);
             if (pl->sets_fragment & mask) rc_fbuf(e, ds->pool->buffer, ds->offset, s);
+        }
+    }
+    // A heap declaration omits render targets. Declare the exact views read as input attachments.
+    for (uint32_t s = 0; s < VKMSL_MAX_SETS; s++) {
+        if (!(pl->sets_fragment & (1u << s))) continue;
+        const struct VkDescriptorSet_T *ds = b->push[s] ? b->push[s] : b->sets[s];
+        if (!ds) continue;
+        for (uint32_t i = 0; i < ds->layout->input_count; i++) {
+            id<MTLTexture> texture = ds->input_textures[i];
+            if (texture) [r useResource:texture usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
         }
     }
     if (aux_vertex || pl->aux_fragment) {
