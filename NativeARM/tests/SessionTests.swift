@@ -59,6 +59,12 @@ import Darwin
                 for role in ["host", "encoder"] {
                     guard try String(contentsOf: root.appendingPathComponent(role + "-loading-path")) == loading else { throw NativeFailure("Loading map is not shared with both native processes") }
                 }
+                let prehostLoading = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("encoder-prehost-loading.json"))) as? [String: Any]
+                guard prehostLoading?["type"] as? String == "begin_loading",
+                      prehostLoading?["mapName"] as? String == "startup",
+                      prehostLoading?["visible"] as? Bool == false else {
+                    throw NativeFailure("Encoder did not receive hidden startup loading state before host launch")
+                }
                 let stage = config.logs.appendingPathComponent("loading-stage.json").path
                 for role in ["host", "encoder"] {
                     guard try String(contentsOf: root.appendingPathComponent(role + "-stage-path")) == stage else { throw NativeFailure("Stage is not shared with both native processes") }
