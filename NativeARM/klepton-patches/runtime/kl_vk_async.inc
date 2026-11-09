@@ -6,10 +6,10 @@
 // hitches when characters or new areas appear). With KL_VK_ASYNC_PIPELINES=1
 // the create info is deep-copied, the guest gets a placeholder handle at once,
 // and worker threads compile ahead of use. Pending graphics draws are omitted
-// without waiting, including depth passes: uninterrupted head motion takes
-// priority over complete cold frames. Ready materials activate together at
-// the next stereo frame boundary. Cached shadow contents may be incomplete
-// until the engine redraws them; this policy is not a shadow-correctness fix.
+// without waiting for ordinary scene materials. Required offscreen lighting,
+// single-sample masks and depth passes complete on first use so cached shadow
+// contents cannot retain an omitted draw. Ordinary materials still activate
+// together at a stereo frame boundary.
 // Anything the copy does not understand is compiled synchronously as before.
 //
 // While compiles are in flight, destroys of shader modules, pipeline layouts,
@@ -176,7 +176,7 @@ typedef struct kva_pipe {
     _Atomic int state;              // 0 pending, 1 ready, 2 failed
     uint64_t ready_serial;          // immutable after state becomes ready
     _Atomic int demanded;           // priority hint; never locks the recording thread
-    int depth_only;
+    int required_first_use;
     int destroy_requested;          // under g_kva_mu
     VkDevice dev;
     VkPipelineCache cache;
@@ -202,6 +202,8 @@ static int kva_private_archive(void) {
 static pthread_cond_t g_kva_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_kva_ready = PTHREAD_COND_INITIALIZER;
 static kva_pipe *g_kva_head, *g_kva_tail, *g_kva_active;
+static int g_kva_preserve_required = 1;
+static int g_kva_preserve_all;
 static int g_kva_pending;                   // queued + compiling
 static unsigned long long g_kva_done, g_kva_failed, g_kva_sync, g_kva_deferred_binds, g_kva_failed_binds;
 static double g_kva_ms;
@@ -286,6 +288,16 @@ static int kva_depth_only(const VkGraphicsPipelineCreateInfo *ci) {
     for (uint32_t i = 0; i < ci->pColorBlendState->attachmentCount; i++)
         if (ci->pColorBlendState->pAttachments[i].colorWriteMask) return 0;
     return 1;
+}
+
+// The 4x-MSAA scene may defer a cold material. Single-sample passes also
+// write persistent coloured lighting/shadow masks, whose omitted draws can
+// leave excessive fog illumination until the engine rebuilds that mask.
+static int kva_required_first_use(const VkGraphicsPipelineCreateInfo *ci) {
+    if (kva_depth_only(ci)) return 1;
+    int usage = kva_render_usage(ci);
+    if (usage >= 0 && !(usage & 2)) return 1;
+    return ci->pMultisampleState && ci->pMultisampleState->rasterizationSamples == VK_SAMPLE_COUNT_1_BIT;
 }
 
 typedef struct { int kind; VkDevice dev; uint64_t h; } kva_deferred;   // 0 module 1 layout 2 renderpass 3 dsl 4 cache
@@ -613,12 +625,13 @@ static void *kva_worker(void *arg) {
 }
 
 static void kva_spawn_workers(void) {
+    g_kva_preserve_all = kl_env_on("KL_VK_ASYNC_WAIT_ALL", 0);
     const char *e = getenv("KL_VK_ASYNC_THREADS");
     int n = e && *e ? atoi(e) : 3;
     if (n < 1) n = 1;
     if (n > 8) n = 8;
     for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, kva_worker, NULL); pthread_detach(t); }
-    VKI("[async] pipeline compiles moved off the render thread (%d workers) with private caches; nonblocking colour/depth binds; materials activate at stereo frame boundaries\n", n);
+    VKI("[async] pipeline compiles moved off the render thread (%d workers) with private caches; nonblocking scene materials; required lighting/depth first-use preserved; materials activate at stereo frame boundaries\n", n);
 }
 static void kva_start_workers(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -637,8 +650,8 @@ static int kva_create(VkDevice dev, VkPipelineCache cache, uint32_t n, const VkG
         kva_pipe *p = (kva_pipe *)calloc(1, sizeof *p);
         if (!p) goto fail;
         p->magic = KVA_MAGIC; p->dev = dev; p->cache = cache;
-        p->depth_only = kva_depth_only(&ci[i]);
-        if (p->depth_only) {
+        p->required_first_use = kva_required_first_use(&ci[i]);
+        if (p->required_first_use) {
             static unsigned long long targets;
             if (__atomic_add_fetch(&targets, 1, __ATOMIC_RELAXED) <= 32)
                 VKI("[async] depth/stencil pipeline: renderPass=%#llx subpass=%u targets=%d\n",
@@ -717,15 +730,27 @@ static int kva_bind_wait_ms(void) {
     return v < 0 ? 0 : (v > 2000 ? 2000 : v);
 }
 
-// Never wait for a graphics pipeline on the thread recording a frame unless
-// KL_VK_BIND_WAIT_MS requests bounded demand waiting so multi-pass draws
-// (such as character eyes or lit surfaces) never omit a companion pass.
+// Ordinary materials remain nonblocking (or bounded by KL_VK_BIND_WAIT_MS);
+// cached depth/shadow passes cannot be omitted on first use.
 static inline uint64_t kva_bind(void *cb, uint32_t bindPoint, uint64_t pipeline) {
     if (!kva_on() || bindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS) return pipeline;
     kva_pipe *p = kva_of(pipeline);
     if (!p) { kva_set_skip(cb, 0); return pipeline; }
-    int wait_ms = kva_bind_wait_ms();
     int state = atomic_load(&p->state);
+    if ((p->required_first_use || g_kva_preserve_all) && g_kva_preserve_required) {
+        if (state == 0) {
+            pthread_mutex_lock(&g_kva_mu);
+            atomic_store(&p->demanded, 1);
+            kva_prioritize_locked(p);
+            while ((state = atomic_load(&p->state)) == 0)
+                pthread_cond_wait(&g_kva_ready, &g_kva_mu);
+            pthread_mutex_unlock(&g_kva_mu);
+        }
+        // Offscreen outputs are shared by later lighting passes; frame-delayed activation
+        // would otherwise drop a ready shadow pass for the rest of this frame.
+        if (state == 1) { kva_set_skip(cb, 0); return atomic_load(&p->real); }
+    }
+    int wait_ms = kva_bind_wait_ms();
     if (state == 0 && wait_ms > 0) {
         atomic_store(&p->demanded, 1);
         pthread_mutex_lock(&g_kva_mu);
