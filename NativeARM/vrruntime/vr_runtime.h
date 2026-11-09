@@ -134,6 +134,7 @@ struct PoseSet {
     bool inputsFresh;
 };
 void sample_poses(PoseSet *out, double predictSeconds);
+bool hand_pose_at(int hand,double time,vr::TrackedDevicePose_t *out);
 // Recover the headset sample ID for an application's submitted render pose.
 // Zero means no matching sample remains in the bounded recent history.
 double timestamp_for_head_pose(const vr::HmdMatrix34_t &pose);
