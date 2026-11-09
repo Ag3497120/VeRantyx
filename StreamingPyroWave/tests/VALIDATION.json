@@ -1,0 +1,11 @@
+{
+  "mac_arm64_release_build": "passed",
+  "cpu_ubsan_tests": 5,
+  "packet_batch_reference_cases": 1000,
+  "vulkan_patch_clean_apply_check": "passed against d2997ac172bdc00e29c58e3f2938acb7e94580bf",
+  "fresh_android_receiver_build": false,
+  "fresh_verantyx_headset_ab": false,
+  "default_cdf53_enabled": false,
+  "application_binary_hooks_included": false,
+  "notes": "Historical measurements are separated from source/build validation; no current VeRantyx performance result is claimed."
+}
