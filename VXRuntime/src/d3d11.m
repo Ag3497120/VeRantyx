@@ -402,13 +402,12 @@ static void buffer_destroy(d3d_object *o) {
     d3d_buffer *b = (d3d_buffer *)o;
     drop_slice(o->dev, b);
     if (b->mtl) CFBridgingRelease(b->mtl);
-    if (b->shm) munmap(b->shm, b->shm_size);
     if (b->shared) d3d_shared_release(b->shared - 1);
 }
-d3d_buffer *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared, void *shm, size_t shm_size) {
+d3d_buffer *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared) {
     d3d_buffer *b = d3d_alloc(sizeof *b, K_BUFFER, g_buffer_vtbl, dev);
     memcpy(b->desc, desc, sizeof b->desc);
-    b->mtl = mtl; b->shared = shared; b->shm = shm; b->shm_size = shm_size;
+    b->mtl = mtl; b->shared = shared;
     b->base.destroy = buffer_destroy;
     b->base.vtbl2 = d3d_dxgi_resource_vtbl();
     return b;
@@ -1654,18 +1653,17 @@ static WINAPI HRESULT device_create_buffer(void *this, const uint32_t *desc, con
     if (!desc || !desc[0]) return E_INVALIDARG;
     if (!out) return S_FALSE;
     if (desc[4] & MISC_SHARED_ANY) {                             // shared with other processes: shared memory
-        void *shm = NULL; size_t size = 0; int slot;
-        void *mtl = d3d_shared_buffer(d, desc, &shm, &size, &slot);
+        int slot;
+        void *mtl = d3d_shared_buffer(d, desc, init ? init->data : NULL, &slot);
         if (mtl) {
-            if (init && init->data) memcpy(shm, init->data, desc[0]);
-            *out = d3d_buffer_wrap(d, desc, mtl, slot + 1, shm, size);
+            *out = d3d_buffer_wrap(d, desc, mtl, slot + 1);
             return S_OK;
         }
     }
     id<MTLBuffer> b = cpu_buffer((__bridge id<MTLDevice>)d->mtl, desc[0]);
     if (!b) return E_OUTOFMEMORY;
     if (init && init->data) memcpy(b.contents, init->data, desc[0]);
-    *out = d3d_buffer_wrap(d, desc, (void *)CFBridgingRetain(b), 0, NULL, 0);
+    *out = d3d_buffer_wrap(d, desc, (void *)CFBridgingRetain(b), 0);
     return S_OK;
 }
 static WINAPI HRESULT device_create_rtv(void *this, d3d_object *res, const uint32_t *desc, void **out) {

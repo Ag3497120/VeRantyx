@@ -9,6 +9,7 @@
 #import <IOSurface/IOSurface.h>
 #include "d3d_common.h"
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -119,34 +120,58 @@ void *d3d_shared_texture(d3d_device *dev, MTLTextureDescriptor *td, const uint32
     if (vx_trace) vx_log("Direct3D: shared texture %ux%u format %u: IOSurface %u, handle %#x", (unsigned)td.width, (unsigned)td.height, desc[TD_FORMAT], (unsigned)IOSurfaceGetID(tex.iosurface), D3D_SHARED_HANDLE_BASE + 4 * s);
     return (void *)CFBridgingRetain(tex);
 }
-// A buffer for sharing: shared memory (whole pages) that a Metal buffer uses without copying.
-static void *map_shared_buffer(d3d_device *dev, const char *name, size_t size, int create, void **shm) {
-    int fd = shm_open(name, O_RDWR | (create ? O_CREAT : 0), 0600);
-    if (fd < 0) return NULL;
-    if (create) ftruncate(fd, (off_t)size);
+// Rosetta reports 4 KiB process pages, but Metal can import memory at the host's page granularity.
+static void *map_buffer_pages(int fd, size_t size) {
+    size_t page = vm_kernel_page_size;
     void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED || (uintptr_t)p % page == 0) return p;
+    munmap(p, size);
+
+    // Reserve the range first so MAP_FIXED can replace only pages we own.
+    void *space = mmap(NULL, size + page, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (space == MAP_FAILED) return MAP_FAILED;
+    uintptr_t aligned = round_page_kernel((uintptr_t)space);
+    p = mmap((void *)aligned, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    if (p == MAP_FAILED) { munmap(space, size + page); return MAP_FAILED; }
+    size_t prefix = aligned - (uintptr_t)space;
+    if (prefix) munmap(space, prefix);
+    munmap((uint8_t *)p + size, page - prefix);
+    return p;
+}
+
+// A buffer for sharing: Metal uses the same mapping as both processes' CPU code.
+static void *map_shared_buffer(d3d_device *dev, const char *name, size_t size, int create,
+                               const void *initial, size_t initial_size) {
+    int fd = shm_open(name, O_RDWR | (create ? O_CREAT | O_EXCL : 0), 0600);
+    if (fd < 0) return NULL;
+    if (create && ftruncate(fd, (off_t)size)) { close(fd); return NULL; }
+    void *p = map_buffer_pages(fd, size);
     close(fd);
     if (p == MAP_FAILED) return NULL;
-    id<MTLBuffer> b = [(__bridge id<MTLDevice>)dev->mtl newBufferWithBytesNoCopy:p length:size options:MTLResourceStorageModeShared deallocator:nil];
-    if (!b) { munmap(p, size); return NULL; }
-    *shm = p;
+    if (initial) memcpy(p, initial, initial_size);
+    id<MTLBuffer> b = [(__bridge id<MTLDevice>)dev->mtl newBufferWithBytesNoCopy:p length:size options:MTLResourceStorageModeShared
+                                                                  deallocator:^(void *bytes, NSUInteger length) { munmap(bytes, length); }];
+    if (!b) {
+        vx_log("Direct3D: Metal could not wrap %zu bytes of shared buffer memory", size);
+        munmap(p, size);
+        return NULL;
+    }
     return (void *)CFBridgingRetain(b);
 }
-void *d3d_shared_buffer(d3d_device *dev, const uint32_t desc[6], void **shm, size_t *shm_size, int *slot) {
+void *d3d_shared_buffer(d3d_device *dev, const uint32_t desc[6], const void *initial, int *slot) {
     *slot = take_slot();
     if (*slot < 0) return NULL;
-    size_t page = (size_t)getpagesize(), size = (desc[0] + page - 1) / page * page;
+    size_t size = round_page_kernel((size_t)desc[0]);
     char name[32];
     snprintf(name, sizeof name, "/vxb.%d.%d", (int)getpid(), *slot);
     shm_unlink(name);
-    void *b = map_shared_buffer(dev, name, size, 1, shm);
-    if (!b) { d3d_shared_release(*slot); *slot = -1; return NULL; }
+    void *b = map_shared_buffer(dev, name, size, 1, initial, desc[0]);
+    if (!b) { shm_unlink(name); d3d_shared_release(*slot); *slot = -1; return NULL; }
     shared_slot *e = &table()->s[*slot];
     e->kind = 2; e->size = size;
     snprintf(e->shm, sizeof e->shm, "%s", name);
     memcpy(e->desc, desc, sizeof(uint32_t) * 6);
     __atomic_store_n(&e->used, 2, __ATOMIC_RELEASE);
-    *shm_size = size;
     if (vx_trace) vx_log("Direct3D: shared buffer of %u bytes: handle %#x", desc[0], D3D_SHARED_HANDLE_BASE + 4 * *slot);
     return b;
 }
@@ -197,10 +222,9 @@ HRESULT d3d_open_shared(d3d_device *dev, HANDLE h, const GUID *iid, void **out) 
         d3d_shared_note((d3d_texture *)o);
         if (getenv("VXRT_TRACE_KEYED")) vx_log("opened shared texture slot %d: %ux%u DXGI format %u, IOSurface %u", s, e->desc[TD_WIDTH], e->desc[TD_HEIGHT], e->desc[TD_FORMAT], e->surface);
     } else if (e->kind == 2) {
-        void *shm = NULL;
-        void *b = map_shared_buffer(dev, e->shm, (size_t)e->size, 0, &shm);
-        if (!b) return E_INVALIDARG;
-        o = &d3d_buffer_wrap(dev, e->desc, b, s + 1, shm, (size_t)e->size)->base;
+        void *b = map_shared_buffer(dev, e->shm, (size_t)e->size, 0, NULL, 0);
+        if (!b) { vx_log("Direct3D: could not open shared buffer %p", h); return E_INVALIDARG; }
+        o = &d3d_buffer_wrap(dev, e->desc, b, s + 1)->base;
     }
     if (!o) return E_INVALIDARG;
     HRESULT hr = ((HRESULT (WINAPI *)(void *, const GUID *, void **))o->vtbl[0])(o, iid, out);
