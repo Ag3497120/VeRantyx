@@ -198,6 +198,41 @@ import Darwin
         try check(!tracking.observe(pose(8,1), now: trackedAt.addingTimeInterval(5)), "tracking clock reset needs a new baseline")
         try check(tracking.observe(pose(10,2), now: trackedAt.addingTimeInterval(6)), "tracking reconnect")
         try check(NativeFiles.sha256(Data("abc".utf8)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256")
+        let mirrorFile = root.appendingPathComponent("mirror.dat")
+        fm.createFile(atPath: mirrorFile.path, contents: nil)
+        let mirrorHandle = try FileHandle(forWritingTo: mirrorFile)
+        try mirrorHandle.truncate(atOffset: UInt64(NativeIPC.size))
+        func writeSharedFrame(slot: UInt32, seq: UInt32, width: UInt32, height: UInt32, format: UInt32, leftPixel: [UInt8], rightPixel: [UInt8]) throws {
+            let base = 64 + Int(slot & 1) * NativeIPC.block
+            var header = Data(count: 88)
+            func put<T>(_ v: T, _ at: Int) { var val = v; withUnsafeBytes(of: &val) { header.replaceSubrange(at..<at+$0.count, with: $0) } }
+            put(seq, 0); put(width, 4); put(height, 8); put(format, 12)
+            try mirrorHandle.seek(toOffset: UInt64(base))
+            try mirrorHandle.write(contentsOf: header)
+            let eyeW = Int(width / 2)
+            var row = Data( capacity: Int(width) * 4)
+            for _ in 0..<eyeW { row.append(contentsOf: leftPixel) }
+            for _ in 0..<eyeW { row.append(contentsOf: rightPixel) }
+            for r in 0..<Int(height) {
+                try mirrorHandle.seek(toOffset: UInt64(base + 88 + r * Int(width) * 4))
+                try mirrorHandle.write(contentsOf: row)
+            }
+            var ready = slot
+            try mirrorHandle.seek(toOffset: 0)
+            try withUnsafeBytes(of: &ready) { try mirrorHandle.write(contentsOf: $0) }
+        }
+        try writeSharedFrame(slot: 1, seq: 7, width: 8, height: 2, format: 87, leftPixel: [10, 20, 30, 255], rightPixel: [200, 210, 220, 255])
+        let reader = NativeMirrorReader(file: mirrorFile)
+        let mf1 = reader.poll()
+        try check(mf1?.sequence == 7 && mf1?.width == 4 && mf1?.height == 2 && mf1?.image.width == 4 && mf1?.image.height == 2, "mirror extracts left eye BGRA8")
+        try check(reader.poll() == nil, "mirror deduplicates unchanged sequence")
+        try writeSharedFrame(slot: 0, seq: 8, width: 6, height: 3, format: 28, leftPixel: [40, 50, 60, 255], rightPixel: [1, 2, 3, 255])
+        let mf2 = reader.poll()
+        try check(mf2?.sequence == 8 && mf2?.width == 3 && mf2?.height == 3 && mf2?.image.width == 3 && mf2?.image.height == 3, "mirror extracts left eye RGBA8")
+        try writeSharedFrame(slot: 1, seq: 0, width: 8, height: 2, format: 87, leftPixel: [0, 0, 0, 255], rightPixel: [0, 0, 0, 255])
+        try check(NativeIPC.mirrorFrame(mirrorFile) == nil, "in-progress zero sequence rejected")
+        try mirrorHandle.close()
+        reader.closeMap()
         print("Native Swift support: \(checks) checks passed")
     }
 }

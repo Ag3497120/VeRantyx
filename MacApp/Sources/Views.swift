@@ -535,6 +535,11 @@ struct PlayView: View {
                 .pickerStyle(.segmented)
                 .disabled(model.play?.running == true)
                 Text(model.sessionQualityDetail).font(.callout).foregroundStyle(.secondary)
+                Toggle(T("Mirror picture and audio on this Mac", "この Mac にも映像と音を出す"), isOn: $model.mirrorOnMac)
+                    .disabled(model.play?.running == true)
+                Text(T("Shows a live single-eye view in the app (and an optional window) and keeps the Mac's speakers playing alongside the headset.",
+                       "片目の映像をアプリ内（および別ウィンドウ）に表示し、ヘッドセットと同時に Mac のスピーカーからも音を出します。"))
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Text(T("Each game can take its own way to the headset: the ALVR app or the VeRantyx app, chosen on its card and kept for it.",
                        "ゲームごとにヘッドセットへの経路（ALVR アプリか VeRantyx アプリ）を選べます。各カードで選び、ゲームごとに保存されます。"))
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -873,6 +878,37 @@ struct SessionCard: View {
             if let problem = play.problem {
                 Label(problem, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
+            if play.mirrorOnMac && !play.flat && play.running {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label(T("Mirror on this Mac (left eye + Mac speakers)", "この Mac のミラー表示（左目＋Mac スピーカー）"), systemImage: "tv.and.hifispeaker.fill")
+                            .font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            MirrorWindow.shared.show(image: play.mirrorImage, title: play.title)
+                        } label: {
+                            Label(T("Open mirror window", "ミラーウィンドウを開く"), systemImage: "macwindow.on.rectangle")
+                        }
+                        .controlSize(.small)
+                    }
+                    if let cgImage = play.mirrorImage {
+                        Image(decorative: cgImage, scale: 1.0)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(maxWidth: .infinity, maxHeight: 360)
+                            .background(Color.black)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    } else {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text(T("Waiting for the first VR frame…", "最初の VR フレームを待っています…"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 120)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.25)))
+                    }
+                }
+            }
             if play.appID == "546560" { FPSComparisonView(play: play) }
             DisclosureGroup(T("The game's log", "ゲームのログ"), isExpanded: $showLog) {
                 VStack(alignment: .leading, spacing: 1) {
@@ -938,6 +974,47 @@ struct Step: View {
             else { Image(systemName: "circle").foregroundStyle(.tertiary) }
             Text(text).font(.callout).foregroundStyle(done || active ? .primary : .secondary)
         }
+    }
+}
+
+@MainActor final class MirrorWindow {
+    static let shared = MirrorWindow()
+    private var window: NSWindow?
+    private let imageView = NSView()
+
+    func show(image: CGImage?, title: String) {
+        if window == nil {
+            let w = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 960, height: 600),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            w.isReleasedWhenClosed = false
+            w.backgroundColor = .black
+            w.collectionBehavior = [.fullScreenPrimary, .managed]
+            w.minSize = NSSize(width: 480, height: 300)
+            imageView.wantsLayer = true
+            imageView.layer?.backgroundColor = NSColor.black.cgColor
+            imageView.layer?.contentsGravity = .resizeAspect
+            w.contentView = imageView
+            w.center()
+            window = w
+        }
+        window?.title = TF("%@ — Mirror", "%@ — ミラー", title)
+        imageView.layer?.contents = image
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func update(image: CGImage?, title: String) {
+        guard let window, window.isVisible else { return }
+        window.title = TF("%@ — Mirror", "%@ — ミラー", title)
+        imageView.layer?.contents = image
+    }
+
+    func close() {
+        imageView.layer?.contents = nil
+        window?.orderOut(nil)
     }
 }
 

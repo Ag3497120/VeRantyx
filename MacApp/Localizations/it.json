@@ -284,7 +284,13 @@
  "Steam for Mac was not signed in when the game started.": "Steam per Mac non aveva effettuato l'accesso all'avvio del gioco.",
  "ALVR's setting (72 Hz unless changed)": "Impostazione di ALVR (72 Hz se non modificata)",
  "Refresh rate": "Frequenza di aggiornamento",
- "The headset's display rate. A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 60 Hz on a headset that has it (Quest 1); at 72 Hz some frames are shown twice and some once, which judders. The headset takes the nearest rate it has. Takes effect at the next play.": "La frequenza del display del visore. Un gioco a 60 fps è più fluido a 120 Hz, dove ogni fotogramma viene mostrato due volte, o a 60 Hz su un visore che la offre (Quest 1); a 72 Hz alcuni fotogrammi vengono mostrati due volte e altri una, con scatti. Il visore usa la frequenza più vicina che ha. Vale dalla prossima partita.",
  "The headset's field of view changed after the game started (ALVR's FoV setting?): stop and start the game again, or the eyes do not line up.": "Il campo visivo del visore è cambiato dopo l'avvio del gioco (l'impostazione FoV di ALVR?): ferma il gioco e riavvialo, altrimenti gli occhi non coincidono.",
- "Stream over UDP (try it if the picture lags on Wi-Fi)": "Trasmetti via UDP (provalo se l'immagine è in ritardo in Wi-Fi)"
+ "Stream over UDP (try it if the picture lags on Wi-Fi)": "Trasmetti via UDP (provalo se l'immagine è in ritardo in Wi-Fi)",
+ "Mirror picture and audio on this Mac": "Duplica immagine e audio su questo Mac",
+ "Shows a live single-eye view in the app (and an optional window) and keeps the Mac's speakers playing alongside the headset.": "Mostra in diretta la vista di un occhio nell'app (e in una finestra opzionale) e mantiene attivi gli altoparlanti del Mac insieme al visore.",
+ "Mirror on this Mac (left eye + Mac speakers)": "Duplicazione su questo Mac (occhio sinistro + altoparlanti del Mac)",
+ "Open mirror window": "Apri finestra di duplicazione",
+ "Waiting for the first VR frame…": "In attesa del primo fotogramma VR…",
+ "%@ — Mirror": "%@ — Duplicazione",
+ "The headset's display rate. Quest 2, Quest 3 and Pico support 72, 80, 90 and 120 Hz (60 Hz is Quest 1 only and falls back to 72 Hz on newer headsets). A game at 60 fps looks smoothest at 120 Hz, where each frame is shown twice, or at 72 Hz when the Mac can sustain 72 fps. Takes effect at the next play.": "La frequenza di aggiornamento del visore. Quest 2, Quest 3 e Pico supportano 72, 80, 90 e 120 Hz (60 Hz è solo per Quest 1 e passa a 72 Hz sui visori più recenti). Un gioco a 60 fps appare più fluido a 120 Hz, dove ogni fotogramma viene mostrato due volte, oppure a 72 Hz quando il Mac riesce a sostenere 72 fps. Ha effetto dal prossimo avvio."
 }

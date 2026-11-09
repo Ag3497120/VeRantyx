@@ -1,5 +1,6 @@
 // Playing: the repository's launch scripts, run from the app's runtime folder with the settings chosen here, and what
 // their logs say while they run (SteamVR up, the headset connected, the frame rate).
+import CoreGraphics
 import Foundation
 import Observation
 
@@ -73,6 +74,11 @@ enum Quality: String, CaseIterable, Identifiable {
     var nativeQuitTimedOut = false
     /// On the Mac's screen, without SteamVR or a headset.
     let flat: Bool
+    /// Mirrors the left eye in the app and keeps the Mac's speakers unmuted while streaming to the headset.
+    let mirrorOnMac: Bool
+    var mirrorImage: CGImage? = nil
+    @ObservationIgnored private var mirrorReader: NativeMirrorReader?
+    @ObservationIgnored private var mirrorTimer: Timer?
     var phase: Phase = .starting
     var headsetConnected = false
     var fps: Double? = nil
@@ -125,7 +131,7 @@ enum Quality: String, CaseIterable, Identifiable {
     nonisolated static var dryRun: Bool { ProcessInfo.processInfo.environment["VERANTYX_DRY_RUN"] == "1" }
 
     init(title: String, appID: String? = nil, exe: URL?, headset: Headset, wired: Bool, refreshHz: Int = 0, udp: Bool = false, quality: Quality, known: Title? = nil,
-         flat: Bool = false, backend: GameBackend = .vxrt) throws {
+         flat: Bool = false, backend: GameBackend = .vxrt, mirrorOnMac: Bool = false) throws {
         self.title = title
         self.appID = appID
         self.backend = backend
@@ -134,6 +140,7 @@ enum Quality: String, CaseIterable, Identifiable {
         self.quality = quality
         self.known = known
         self.flat = flat
+        self.mirrorOnMac = mirrorOnMac && !flat
         let scripts = Paths.runtime.appendingPathComponent("scripts")
         try FileManager.default.createDirectory(at: Paths.logs, withIntermediateDirectories: true)
         var env = ProcessInfo.processInfo.environment
@@ -145,6 +152,10 @@ enum Quality: String, CaseIterable, Identifiable {
         if known?.launcher == true { env["VXRT_MESSAGEBOX"] = "auto" }   // (the launcher's message boxes answer themselves)
         // (always said, never inherited: launch_vxrt_nms_vr.sh takes ALVR when it is not set)
         env["VERANTYX_ALVR"] = !flat && headset.usesALVR ? "1" : "0"
+        if self.mirrorOnMac {
+            env["VERANTYX_AUDIO_KEEP_MAC_SPEAKERS"] = "1"
+            env["VERANTYX_MIRROR"] = "1"
+        }
         if flat {
             env["VXRT_FLAT"] = "1"                          // (launch_vxrt_game.sh: no SteamVR, the game takes the Mac's focus)
             env["VXRT_STATS"] = "1"                         // (the game's frame rate, "present: N/s", in its log)
@@ -238,9 +249,26 @@ enum Quality: String, CaseIterable, Identifiable {
             Task { @MainActor in self?.ended(status) }
         }
         try process.run()
+        if !flat {
+            let sharedFrame = backend == .nativeARM64
+                ? nativeSession!.appendingPathComponent("frame.dat")
+                : Paths.drive.appendingPathComponent("SteamVR_Prefix/drive_c/vr_shared_frame.dat")
+            mirrorReader = NativeMirrorReader(file: sharedFrame)
+            if self.mirrorOnMac && !Play.dryRun {
+                let mt = Timer(timeInterval: 1.0 / 24.0, repeats: true) { [weak self] _ in Task { @MainActor in self?.pollMirror() } }
+                RunLoop.main.add(mt, forMode: .common)
+                mirrorTimer = mt
+            }
+        }
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.poll() } }
         RunLoop.main.add(t, forMode: .common)             // (.common: also while a menu is open or the window is resized)
         timer = t
+    }
+
+    func pollMirror() {
+        guard running, mirrorOnMac, let frame = mirrorReader?.poll() else { return }
+        mirrorImage = frame.image
+        MirrorWindow.shared.update(image: frame.image, title: title)
     }
 
     var running: Bool { phase != .ended }
@@ -290,6 +318,12 @@ enum Quality: String, CaseIterable, Identifiable {
 
     private func ended(_ status: Int32) {
         timer?.invalidate()
+        mirrorTimer?.invalidate()
+        mirrorTimer = nil
+        mirrorReader?.closeMap()
+        mirrorReader = nil
+        mirrorImage = nil
+        MirrorWindow.shared.close()
         poll()
         phase = .ended
         nativeQuitTimedOut = false

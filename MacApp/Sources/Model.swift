@@ -104,6 +104,10 @@ struct Job {
     var quality: Quality = Quality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .standard {
         didSet { if savingPreferences { UserDefaults.standard.set(quality.rawValue, forKey: "quality") } }
     }
+    /// Mirrors the headset's left-eye picture in the app and keeps the Mac's speakers unmuted alongside headset audio.
+    var mirrorOnMac: Bool = UserDefaults.standard.bool(forKey: "mirrorOnMac") {
+        didSet { if savingPreferences { UserDefaults.standard.set(mirrorOnMac, forKey: "mirrorOnMac") } }
+    }
     /// Each game's way to the headset, chosen on its card (Route's raw value by app id); a game not in it follows the
     /// Headset page. Kept in the setting "headsetRoutes".
     var routes: [String: String] = (UserDefaults.standard.dictionary(forKey: "headsetRoutes") as? [String: String]) ?? [:] {
@@ -119,9 +123,11 @@ struct Job {
         self.savingPreferences = savingPreferences && !Play.dryRun
         preferredBackend = preferences.backend
         quality = preferences.quality
+        mirrorOnMac = preferences.mirrorOnMac
         if self.savingPreferences {
             UserDefaults.standard.set(preferences.backend.rawValue, forKey: "preferredBackend")
             UserDefaults.standard.set(preferences.quality.rawValue, forKey: "quality")
+            UserDefaults.standard.set(preferences.mirrorOnMac, forKey: "mirrorOnMac")
         }
         guard refreshAutomatically else { return }
         Task { await refresh() }
@@ -706,7 +712,7 @@ struct Job {
         do {
             play = try Play(title: game.name, appID: game.id, exe: game.alyx ? nil : game.exe, headset: headset(for: game), wired: wired, refreshHz: alvrRefreshHz, udp: alvrUDP,
                             quality: quality(for: game), known: game.title, flat: flat && game.title?.flat == true,
-                            backend: backend(forID: game.id))
+                            backend: backend(forID: game.id), mirrorOnMac: mirrorOnMac)
         } catch {
             self.error = error.localizedDescription
         }

@@ -1,5 +1,6 @@
 // Shared by the app, the session helper and offline tests. No game code is loaded here.
 import Foundation
+import CoreGraphics
 import CryptoKit
 import Darwin
 
@@ -382,6 +383,13 @@ struct NativeTrackingActivity {
     }
 }
 
+struct NativeMirrorFrame {
+    var sequence: UInt32
+    var width: Int
+    var height: Int
+    var image: CGImage
+}
+
 enum NativeIPC {
     static let block = 88 + 4096 * 4096 * 8
     static let hands = 64 + 2 * block
@@ -403,6 +411,106 @@ enum NativeIPC {
               (0..<16).allSatisfy({ part($0 * 4, Float.self).isFinite }),
               [0, 2, 4, 6].allSatisfy({ tangents[$0] < 0 && tangents[$0 + 1] > 0 }) else { return nil }
         return NativeViewSnapshot(sequence: first, timestamp: timestamp, ipd: ipd, tangents: tangents)
+    }
+
+    static func mirrorFrame(from map: UnsafeRawPointer, after lastSequence: UInt32 = 0) -> NativeMirrorFrame? {
+        func value<T>(_ at: Int, _: T.Type) -> T { map.loadUnaligned(fromByteOffset: at, as: T.self) }
+        let ready = value(0, UInt32.self)
+        let idx = Int(ready & 1)
+        let base = 64 + idx * block
+        let seq = value(base, UInt32.self)
+        guard seq > 0, seq != lastSequence else { return nil }
+        OSMemoryBarrier()
+        let fullW = Int(value(base + 4, UInt32.self))
+        let h = Int(value(base + 8, UInt32.self))
+        let format = value(base + 12, UInt32.self)
+        let eyeW = fullW / 2
+        guard fullW >= 2, fullW <= 4096, fullW & 1 == 0, h >= 1, h <= 4096 else { return nil }
+        let bitmapInfo: CGBitmapInfo
+        switch format {
+        case 87, 91:
+            bitmapInfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue)
+        case 28, 29:
+            bitmapInfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.noneSkipLast.rawValue)
+        default:
+            return nil
+        }
+        let srcStride = fullW * 4
+        let dstStride = eyeW * 4
+        let pixels = map.advanced(by: base + 88)
+        var out = Data(count: dstStride * h)
+        out.withUnsafeMutableBytes { dst in
+            guard let dstBase = dst.baseAddress else { return }
+            for row in 0..<h {
+                memcpy(dstBase.advanced(by: row * dstStride), pixels.advanced(by: row * srcStride), dstStride)
+            }
+        }
+        OSMemoryBarrier()
+        guard value(base, UInt32.self) == seq, value(0, UInt32.self) == ready else { return nil }
+        guard let provider = CGDataProvider(data: out as CFData),
+              let image = CGImage(
+                  width: eyeW,
+                  height: h,
+                  bitsPerComponent: 8,
+                  bitsPerPixel: 32,
+                  bytesPerRow: dstStride,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: bitmapInfo,
+                  provider: provider,
+                  decode: nil,
+                  shouldInterpolate: true,
+                  intent: .defaultIntent
+              ) else { return nil }
+        return NativeMirrorFrame(sequence: seq, width: eyeW, height: h, image: image)
+    }
+
+    static func mirrorFrame(_ file: URL, after lastSequence: UInt32 = 0) -> NativeMirrorFrame? {
+        let fd = open(file.path, O_RDONLY | O_NOFOLLOW); guard fd >= 0 else { return nil }; defer { close(fd) }
+        var st = stat(); guard fstat(fd, &st) == 0, st.st_size >= hands else { return nil }
+        guard let map = mmap(nil, hands, PROT_READ, MAP_SHARED, fd, 0), map != MAP_FAILED else { return nil }
+        defer { munmap(map, hands) }
+        return mirrorFrame(from: UnsafeRawPointer(map), after: lastSequence)
+    }
+}
+
+final class NativeMirrorReader {
+    let file: URL
+    private var fd: Int32 = -1
+    private var map: UnsafeMutableRawPointer?
+    private var mappedInode: ino_t = 0
+    private(set) var lastSequence: UInt32 = 0
+
+    init(file: URL) { self.file = file }
+    deinit { closeMap() }
+
+    func closeMap() {
+        if let map { munmap(map, NativeIPC.hands); self.map = nil }
+        if fd >= 0 { close(fd); fd = -1 }
+        mappedInode = 0
+    }
+
+    func poll() -> NativeMirrorFrame? {
+        var st = stat()
+        guard lstat(file.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size >= NativeIPC.hands else {
+            closeMap()
+            return nil
+        }
+        if map == nil || st.st_ino != mappedInode {
+            closeMap()
+            let newFD = open(file.path, O_RDONLY | O_NOFOLLOW)
+            guard newFD >= 0 else { return nil }
+            guard let m = mmap(nil, NativeIPC.hands, PROT_READ, MAP_SHARED, newFD, 0), m != MAP_FAILED else {
+                close(newFD)
+                return nil
+            }
+            fd = newFD
+            map = m
+            mappedInode = st.st_ino
+            lastSequence = 0
+        }
+        guard let map, let frame = NativeIPC.mirrorFrame(from: UnsafeRawPointer(map), after: lastSequence) else { return nil }
+        lastSequence = frame.sequence
+        return frame
     }
 }
 

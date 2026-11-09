@@ -4,6 +4,7 @@ import Foundation
 struct LaunchPreferences {
     var backend: GameBackend
     var quality: Quality
+    var mirrorOnMac: Bool = false
 
     static func load(_ values: [String: Any]) -> LaunchPreferences {
         let saved = (values["preferredBackend"] as? String).flatMap(GameBackend.init(rawValue:))
@@ -11,7 +12,8 @@ struct LaunchPreferences {
         let backend = saved ?? legacy ?? .vxrt
         let qualityKey = saved == nil && backend == .nativeARM64 ? "nativeAlyxQuality" : "quality"
         let quality = (values[qualityKey] as? String).flatMap(Quality.init(rawValue:)) ?? .standard
-        return LaunchPreferences(backend: backend, quality: backend == .nativeARM64 && ![.standard, .sharp].contains(quality) ? .standard : quality)
+        let mirrorOnMac = (values["mirrorOnMac"] as? Bool) ?? false
+        return LaunchPreferences(backend: backend, quality: backend == .nativeARM64 && ![.standard, .sharp].contains(quality) ? .standard : quality, mirrorOnMac: mirrorOnMac)
     }
 }
 
