@@ -1,0 +1,69 @@
+{
+  "per_eye": [
+    1664,
+    1792
+  ],
+  "Hz": 72,
+  "cases": [
+    {
+      "variant": "h264-new",
+      "target_Mbps": 350,
+      "actual_Mbps": 349.9093507238819,
+      "mean_ms": 33.600033115198535,
+      "p95_ms": 42.622916665095545,
+      "fps": 72.0195485184992,
+      "missing_warm": 0,
+      "total_acquired": 576,
+      "sent": 576,
+      "max_gap_ms": 30.997607,
+      "one_second_counts": [
+        72,
+        72,
+        72
+      ],
+      "band": "usable"
+    },
+    {
+      "variant": "h264-new",
+      "target_Mbps": 350,
+      "actual_Mbps": 350.016961457801,
+      "mean_ms": 33.02721030967051,
+      "p95_ms": 38.36949966444081,
+      "fps": 71.94717683200109,
+      "missing_warm": 0,
+      "total_acquired": 575,
+      "sent": 576,
+      "max_gap_ms": 23.956304,
+      "one_second_counts": [
+        72,
+        72,
+        72
+      ],
+      "band": "usable"
+    },
+    {
+      "variant": "h264-old",
+      "target_Mbps": 350,
+      "actual_Mbps": 112.44229896393088,
+      "mean_ms": 99.21852280847867,
+      "p95_ms": 118.20283266479237,
+      "fps": 30.98349265073503,
+      "missing_warm": 0,
+      "total_acquired": 576,
+      "sent": 576,
+      "max_gap_ms": 48.006515,
+      "one_second_counts": [
+        52,
+        32,
+        27,
+        28,
+        27,
+        28,
+        27,
+        27,
+        28
+      ],
+      "band": "bad"
+    }
+  ]
+}
