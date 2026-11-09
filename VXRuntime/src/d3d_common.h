@@ -110,7 +110,7 @@ typedef struct {
 // mtl: the Metal buffer holding the contents (retained), from byte off on: a small buffer renamed by Map(DISCARD)
 // or UpdateSubresource is a slice of a larger chunk (then chunk is set; its size is desc[0], not mtl's length).
 // so_filled: bytes stream output has written (where an append, offset -1, continues).
-typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; int shared; void *shm; size_t shm_size; size_t off; void *chunk; uint32_t so_filled; } d3d_buffer;
+typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; int shared; size_t off; void *chunk; uint32_t so_filled; } d3d_buffer;
 // A view: of a texture (mip, slices), or of a buffer (first element and count; flags: raw).
 // A view: of a texture (dimension, first mip and mip count, slices), or of a buffer (first element and count;
 // flags: raw, append, counter). counter: a UAV's hidden counter (id<MTLBuffer> of 4 bytes, retained); mtl_view:
@@ -176,7 +176,7 @@ d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], 
 // every vxrt process sees; a shared handle is 0x40000000 + 4 * slot.
 #define D3D_SHARED_HANDLE_BASE 0x40000000u
 void   *d3d_shared_texture(d3d_device *dev, MTLTextureDescriptor *td, const uint32_t desc[TD_COUNT], uint32_t bytes_per_pixel, int *slot);
-void   *d3d_shared_buffer(d3d_device *dev, const uint32_t desc[6], void **shm, size_t *shm_size, int *slot);
+void   *d3d_shared_buffer(d3d_device *dev, const uint32_t desc[6], const void *initial, int *slot);
 void    d3d_shared_release(int slot);
 HRESULT d3d_open_shared(d3d_device *dev, HANDLE h, const GUID *iid, void **out);
 void  **d3d_dxgi_resource_vtbl(void);        // IDXGIResource1 on resources' second table
@@ -191,7 +191,7 @@ extern __thread uint32_t vx_held_ops[7];
 #define HELD_OP(i) do { if (vx_keyed_held) vx_held_ops[i]++; } while (0)
 void d3d_texture_png(d3d_device *dev, void *texture, const char *path);   // dxgi.m (debugging)
 d3d_texture *d3d_texture_wrap(d3d_device *dev, const uint32_t desc[TD_COUNT], void *mtl, int shared);   // mtl retained
-d3d_buffer  *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared, void *shm, size_t shm_size);
+d3d_buffer  *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared);
 void         d3d_texture_replace(d3d_texture *t, void *mtl_texture);     // a swap chain's buffer after a resize
 void         d3d_flush(d3d_device *dev, int wait);                       // commits the immediate context's work
 void         d3d_mark_gpu(d3d_context *c, d3d_object *o);                // a copy recorded now reads or writes o

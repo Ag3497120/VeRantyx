@@ -298,13 +298,14 @@ static void clear_attachments_impl(vk_enc *e, id<MTLRenderCommandEncoder> r, con
     id<MTLRenderPipelineState> ps = cache[key];
     pthread_mutex_unlock(&dev->internal_lock);
     if (!ps) {
+        // Metal only allows render_target_array_index when the render pass enables layered rendering.
         NSMutableString *src = [NSMutableString stringWithString:@"#include <metal_stdlib>\nusing namespace metal;\n"
-            "struct P { float4 c[8]; float depth; uint layer; };\n"
-            "struct V { float4 pos [[position]]; uint layer [[render_target_array_index]]; };\n"
+            "struct P { float4 c[8]; float depth; uint layer; };\n"];
+        [src appendFormat:@"struct V { float4 pos [[position]]; %s };\n"
             "vertex V vs(uint vid [[vertex_id]], uint iid [[instance_id]], constant P& p [[buffer(0)]]) {\n"
             "  float2 xy = float2(float((vid << 1) & 2), float(vid & 2));\n"
-            "  V o; o.pos = float4(xy * float2(2.0, -2.0) + float2(-1.0, 1.0), p.depth, 1.0); o.layer = p.layer + iid; return o; }\n"
-            ];
+            "  V o; o.pos = float4(xy * float2(2.0, -2.0) + float2(-1.0, 1.0), p.depth, 1.0); %s return o; }\n",
+            layered ? "uint layer [[render_target_array_index]];" : "", layered ? "o.layer = p.layer + iid;" : ""];
         uint32_t outputs = 0;
         for (uint32_t i = 0; i < color_count; i++) if (formats[i]) outputs++;
         if (outputs) [src appendString:@"struct O {\n"];

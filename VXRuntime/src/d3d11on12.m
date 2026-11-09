@@ -85,7 +85,7 @@ static WINAPI HRESULT on12_wrap(void *this, void *resource12, const RESOURCE_FLA
     } else if (info.dimension == 1 && info.buffer) {
         uint32_t desc[6] = { (uint32_t)info.width, 0, bind, flags ? flags->cpu : 0, flags ? flags->misc : 0,
                              flags ? flags->stride : 0 };
-        wrapper = &d3d_buffer_wrap(o->dev, desc, (void *)CFBridgingRetain((__bridge id)info.buffer), 0, NULL, 0)->base;
+        wrapper = &d3d_buffer_wrap(o->dev, desc, (void *)CFBridgingRetain((__bridge id)info.buffer), 0)->base;
     } else {
         vx_log("D3D11On12: wrapping a Direct3D 12 resource of dimension %d is not supported yet", info.dimension);
         return E_NOTIMPL;

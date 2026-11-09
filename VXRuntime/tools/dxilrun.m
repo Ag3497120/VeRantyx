@@ -104,6 +104,13 @@ int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/shaders12";
     dev = MTLCreateSystemDefaultDevice();
     queue = [dev newCommandQueue];
+    // A VM's paravirtual GPU does not bind textures by gpuResourceID (their writes never land): the execution
+    // checks cannot hold there. Translation and Metal compilation stay covered by dxil2msl. VXRT_TEST_AS_VM
+    // forces this branch on real hardware so the skip path itself is testable.
+    if ([dev.name containsString:@"Paravirtual"] || getenv("VXRT_TEST_AS_VM")) {
+        printf("dxilrun: skipped (%s: no gpuResourceID texture binding in a VM)\n", dev.name.UTF8String);
+        return 0;
+    }
     int bad = run_sum(dir);
     printf("dxilrun: %s\n", bad ? "FAILED" : "ok");
     return bad;

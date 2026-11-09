@@ -111,6 +111,7 @@ static WINAPI SOCKET WSASocketA(int af, int type, int protocol, void *info, uint
 static WINAPI SOCKET WSASocketW(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) { (void)info; (void)group; (void)flags; return ws_socket(af, type, protocol); }
 static void select_forget(SOCKET s);
 static void select_connect_started(SOCKET s);
+static void select_connect_immediate(SOCKET s, int err);
 static void select_inherit(SOCKET listening, SOCKET accepted);
 static void select_listening(SOCKET s);
 static WINAPI int closesocket(SOCKET s) {
@@ -124,9 +125,16 @@ static WINAPI int ws_bind(SOCKET s, const void *addr, int len) {
 }
 static WINAPI int ws_connect(SOCKET s, const void *addr, int len) {
     struct sockaddr_storage a; socklen_t l = addr_in(addr, len, &a);
-    int r = connect(to_fd(s), (struct sockaddr *)&a, l);
-    // A non-blocking connect completes later: FD_CONNECT then tells how it went (WSAEventSelect below).
-    if ((!r || errno == EINPROGRESS) && (fcntl(to_fd(s), F_GETFL) & O_NONBLOCK)) select_connect_started(s);
+    int fd = to_fd(s);
+    int nb = fcntl(fd, F_GETFL) & O_NONBLOCK;
+    // The connecting flag goes on before connect(): the poller must not see the completion (or a refusal) as plain
+    // writable/closed — a failed connect reports FD_CONNECT alone, as Windows does. Without this, on a fast refusal
+    // the poller could add FD_WRITE between connect() returning and the flag being set.
+    if (nb) select_connect_started(s);
+    int r = connect(fd, (struct sockaddr *)&a, l);
+    // Completed at once with the error (a refused localhost port): the caller's connect() result says it; nothing
+    // more to report.
+    if (nb && r && errno != EINPROGRESS) select_connect_immediate(s, 1);
     return r ? fail() : 0;
 }
 static WINAPI int ws_listen(SOCKET s, int backlog) {
@@ -613,6 +621,12 @@ static void select_connect_started(SOCKET s) {
     pthread_mutex_lock(&g_select_lock);
     set_connecting(to_fd(s), 1);
     for (int i = 0; i < g_select_count; i++) if (g_selects[i].s == s) { g_selects[i].failed = 0; g_selects[i].closed = 0; }
+    pthread_mutex_unlock(&g_select_lock);
+}
+static void select_connect_immediate(SOCKET s, int err) {
+    pthread_mutex_lock(&g_select_lock);
+    set_connecting(to_fd(s), 0);
+    for (int i = 0; i < g_select_count; i++) if (g_selects[i].s == s) g_selects[i].failed = err != 0;
     pthread_mutex_unlock(&g_select_lock);
 }
 static void select_forget(SOCKET s) {

@@ -13,12 +13,15 @@
 static int bad;
 static const char *test = "";
 #define CHECK(x) do { if (!(x)) { printf("vulkan_features: %s: check failed (line %d): %s\n", test, __LINE__, #x); bad++; } } while (0)
+#define REQUIRE_VK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
+    printf("vulkan_features: %s: %s returned %d\n", test, #x, r_); exit(1); } } while (0)
 
 static VkPhysicalDevice gpu;
 static VkDevice device;
 static VkQueue queue;
 static VkCommandPool pool;
 static VkFence fence;
+static const uint64_t wait_timeout = 5000000000ull;
 
 static uint32_t memory_type(uint32_t bits, VkFlags want) {
     VkPhysicalDeviceMemoryProperties props;
@@ -81,11 +84,11 @@ static VkCommandBuffer begin(void) {
     return cb;
 }
 static void submit(VkCommandBuffer cb) {
-    vkEndCommandBuffer(cb);
+    REQUIRE_VK(vkEndCommandBuffer(cb));
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
-    vkResetFences(device, 1, &fence);
-    CHECK(vkQueueSubmit(queue, 1, &si, fence) == VK_SUCCESS);
-    CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS);
+    REQUIRE_VK(vkResetFences(device, 1, &fence));
+    REQUIRE_VK(vkQueueSubmit(queue, 1, &si, fence));
+    REQUIRE_VK(vkWaitForFences(device, 1, &fence, VK_TRUE, wait_timeout));
     vkFreeCommandBuffers(device, pool, 1, &cb);
 }
 static void barrier(VkCommandBuffer cb) {
@@ -266,23 +269,28 @@ int main(void) {
         vkDestroyRenderPass(device, rp, NULL);
         free_image(&ms); free_image(&rs);
     }
-    // 6. Dynamic rendering: a color and a depth/stencil attachment cleared, then a rectangle of the color cleared again
-    //    with vkCmdClearAttachments; the depth and stencil aspects read back.
-    {
-        test = "dynamic rendering";
+    // 6. Dynamic rendering: clear a color rectangle, then repeat with a smaller depth/stencil attachment and read both aspects back.
+    for (int depth_stencil = 0; depth_stencil <= 1; depth_stencil++) {
+        test = depth_stencil ? "dynamic rendering with depth/stencil" : "dynamic rendering color only";
+        uint32_t height = depth_stencil ? 48 : 64;
         img c = make_image(VK_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, VK_SAMPLE_COUNT_1_BIT, color_usage);
-        img d = make_image(VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 64, 1, 1, VK_SAMPLE_COUNT_1_BIT,
-                           VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         VkImageView cv = make_view(c.image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0);
-        VkImageView dv = make_view(d.image, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0);
+        img d = { 0 };
+        VkImageView dv = VK_NULL_HANDLE;
+        if (depth_stencil) {
+            d = make_image(VK_FORMAT_D32_SFLOAT_S8_UINT, 64, height, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+                           VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+            dv = make_view(d.image, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0);
+        }
         VkRenderingAttachmentInfo ca = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = cv,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = { .color = { .float32 = { 0, 0, 1, 1 } } } };
         VkRenderingAttachmentInfo da = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dv,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .depthStencil = { 0.75f, 0x5a } } };
-        VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { 64, 64 } }, .layerCount = 1,
-                               .colorAttachmentCount = 1, .pColorAttachments = &ca, .pDepthAttachment = &da, .pStencilAttachment = &da };
+        VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { 64, height } }, .layerCount = 1,
+                               .colorAttachmentCount = 1, .pColorAttachments = &ca,
+                               .pDepthAttachment = dv ? &da : NULL, .pStencilAttachment = dv ? &da : NULL };
         VkCommandBuffer cb = begin();
         vkCmdBeginRendering(cb, &ri);
         VkClearAttachment clr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, { .color = { .float32 = { 1, 1, 0, 1 } } } };
@@ -290,19 +298,25 @@ int main(void) {
         vkCmdClearAttachments(cb, 1, &clr, 1, &rect);
         vkCmdEndRendering(cb);
         barrier(cb);
-        to_buffer(cb, c.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 64, 64, out.buffer, 0);
-        to_buffer(cb, d.image, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 64, 64, out.buffer, 65536);
-        to_buffer(cb, d.image, VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 64, 64, out.buffer, 2 * 65536);
+        to_buffer(cb, c.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 64, height, out.buffer, 0);
+        if (depth_stencil) {
+            to_buffer(cb, d.image, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 64, height, out.buffer, 65536);
+            to_buffer(cb, d.image, VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 64, height, out.buffer, 2 * 65536);
+        }
         submit(cb);
         CHECK(rgba(out.map + (2 * 64 + 2) * 4, 0, 0, 255, 255));
         CHECK(rgba(out.map + (20 * 64 + 20) * 4, 255, 255, 0, 255));
         CHECK(rgba(out.map + (40 * 64 + 40) * 4, 0, 0, 255, 255));
-        float depth;
-        memcpy(&depth, out.map + 65536 + (5 * 64 + 5) * 4, 4);
-        CHECK(depth == 0.75f);
-        CHECK(out.map[2 * 65536 + 5 * 64 + 5] == 0x5a);
-        vkDestroyImageView(device, cv, NULL); vkDestroyImageView(device, dv, NULL);
-        free_image(&c); free_image(&d);
+        if (depth_stencil) {
+            float depth;
+            memcpy(&depth, out.map + 65536 + (5 * 64 + 5) * 4, 4);
+            CHECK(depth == 0.75f);
+            CHECK(out.map[2 * 65536 + 5 * 64 + 5] == 0x5a);
+            vkDestroyImageView(device, dv, NULL);
+            free_image(&d);
+        }
+        vkDestroyImageView(device, cv, NULL);
+        free_image(&c);
     }
     // 7. Timeline semaphores: signaled from the host and from a submission that waits on the host's value.
     {
@@ -311,26 +325,27 @@ int main(void) {
                                          .initialValue = 1 };
         VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti };
         VkSemaphore t = 0;
-        CHECK(vkCreateSemaphore(device, &si, NULL, &t) == VK_SUCCESS);
+        REQUIRE_VK(vkCreateSemaphore(device, &si, NULL, &t));
         uint64_t v = 0;
         CHECK(vkGetSemaphoreCounterValue(device, t, &v) == VK_SUCCESS && v == 1);
         uint64_t wait_value = 5, signal_value = 7;
         VkCommandBuffer cb = begin();
-        vkEndCommandBuffer(cb);
+        REQUIRE_VK(vkEndCommandBuffer(cb));
         VkTimelineSemaphoreSubmitInfo tsi = { .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 1,
             .pWaitSemaphoreValues = &wait_value, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &signal_value };
         VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkSubmitInfo s = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &tsi, .waitSemaphoreCount = 1, .pWaitSemaphores = &t,
                            .pWaitDstStageMask = &stage, .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = 1,
                            .pSignalSemaphores = &t };
-        CHECK(vkQueueSubmit(queue, 1, &s, VK_NULL_HANDLE) == VK_SUCCESS);
+        REQUIRE_VK(vkResetFences(device, 1, &fence));
+        REQUIRE_VK(vkQueueSubmit(queue, 1, &s, fence));
         VkSemaphoreWaitInfo wi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &t, .pValues = &signal_value };
         CHECK(vkWaitSemaphores(device, &wi, 0) == VK_TIMEOUT);              // (the submission waits for 5 first)
         VkSemaphoreSignalInfo sig = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = t, .value = 5 };
-        CHECK(vkSignalSemaphore(device, &sig) == VK_SUCCESS);
-        CHECK(vkWaitSemaphores(device, &wi, 5000000000ull) == VK_SUCCESS);
+        REQUIRE_VK(vkSignalSemaphore(device, &sig));
+        REQUIRE_VK(vkWaitSemaphores(device, &wi, wait_timeout));
         CHECK(vkGetSemaphoreCounterValue(device, t, &v) == VK_SUCCESS && v == 7);
-        vkQueueWaitIdle(queue);
+        REQUIRE_VK(vkWaitForFences(device, 1, &fence, VK_TRUE, wait_timeout));
         vkFreeCommandBuffers(device, pool, 1, &cb);
         vkDestroySemaphore(device, t, NULL);
     }

@@ -657,7 +657,7 @@ static vx_image *load_pe(const char *path, int is_main) {
     fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
     if (len < 0) { fclose(f); vx_log("cannot size %s", path); vx_set_last_error(193); return NULL; }
     uint8_t *file = malloc(len);
-    if (!file || fread(file, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(file); return NULL; }
+    if (!file || fread(file, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(file); vx_log("cannot read %s (%ld bytes): %s", path, len, file ? "short read" : strerror(errno)); return NULL; }
     fclose(f);
     vx_pe_info pe;
     if (!vx_pe_inspect(file, (size_t)len, &pe)) {
@@ -1354,7 +1354,7 @@ static int run_program(void *arg) {
     pthread_mutex_lock(&g_loader_lock);
     vx_image *m = load_pe(exe, 1);
     pthread_mutex_unlock(&g_loader_lock);
-    if (!m) return 1;
+    if (!m) { vx_log("vxrt: %s could not be loaded (the reason is logged above)", exe); return 1; }
     if (vx_trace) vx_log("%s: entry %#x", m->name, m->entry_rva);
     tls_callbacks(m, 1 /* DLL_PROCESS_ATTACH */);
     typedef DWORD (WINAPI *entry_fn)(void);

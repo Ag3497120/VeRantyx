@@ -1441,12 +1441,14 @@ check-run:
 	build/dxil2msl -vs tests/shaders12/tess_vs.dxil -hs tests/shaders12/tess_hs.dxil tests/shaders12/tess_ds.dxil
 	build/dxil2msl -vs tests/shaders12/passcolor_vs.dxil tests/shaders12/quad_gs.dxil
 	build/dxilrun tests/shaders12
-	build/difftest build/ref_x86 200
+	@if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$$'; then build/difftest build/ref_x86 200; else echo "difftest: no Hypervisor.framework here (a VM, e.g. a CI runner), skipped"; fi
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
 # The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
 # translator (make check-arm64).
 VXRT ?= build/vxrt
+# After a GPU fault a Vulkan wait can stall. Bound the test and keep Metal encoder diagnostics in the log.
+VULKAN_TEST = VXRT_TRACE_VULKAN=1 python3 -c 'import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:], timeout=60))' $(VXRT)
 runtime-tests: export VXRT_ROOT = build/root
 runtime-tests: export VXRT_NO_ACTIVATE = 1
 runtime-tests: $(VXRT) tests
@@ -1545,10 +1547,10 @@ runtime-tests-run:
 	$(VXRT) build/d3d12_engine.exe
 	$(VXRT) build/d3d12_fxc.exe
 	$(VXRT) build/d3d11on12.exe
-	$(VXRT) build/vulkan_features.exe
-	$(VXRT) build/vulkan_shaders.exe
-	$(VXRT) build/vulkan_external.exe
-	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
+	$(VULKAN_TEST) build/vulkan_features.exe
+	$(VULKAN_TEST) build/vulkan_shaders.exe
+	$(VULKAN_TEST) build/vulkan_external.exe
+	$(VULKAN_TEST) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
 		build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(VXRT) build/input.exe
 	$(VXRT) build/audio.exe

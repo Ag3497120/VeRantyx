@@ -84,9 +84,8 @@ struct VkQueue_T {
 
 typedef struct vk_heap_list {
     __strong id<MTLHeap> *heaps; uint32_t count, cap; pthread_mutex_t lock; uint64_t generation;
-    // macOS 15 and later: the heaps also in one residency set every queue has (id<MTLResidencySet>), committed before a
-    // submission when it changed; the encoders then need no useHeaps (vk_command.m: 150 render passes a frame each
-    // listing every heap was a quarter of No Man's Sky's encoding time, 2026-10-26).
+    // macOS 15 and later: each queue uses this residency set, committed when the heaps change. Otherwise compute
+    // encoders declare heaps and render encoders declare the resources they read or write through descriptors.
     __strong id residency;
     int residency_dirty;
 } vk_heap_list;
@@ -101,7 +100,7 @@ struct VkDevice_T {
     uint32_t queue_count;
     uint32_t extensions;           // VK_DEV_EXT_* bits enabled
     VkPhysicalDeviceFeatures features;
-    vk_heap_list heaps;            // every live memory heap, made resident in each encoder
+    vk_heap_list heaps;            // live memory heaps for the residency set and compute fallback
     __strong id<MTLLibrary> internal;   // blits, clears and fills (vk_internal.m)
     pthread_mutex_t internal_lock;
     __strong NSMutableDictionary *internal_pipelines;
@@ -185,6 +184,8 @@ typedef struct {
     uint32_t count;                   // descriptors (for variable-count bindings, the most)
     uint32_t word;                    // first 8-byte word in the set's argument buffer
     uint32_t dynamic;                 // dynamic buffers: first index among the layout's dynamic offsets
+    uint32_t resource;                // first index in the set's resources, when usage is nonzero
+    MTLResourceUsage usage;
     VkShaderStageFlags stages;
     VkDescriptorBindingFlags flags;
     VkSampler *immutable;             // immutable samplers (count of them), or NULL
@@ -196,18 +197,11 @@ struct VkDescriptorSetLayout_T {
     vk_set_binding *bindings;         // sorted by binding number
     uint32_t words;                   // argument buffer size in words (with the variable binding at its maximum)
     uint32_t dynamic_count;
+    uint32_t resource_count;
+    int has_input_attachments;
     VkDescriptorSetLayoutCreateFlags flags;
     int variable_binding;             // index of a VARIABLE_DESCRIPTOR_COUNT binding, -1 if none
 };
-
-// What a descriptor refers to, kept beside the argument buffer words (for residency of resources outside heaps,
-// copies between sets, and the byte ranges of buffer descriptors).
-typedef struct {
-    VkDescriptorType type;
-    void *object;                     // VkBuffer, VkImageView, VkBufferView or VkSampler
-    void *object2;                    // combined image samplers: the sampler
-    uint64_t offset, range;
-} vk_descriptor;
 
 struct VkDescriptorPool_T {
     __strong id<MTLBuffer> buffer;    // the argument buffers of all its sets
@@ -226,10 +220,8 @@ struct VkDescriptorSet_T {
     uint64_t offset, size;            // its argument buffer within the pool's buffer
     uint64_t *words;                  // CPU address of that buffer
     uint32_t variable_count;
-    vk_descriptor *descriptors;       // one per descriptor, in binding order
-    uint32_t descriptor_count;
-    uint32_t *first;                  // index into descriptors of each layout binding's first
-    int has_unheaped;                 // (refers to swapchain images or other textures outside the memory heaps)
+    uint32_t resource_count;
+    id<MTLResource> __weak *resources;   // declare access without extending the descriptor's resource lifetime
 };
 
 struct VkPipelineLayout_T {

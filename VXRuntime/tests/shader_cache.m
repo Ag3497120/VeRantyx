@@ -47,6 +47,15 @@ int main(int argc, char **argv) {
     @autoreleasepool {
         uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         id<MTLDevice> device = MTLCreateSystemDefaultDevice(); assert(device);
+        // A VM's paravirtual GPU ("Apple Paravirtual device") does not round-trip binary archives between
+        // processes: the strict disk-cache checks cannot hold there. VXRT_TEST_AS_VM forces this branch on
+        // real hardware so the skip path itself is testable.
+        if ([device.name containsString:@"Paravirtual"] || getenv("VXRT_TEST_AS_VM")) {
+            NSDictionary *skip = @{ @"skipped": @YES, @"device": device.name };
+            NSData *json = [NSJSONSerialization dataWithJSONObject:skip options:NSJSONWritingSortedKeys error:nil];
+            puts([[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
+            return 0;
+        }
         if (argc > 1 && !strcmp(argv[1], "failure")) {
             NSString *bad = @"#include <metal_stdlib>\nusing namespace metal; kernel void vx_main() { undefined_identifier; }";
             NSError *error = nil;

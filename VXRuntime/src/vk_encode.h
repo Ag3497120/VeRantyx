@@ -90,7 +90,9 @@ typedef struct vk_enc {
     // wait there anyway (after the runtime's own kernels whose results its vertex stage reads).
     uint64_t wait_dst;
     int vertex_wait;
-    int no_use_heaps;
+    int no_use_heaps;                   // the queue's residency set is in use
+    uint32_t render_pass_id;
+    NSMapTable<id<MTLResource>, NSNumber *> *render_resources;  // declarations per pass, retained until completion
     int compute_concurrent;             // (the next compute encoder: dispatches that may run together, hoist_tessellation)
     int hoist_phase;
     __unsafe_unretained id<MTLBuffer> fan_buf;   // (triangle fans' indices: one buffer a command buffer, the Metal command buffer keeps it)
@@ -103,6 +105,8 @@ typedef struct vk_enc {
         __unsafe_unretained id<MTLDepthStencilState> depth_stencil;
         __unsafe_unretained id<MTLBuffer> vbuf[32], fbuf[32];   // (nil: bytes or unknown)
         uint64_t voff[32], foff[32];
+        const struct VkDescriptorSet_T *resource_sets[VKMSL_MAX_SETS];
+        VkShaderStageFlags resource_stages[VKMSL_MAX_SETS];
         uint32_t vbytes_len[2], fbytes_len[2];                    // push constants [0], dynamic offsets [1]
         uint8_t vbytes[2][1024], fbytes[2][1024];
         MTLViewport viewports[16]; uint32_t nviewports;

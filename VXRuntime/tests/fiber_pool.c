@@ -6,8 +6,8 @@
 #include <windows.h>
 #include <stdio.h>
 
-static int failures;
-#define CHECK(c) do { if (!(c)) { printf("fiber_pool: FAILED %s (line %d)\n", #c, __LINE__); failures++; } } while (0)
+static volatile LONG failures;
+#define CHECK(c) do { if (!(c)) { printf("fiber_pool: FAILED %s (line %d)\n", #c, __LINE__); InterlockedIncrement(&failures); } } while (0)
 
 static void *gs_fiber(void) { void *f; __asm__ volatile("movq %%gs:0x20, %0" : "=r"(f)); return f; }   // MSVC's GetCurrentFiber
 static void *gs_fiber_data(void) { return *(void **)gs_fiber(); }                                      // MSVC's GetFiberData
@@ -25,14 +25,12 @@ static void WINAPI chain_body(void *param) {
 
 // 2. A pool: fibers in a shared queue, run by several threads. A fiber does a step, then switches back to the
 // thread that ran it (its "home", set by that thread before the switch), which puts it back in the queue.
-enum { THREADS = 4, FIBERS = 12, STEPS = 400 };
+enum { THREADS = 4, FIBERS = 12, STEPS_PER_THREAD = 100 };
 static CRITICAL_SECTION lock;
-static void *pool[FIBERS], *queue[FIBERS];
-static int queue_n;
-static void *home[FIBERS];
+static void *pool[FIBERS], *home[FIBERS];
+static int queue[FIBERS], queue_head, queue_tail, started_workers;
 static volatile LONG steps_done, wrong_current, migrations;
 static DWORD last_thread[FIBERS];
-static volatile LONG stop;
 static void WINAPI pool_body(void *param) {
     int i = (int)(INT_PTR)param;
     volatile double acc = i;                              // (a local that must survive switches and threads)
@@ -47,28 +45,33 @@ static void WINAPI pool_body(void *param) {
         SwitchToFiber(home[i]);                           // (the thread queues it again: another may resume it)
     }
 }
+static void run_step(int i, void *me) {
+    home[i] = me;
+    SwitchToFiber(pool[i]);
+    if (gs_fiber() != me) InterlockedIncrement(&wrong_current);
+}
 static DWORD WINAPI worker(void *arg) {
     (void)arg;
     void *me = ConvertThreadToFiber((void *)0x5eed);
     CHECK(me != NULL);
+    if (!me) return 1;
     CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST));   // (rewrote gs:0x20 on macOS)
     CHECK(gs_fiber() == me && gs_fiber_data() == (void *)0x5eed);
-    while (!stop) {
-        void *f = NULL;
+
+    // Keep one fiber out of the queue until every worker has run it, even if the workers run serially.
+    EnterCriticalSection(&lock);
+    run_step(0, me);
+    if (++started_workers == THREADS) queue[queue_tail++ % FIBERS] = 0;
+    LeaveCriticalSection(&lock);
+
+    for (int step = 1; step < STEPS_PER_THREAD; step++) {
         EnterCriticalSection(&lock);
-        if (queue_n) {
-            int k = (GetCurrentThreadId() + queue_n) % queue_n;   // (not in order, so fibers change threads)
-            f = queue[k]; queue[k] = queue[--queue_n];
-        }
+        int i = queue[queue_head++ % FIBERS];             // (more fibers than workers, each worker takes one)
         LeaveCriticalSection(&lock);
-        if (!f) { Sleep(0); continue; }
-        for (int i = 0; i < FIBERS; i++) if (pool[i] == f) home[i] = me;
-        SwitchToFiber(f);
-        if (gs_fiber() != me) InterlockedIncrement(&wrong_current);
+        run_step(i, me);
         EnterCriticalSection(&lock);
-        queue[queue_n++] = f;                             // (once it has left: then it can be resumed elsewhere)
+        queue[queue_tail++ % FIBERS] = i;                 // (once it has left: then it can be resumed elsewhere)
         LeaveCriticalSection(&lock);
-        if (steps_done >= STEPS) stop = 1;
     }
     CHECK(ConvertFiberToThread());
     return 0;
@@ -88,13 +91,27 @@ int main(void) {
     printf("fiber_pool: chain main -> A -> B -> C -> main: %s\n", chain_ok ? "ok" : "wrong current fiber");
 
     InitializeCriticalSection(&lock);
-    for (int i = 0; i < FIBERS; i++) { pool[i] = CreateFiber(64 << 10, pool_body, (void *)(INT_PTR)i); queue[queue_n++] = pool[i]; }
+    for (int i = 0; i < FIBERS; i++) {
+        pool[i] = CreateFiber(64 << 10, pool_body, (void *)(INT_PTR)i);
+        CHECK(pool[i] != NULL);
+    }
+    if (failures) return 1;
+    for (int i = 1; i < FIBERS; i++) queue[queue_tail++] = i;
+
     HANDLE t[THREADS];
-    for (int i = 0; i < THREADS; i++) t[i] = CreateThread(NULL, 0, worker, NULL, 0, NULL);
-    CHECK(WaitForMultipleObjects(THREADS, t, TRUE, 20000) == WAIT_OBJECT_0);
-    CHECK(steps_done >= STEPS);
+    for (int i = 0; i < THREADS; i++) {
+        t[i] = CreateThread(NULL, 0, worker, NULL, 0, NULL);
+        CHECK(t[i] != NULL);
+        if (!t[i]) return 1;
+    }
+    DWORD waited = WaitForMultipleObjects(THREADS, t, TRUE, 20000);
+    CHECK(waited == WAIT_OBJECT_0);
+    if (waited != WAIT_OBJECT_0) return 1;
+    for (int i = 0; i < THREADS; i++) CloseHandle(t[i]);
+    DeleteCriticalSection(&lock);
+    CHECK(steps_done == THREADS * STEPS_PER_THREAD);
     CHECK(wrong_current == 0);
-    CHECK(migrations > 0);
+    CHECK(migrations >= THREADS - 1);
     printf("fiber_pool: %d fibers on %d threads: %ld steps, %ld moves between threads, %ld wrong\n", FIBERS, THREADS,
            steps_done, migrations, wrong_current);
     for (int i = 0; i < FIBERS; i++) DeleteFiber(pool[i]);

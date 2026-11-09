@@ -271,6 +271,15 @@ static int sum_test(void) {
 // append_cs: consumes 1..128 from u0 (counter 128), appends v*10 for odd v to u1 (counter 0), counts v%4 in an
 // R32_UINT texture u2 with InterlockedAdd. Then: 64 values appended, the consume counter at 0, 32 in each bin.
 static int append_test(void) {
+    // The counters and the texture atomic are in one shader, so this dispatch needs R32_UINT UAV atomic add.
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = { DXGI_FORMAT_R32_UINT, 0, 0 };
+    CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support));
+    if (!(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) ||
+        !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD)) {
+        puts("d3d12 fxc counters: skipped because this device does not report R32_UINT UAV atomic add");
+        return 0;
+    }
+
     int before = bad;
     D3D12_SHADER_BYTECODE cs;
     if (load("append_cs", &cs)) return 1;
@@ -283,7 +292,7 @@ static int append_test(void) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC cd = { rs, cs };
     ID3D12PipelineState *pso;
     CHECK(ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&pso));
-    // each buffer: 128 uints of data, then its counter at byte 512 (CounterOffsetInBytes, 4 KiB-aligned rules aside)
+    // Each buffer has 128 uints of data and a counter at the next 4 KiB-aligned offset.
     uint32_t data[128 + 1024] = { 0 };
     for (int i = 0; i < 128; i++) data[i] = (uint32_t)i + 1;
     data[1024] = 128;                                              // the consume counter at byte 4096
@@ -349,10 +358,9 @@ static int append_test(void) {
     for (uint32_t i = 0; i < out_after[1024] && i < 128; i++) { sum += out_after[i]; odd &= (out_after[i] / 10) & 1; }
     int ok = in_after[1024] == 0 && out_after[1024] == 64 && sum == 10ull * 64 * 64 && odd &&
              bins[0] == 32 && bins[1] == 32 && bins[2] == 32 && bins[3] == 32;
-    if (!ok) { printf("append: consume counter %u, append counter %u, sum %llu, bins %u %u %u %u\n", in_after[1024], out_after[1024],
-                      (unsigned long long)sum, bins[0], bins[1], bins[2], bins[3]); bad++; }
-    printf("d3d12 fxc counters: DXBC append_cs consumed 128, appended %u (sum %llu), texture-atomic bins %u %u %u %u: %s\n",
-           out_after[1024], (unsigned long long)sum, bins[0], bins[1], bins[2], bins[3], bad == before ? "ok" : "FAILED");
+    if (!ok) bad++;
+    printf("d3d12 fxc counters: DXBC append_cs consume counter %u, appended %u (sum %llu), texture-atomic bins %u %u %u %u: %s\n",
+           in_after[1024], out_after[1024], (unsigned long long)sum, bins[0], bins[1], bins[2], bins[3], bad == before ? "ok" : "FAILED");
     ID3D12Resource_Unmap(readback, 0, NULL);
     return 0;
 }

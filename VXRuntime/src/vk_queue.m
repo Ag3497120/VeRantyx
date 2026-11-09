@@ -302,6 +302,7 @@ void vx_shared_keyed_gpu_done(int slot);
 // ---- submission --------------------------------------------------------------------------------------------------
 VkResult vk_queue_submit_internal(VkQueue q, uint32_t n, const VkSubmitInfo2 *submits, VkFence fence) {
     VK_STAT_T0(t_submit);
+    int trace = vk_trace();
     pthread_mutex_lock(&q->lock);
     if (fence) {
         pthread_mutex_lock(&fence->lock);
@@ -309,7 +310,12 @@ VkResult vk_queue_submit_internal(VkQueue q, uint32_t n, const VkSubmitInfo2 *su
         pthread_mutex_unlock(&fence->lock);
     }
     for (uint32_t i = 0; i < n || (i == 0 && n == 0); i++) @autoreleasepool {
-        id<MTLCommandBuffer> mcb = [q->mtl commandBuffer];
+        id<MTLCommandBuffer> mcb;
+        if (trace) {
+            MTLCommandBufferDescriptor *desc = [MTLCommandBufferDescriptor new];
+            desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            mcb = [q->mtl commandBufferWithDescriptor:desc];
+        } else mcb = [q->mtl commandBuffer];
         VK_STAT(VKS_MTL_CBS, 1);
         vk_stats_gpu(mcb);
         const VkWin32KeyedMutexAcquireReleaseInfoKHR *km = NULL;
@@ -346,16 +352,15 @@ VkResult vk_queue_submit_internal(VkQueue q, uint32_t n, const VkSubmitInfo2 *su
         }
         uint64_t number = ++q->submitted;
         [mcb encodeSignalEvent:q->done value:number];
-        if (fence && (n == 0 || i == n - 1)) {
-            VkFence f = fence;
+        VkFence f = n == 0 || i == n - 1 ? fence : VK_NULL_HANDLE;
+        if (f || trace) {
             [mcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-                if (done.status == MTLCommandBufferStatusError)
+                if (done.status == MTLCommandBufferStatusError) {
                     vk_log_unique("vulkan: GPU work failed: %s", done.error.localizedDescription.UTF8String);
-                fence_signal(f);
-            }];
-        } else if (vk_trace()) {
-            [mcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-                if (done.status == MTLCommandBufferStatusError) vk_log_unique("vulkan: GPU work failed: %s", done.error.localizedDescription.UTF8String);
+                    for (id<MTLCommandBufferEncoderInfo> info in done.error.userInfo[MTLCommandBufferEncoderInfoErrorKey])
+                        vk_log_unique("vulkan: GPU encoder '%s' state %ld", info.label.UTF8String ?: "unlabeled", (long)info.errorState);
+                }
+                if (f) fence_signal(f);
             }];
         }
         int released[64], nr = 0;

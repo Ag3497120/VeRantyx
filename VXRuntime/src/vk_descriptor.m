@@ -1,6 +1,6 @@
 // Descriptor sets as Metal 3 argument buffers: each set is a run of 8-byte words in its pool's buffer, written here
 // with GPU addresses (buffers: address and size) and resource IDs (textures, samplers); the shaders vk_msl.c writes
-// declare the same words. Copies between sets copy words.
+// declare the same words. Keep the Metal resources alongside those words for render encoder residency.
 #include "vk_impl.h"
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +12,20 @@ static int binding_order(const void *a, const void *b) {
 
 static uint32_t binding_words(const vk_set_binding *b, uint32_t count) {
     return b->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? (count + 7) / 8 : count * vkmsl_descriptor_words(b->type);
+}
+
+static MTLResourceUsage binding_usage(VkDescriptorType type) {
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        return MTLResourceUsageRead | MTLResourceUsageWrite;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+        return MTLResourceUsageRead;
+    default:
+        return 0;
+    }
 }
 
 VKFN VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateInfo *info,
@@ -51,6 +65,10 @@ VKFN VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice dev, const VkDescr
             b->dynamic = dyn;
             dyn += b->count;
         }
+        b->usage = binding_usage(b->type);
+        b->resource = l->resource_count;
+        if (b->usage) l->resource_count += b->count;
+        if (b->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) l->has_input_attachments = 1;
         if (b->flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) l->variable_binding = (int)i;
     }
     l->words = word;
@@ -168,8 +186,28 @@ VKFN VkResult VKAPI_CALL vkCreateDescriptorPool(VkDevice dev, const VkDescriptor
     return VK_SUCCESS;
 }
 
+static struct VkDescriptorSet_T *set_new(VkDescriptorSetLayout l, uint32_t variable_count) {
+    struct VkDescriptorSet_T *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->variable_count = variable_count;
+    s->resource_count = l->resource_count;
+    if (l->variable_binding >= 0) {
+        const vk_set_binding *b = &l->bindings[l->variable_binding];
+        if (b->usage) s->resource_count = b->resource + variable_count;
+    }
+    if (s->resource_count) {
+        s->resources = (id<MTLResource> __weak *)calloc(s->resource_count, sizeof *s->resources);
+        if (!s->resources) { free(s); return NULL; }
+    }
+    s->layout = l;
+    __atomic_add_fetch(&l->refs, 1, __ATOMIC_RELAXED);
+    return s;
+}
+
 static void set_free(struct VkDescriptorSet_T *s) {
     if (!s) return;
+    for (uint32_t i = 0; i < s->resource_count; i++) s->resources[i] = nil;
+    free(s->resources);
     layout_release(s->layout);
     free(s);
 }
@@ -235,7 +273,9 @@ VKFN VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice dev, const VkDescript
     for (uint32_t i = 0; i < info->descriptorSetCount; i++) out[i] = VK_NULL_HANDLE;
     VK_STAT(VKS_DESC_ALLOCS, info->descriptorSetCount);
     pthread_mutex_lock(&p->lock);
-    for (uint32_t i = 0; i < info->descriptorSetCount; i++) {
+    VkResult result = VK_SUCCESS;
+    uint32_t i = 0;
+    for (; i < info->descriptorSetCount; i++) {
         VkDescriptorSetLayout l = info->pSetLayouts[i];
         uint32_t words = l->words;
         uint32_t variable = 0;
@@ -248,19 +288,17 @@ VKFN VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice dev, const VkDescript
         uint64_t size = ((uint64_t)words * 8 + 127) & ~127ull;
         if (!size) size = 128;
         uint64_t offset;
+        struct VkDescriptorSet_T *s = set_new(l, variable);
+        if (!s) { result = VK_ERROR_OUT_OF_HOST_MEMORY; break; }
         if (!pool_take(p, size, &offset)) {
-            pthread_mutex_unlock(&p->lock);
-            for (uint32_t k = 0; k < i; k++) { /* (freed with the pool) */ }
-            return VK_ERROR_OUT_OF_POOL_MEMORY;
+            set_free(s);
+            result = VK_ERROR_OUT_OF_POOL_MEMORY;
+            break;
         }
-        struct VkDescriptorSet_T *s = calloc(1, sizeof *s);
         s->pool = p;
-        s->layout = l;
-        __atomic_add_fetch(&l->refs, 1, __ATOMIC_RELAXED);
         s->offset = offset;
         s->size = size;
         s->words = (uint64_t *)((uint8_t *)p->buffer.contents + offset);
-        s->variable_count = variable;
         memset(s->words, 0, size);
         // Immutable samplers are part of the layout: written once here.
         for (uint32_t b = 0; b < l->binding_count; b++) {
@@ -277,8 +315,17 @@ VKFN VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice dev, const VkDescript
         p->sets[p->set_count++] = s;
         out[i] = s;
     }
+    if (result != VK_SUCCESS) {
+        while (i) {
+            struct VkDescriptorSet_T *s = out[--i];
+            p->set_count--;
+            pool_give(p, s->offset, s->size);
+            set_free(s);
+            out[i] = VK_NULL_HANDLE;
+        }
+    }
     pthread_mutex_unlock(&p->lock);
-    return VK_SUCCESS;
+    return result;
 }
 
 VKFN VkResult VKAPI_CALL vkFreeDescriptorSets(VkDevice dev, VkDescriptorPool p, uint32_t n, const VkDescriptorSet *sets) {
@@ -301,32 +348,40 @@ VKFN VkResult VKAPI_CALL vkFreeDescriptorSets(VkDevice dev, VkDescriptorPool p, 
 static void write_one(struct VkDescriptorSet_T *s, const vk_set_binding *b, uint32_t element, VkDescriptorType type,
                       const VkDescriptorImageInfo *ii, const VkDescriptorBufferInfo *bi, VkBufferView tv) {
     uint32_t w = b->word;
+    id<MTLResource> resource = nil;
     switch (type) {
     case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
     case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
         VkBuffer buf = bi->buffer;
+        resource = buf ? buf->mtl : nil;
         uint64_t addr = buf ? buf->gpu + bi->offset : 0;
         uint64_t range = !buf ? 0 : bi->range == VK_WHOLE_SIZE ? buf->size - bi->offset : bi->range;
         write_word(s, w + 2 * element, addr);
         write_word(s, w + 2 * element + 1, range);
         break;
     }
-    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-        write_word(s, w + element, ii->imageView && ii->imageView->mtl ? ii->imageView->mtl.gpuResourceID._impl : 0);
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
+        id<MTLTexture> texture = ii->imageView ? ii->imageView->mtl : nil;
+        resource = texture;
+        write_word(s, w + element, texture ? texture.gpuResourceID._impl : 0);
+        if (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && !b->immutable)
+            write_word(s, w + b->count + element, ii->sampler ? ii->sampler->mtl.gpuResourceID._impl : 0);
         break;
+    }
     case VK_DESCRIPTOR_TYPE_SAMPLER:
         if (!b->immutable) write_word(s, w + element, ii->sampler ? ii->sampler->mtl.gpuResourceID._impl : 0);
         break;
-    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-        write_word(s, w + element, ii->imageView && ii->imageView->mtl ? ii->imageView->mtl.gpuResourceID._impl : 0);
-        if (!b->immutable) write_word(s, w + b->count + element, ii->sampler ? ii->sampler->mtl.gpuResourceID._impl : 0);
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+        id<MTLTexture> texture = tv ? tv->mtl : nil;
+        resource = texture;
+        write_word(s, w + element, texture ? texture.gpuResourceID._impl : 0);
         break;
-    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-        write_word(s, w + element, tv && tv->mtl ? tv->mtl.gpuResourceID._impl : 0);
-        break;
+    }
     default:
         break;
     }
+    if (b->usage) s->resources[b->resource + element] = resource;
 }
 
 // Walks `count` descriptors from (binding, element), across bindings as Vulkan does.
@@ -381,6 +436,8 @@ VKFN void VKAPI_CALL vkUpdateDescriptorSets(VkDevice dev, uint32_t write_count, 
         const vk_set_binding *bs = walk_start(&ws, src, c->srcBinding, c->srcArrayElement);
         const vk_set_binding *bd = walk_start(&wd, dst, c->dstBinding, c->dstArrayElement);
         for (uint32_t k = 0; k < c->descriptorCount && bs && bd; k++, bs = walk_next(&ws), bd = walk_next(&wd)) {
+            if (bs->usage && bd->usage)
+                dst->resources[bd->resource + wd.element] = src->resources[bs->resource + ws.element];
             uint32_t per = vkmsl_descriptor_words(bs->type);
             if (bs->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
                 write_word(dst, bd->word + wd.element, src->words[bs->word + ws.element]);
@@ -436,9 +493,8 @@ VKFN void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice dev, VkDescripto
 // Push descriptors write into a set that lives as long as the command buffer's recording (vk_command.m keeps it).
 struct VkDescriptorSet_T *vk_push_set_new(VkDescriptorSetLayout l, uint64_t *words, uint64_t size);
 struct VkDescriptorSet_T *vk_push_set_new(VkDescriptorSetLayout l, uint64_t *words, uint64_t size) {
-    struct VkDescriptorSet_T *s = calloc(1, sizeof *s);
-    s->layout = l;
-    __atomic_add_fetch(&l->refs, 1, __ATOMIC_RELAXED);
+    struct VkDescriptorSet_T *s = set_new(l, 0);
+    if (!s) return NULL;
     s->words = words;
     s->size = size;
     return s;

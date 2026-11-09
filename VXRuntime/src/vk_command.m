@@ -192,7 +192,9 @@ static void push_set(VkCommandBuffer cb, VkPipelineBindPoint point, VkPipelineLa
     uint64_t size = ((uint64_t)sl->words * 8 + 15) & ~15ull;
     if (!size) size = 16;
     uint64_t *words = calloc(1, size);
+    if (!words) return;
     struct VkDescriptorSet_T *s = vk_push_set_new(sl, words, size);
+    if (!s) { free(words); return; }
     if (tmpl) vk_apply_template(s, tmpl, data);
     else vk_push_set_write(s, n, writes);
     c_push_set *c = record(cb, C_PUSH_SET, sizeof *c);
@@ -777,13 +779,6 @@ void vk_end_encoder(vk_enc *e) {
     if (e->blit) { [e->blit updateFence:e->fence]; [e->blit endEncoding]; e->blit = nil; }
 }
 
-static void use_heaps_render(vk_enc *e) {
-    if (e->no_use_heaps) return;                          // (the queue's residency set has them)
-    vk_heap_list *l = &e->dev->heaps;
-    pthread_mutex_lock(&l->lock);
-    if (l->count) [e->render useHeaps:l->heaps count:l->count stages:MTLRenderStageVertex | MTLRenderStageFragment];
-    pthread_mutex_unlock(&l->lock);
-}
 static void use_heaps_compute(vk_enc *e) {
     if (e->no_use_heaps) return;
     vk_heap_list *l = &e->dev->heaps;
@@ -807,6 +802,7 @@ static id<MTLComputeCommandEncoder> compute_encoder(vk_enc *e) {
         e->compute = [e->cb computeCommandEncoderWithDescriptor:cd];
     } else if (e->compute_concurrent) e->compute = [e->cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
     else e->compute = [e->cb computeCommandEncoder];
+    if (vk_trace()) e->compute.label = @"Vulkan compute";
     e->wait_dst = 0;
     VK_STAT(VKS_ENCODERS, 1);
     [e->compute waitForFence:e->fence];
@@ -824,6 +820,7 @@ static id<MTLBlitCommandEncoder> blit_encoder(vk_enc *e) {
         bd.sampleBufferAttachments[0].endOfEncoderSampleIndex = i + 1;
         e->blit = [e->cb blitCommandEncoderWithDescriptor:bd];
     } else e->blit = [e->cb blitCommandEncoder];
+    if (vk_trace()) e->blit.label = @"Vulkan blit";
     e->wait_dst = 0;
     VK_STAT(VKS_ENCODERS, 1);
     [e->blit waitForFence:e->fence];
@@ -882,9 +879,13 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
         }
         if (!w) { w = a->view->width; h = a->view->height; samples = (uint32_t)t.sampleCount; }
     }
-    if (!w) { w = p->area.offset.x + p->area.extent.width; h = p->area.offset.y + p->area.extent.height; }
-    d.renderTargetWidth = w;
-    d.renderTargetHeight = h;
+    // Metal takes the size from the attachments. An attachmentless pass needs an explicit size.
+    if (!w) {
+        w = p->area.offset.x + p->area.extent.width;
+        h = p->area.offset.y + p->area.extent.height;
+        d.renderTargetWidth = w;
+        d.renderTargetHeight = h;
+    }
     if (p->layers > 1) d.renderTargetArrayLength = p->layers;
     if (p->occlusion) d.visibilityResultBuffer = p->occlusion->results;
     if (vkprof_on(e->dev)) {
@@ -898,6 +899,8 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
         d.sampleBufferAttachments[0].endOfFragmentSampleIndex = i + 1;
     }
     e->render = [e->cb renderCommandEncoderWithDescriptor:d];
+    e->render_pass_id++;
+    if (vk_trace()) e->render.label = @"Vulkan render pass";
     rc_start(e);
     VK_STAT(VKS_ENCODERS, 1);
     VK_STAT(VKS_PASSES, 1);
@@ -910,7 +913,6 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
     if (vertex_wait) VK_STAT(VKS_VERTEX_WAITS, 1);
     e->wait_dst = 0;
     e->vertex_wait = 0;
-    use_heaps_render(e);
     e->pass = *p;
     e->pass_width = w;
     e->pass_height = h;
@@ -950,6 +952,47 @@ static void rc_fbytes(vk_enc *e, const void *p, uint32_t len, uint32_t i, int k)
 static void rc_forget(vk_enc *e) { memset(&e->rc, 0, sizeof e->rc); }   // (nothing known: everything is sent again)
 static void rc_start(vk_enc *e) { rc_forget(e); e->rc.valid = vk_option("ENCODE_CACHE", 1); }
 
+static void use_render_resource(vk_enc *e, id<MTLResource> resource, MTLResourceUsage usage, MTLRenderStages stages) {
+    // Metal does not retain resources declared here. The map also merges usage and stages when descriptors alias.
+    if (!e->render_resources)
+        e->render_resources = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
+                                                     valueOptions:NSPointerFunctionsStrongMemory];
+    enum { STAGE_SHIFT = 8, PASS_SHIFT = 16 };
+    uint64_t previous = [[e->render_resources objectForKey:resource] unsignedLongLongValue];
+    uint64_t pass = (uint64_t)e->render_pass_id << PASS_SHIFT;
+    if (previous >> PASS_SHIFT != e->render_pass_id) previous = pass;
+    uint64_t next = previous | ((uint64_t)stages << STAGE_SHIFT) | usage;
+    if (next == previous) return;
+    MTLResourceUsage all_usage = next & (MTLResourceUsageRead | MTLResourceUsageWrite);
+    MTLRenderStages all_stages = (next >> STAGE_SHIFT) & (MTLRenderStageVertex | MTLRenderStageFragment);
+    [e->render useResource:resource usage:all_usage stages:all_stages];
+    [e->render_resources setObject:@(next) forKey:resource];
+}
+
+static void use_set_render(vk_enc *e, const struct VkDescriptorSet_T *set, uint32_t slot, VkShaderStageFlags stages) {
+    VkDescriptorSetLayout layout = set->layout;
+    if (!set->resource_count || (e->no_use_heaps && !layout->has_input_attachments)) return;
+    if (e->rc.resource_sets[slot] == set) stages &= ~e->rc.resource_stages[slot];
+    else { e->rc.resource_sets[slot] = set; e->rc.resource_stages[slot] = 0; }
+    if (!stages) return;
+    for (uint32_t i = 0; i < layout->binding_count; i++) {
+        const vk_set_binding *binding = &layout->bindings[i];
+        // The queue's residency set covers heaps. Input attachments still need an explicit texture read.
+        if (!binding->usage || (e->no_use_heaps && binding->type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)) continue;
+        VkShaderStageFlags active = stages & binding->stages;
+        if (!active) continue;
+        MTLRenderStages render_stages = 0;
+        if (active & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) render_stages |= MTLRenderStageVertex;
+        if (active & VK_SHADER_STAGE_FRAGMENT_BIT) render_stages |= MTLRenderStageFragment;
+        uint32_t count = (int)i == layout->variable_binding ? set->variable_count : binding->count;
+        for (uint32_t j = 0; j < count; j++) {
+            id<MTLResource> resource = set->resources[binding->resource + j];
+            if (resource) use_render_resource(e, resource, binding->usage, render_stages);
+        }
+    }
+    e->rc.resource_stages[slot] |= stages;
+}
+
 static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
     id<MTLRenderCommandEncoder> r = e->render;
     bindings_state *b = &e->gb;
@@ -958,6 +1001,7 @@ static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
     // (with a geometry shader the render pipeline's vertex function is "vkpass": the shaders' sets go to the kernels)
     // (with tessellation it is the evaluation shader)
     uint32_t sets_vertex = pl->gs_kernel ? 0 : pl->tess ? pl->sets_tes : pl->sets_vertex;
+    VkShaderStageFlags vertex_stage = pl->tess ? VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT : VK_SHADER_STAGE_VERTEX_BIT;
     uint8_t aux_vertex = pl->gs_kernel ? 0 : pl->tess ? pl->aux_tes : pl->aux_vertex;
     uint8_t push_vertex = pl->gs_kernel ? 0 : pl->tess ? pl->push_tes : pl->push_vertex;
     for (uint32_t s = 0; s < VKMSL_MAX_SETS; s++) {
@@ -965,6 +1009,9 @@ static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
         if (!((sets_vertex | pl->sets_fragment) & mask)) continue;
         struct VkDescriptorSet_T *ds = b->push[s] ? b->push[s] : b->sets[s];
         if (!ds) continue;
+        VkShaderStageFlags stages = (sets_vertex & mask ? vertex_stage : 0) |
+                                    (pl->sets_fragment & mask ? VK_SHADER_STAGE_FRAGMENT_BIT : 0);
+        use_set_render(e, ds, s, stages);
         if (b->push[s]) {
             if (sets_vertex & mask) { [r setVertexBytes:ds->words length:ds->size atIndex:s]; e->rc.vbuf[s] = nil; e->rc.voff[s] = ~0ull; }
             if (pl->sets_fragment & mask) { [r setFragmentBytes:ds->words length:ds->size atIndex:s]; e->rc.fbuf[s] = nil; e->rc.foff[s] = ~0ull; }
@@ -2071,11 +2118,14 @@ void vk_encode(VkQueue q, id<MTLCommandBuffer> mcb, const VkCommandBuffer *cbs, 
         VkDevice dev = e->dev;
         id<MTLCommandBuffer> keep = e->cb;
         id<MTLFence> fence = e->fence;
+        NSMapTable *resources = e->render_resources;
+        uint32_t render_pass_id = e->render_pass_id;
         VkEvent *ev = e->events; int *evv = e->event_values; uint32_t evn = e->event_count, evc = e->event_cap;
         void *ts = e->timestamps; uint32_t tsn = e->timestamp_count, tsc = e->timestamp_cap;
-        e->cb = nil; e->fence = nil; e->render = nil; e->compute = nil; e->blit = nil;
+        e->cb = nil; e->fence = nil; e->render = nil; e->compute = nil; e->blit = nil; e->render_resources = nil;
         memset((void *)e, 0, sizeof *e);
         e->dev = dev; e->queue = q; e->cb = keep; e->fence = fence;
+        e->render_resources = resources; e->render_pass_id = render_pass_id;
         e->events = ev; e->event_values = evv; e->event_count = evn; e->event_cap = evc;
         e->timestamps = ts; e->timestamp_count = tsn; e->timestamp_cap = tsc;
         e->front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
@@ -2093,9 +2143,10 @@ void vk_encode(VkQueue q, id<MTLCommandBuffer> mcb, const VkCommandBuffer *cbs, 
     VkEvent *events = e->events;
     int *values = e->event_values;
     void *ts = e->timestamps;
-    if (evn || tsn) {
+    NSMapTable *resources = e->render_resources;
+    if (evn || tsn || resources) {
         [mcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            (void)done;
+            (void)done; (void)resources;
             for (uint32_t i = 0; i < evn; i++) atomic_store(&events[i]->set, values[i]);
             struct { VkQueryPool pool; uint32_t query; } *t = ts;
             uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -2107,7 +2158,7 @@ void vk_encode(VkQueue q, id<MTLCommandBuffer> mcb, const VkCommandBuffer *cbs, 
             free(events); free(values); free(ts);
         }];
     } else { free(events); free(values); free(ts); }
-    e->cb = nil; e->fence = nil;
+    e->cb = nil; e->fence = nil; e->render_resources = nil;
     free(e);
 }
 
