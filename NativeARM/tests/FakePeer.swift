@@ -35,6 +35,10 @@ private var receivedSignal: Int32 = 0
         }
         if let loading = env["VERANTYX_NATIVE_LOADING_FILE"] {
             try loading.write(toFile: root + "/" + role + "-loading-path", atomically: true, encoding: .utf8)
+            if role == "encoder", let data = try? Data(contentsOf: URL(fileURLWithPath: loading)),
+               !FileManager.default.fileExists(atPath: root + "/host-started") {
+                try data.write(to: URL(fileURLWithPath: root + "/encoder-prehost-loading.json"), options: .atomic)
+            }
             if role == "host" { try Data("{\"type\":\"begin_loading\",\"mapName\":\"synthetic\"}".utf8).write(to: URL(fileURLWithPath: loading)) }
         }
         if let stage = env["VERANTYX_NATIVE_STAGE_FILE"] {

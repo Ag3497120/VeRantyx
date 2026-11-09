@@ -108,6 +108,13 @@ enum NativeSupervisor {
                 fm.fileExists(atPath: quit.path) || fm.fileExists(atPath: force.path)
         }
         func startEncoder() throws -> Process {
+            if host == nil, !fm.fileExists(atPath: loading.path) {
+                // Vision Pro's ALVR client withholds eye geometry and tracking until
+                // it decodes a video frame. Seed the hidden startup state before the
+                // game starts so HardwareEncoder streams the startup notice immediately.
+                try Data("{\"type\":\"begin_loading\",\"mapName\":\"startup\",\"visible\":false,\"messageText\":\"\"}".utf8)
+                    .write(to: loading, options: .atomic)
+            }
             var encoderConfig = config
             // The loading scene draws mailbox text at its authored world position.
             encoderConfig.environment.removeValue(forKey: "VERANTYX_GAME_PROMPT_FILE")

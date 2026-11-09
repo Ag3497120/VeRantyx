@@ -829,6 +829,9 @@ struct LoadingFrameClock {
     private var lastOutput: TimeInterval = -.infinity
     private var lastHadOverlay = false
     private(set) var awaitingSource = false
+    init(awaitingSource: Bool = false) {
+        self.awaitingSource = awaitingSource
+    }
     func needsFrame(hasSource: Bool, hasOverlay: Bool, now: TimeInterval, interval: TimeInterval = 0.1) -> Bool {
         hasSource || ((hasOverlay || awaitingSource) && now - lastOutput >= interval) || (!hasOverlay && lastHadOverlay)
     }
@@ -1940,6 +1943,13 @@ if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] ?? 
         if let expected = env["VERANTYX_LOADING_SELFTEST_EXPECT"], (fromFile.text ?? "(none)") != expected {
             print("loading selftest: expected \(expected), got \(fromFile.text ?? "(none)")"); exit(1)
         }
+        var pregameClock = LoadingFrameClock(awaitingSource: true)
+        precondition(pregameClock.needsFrame(hasSource: false, hasOverlay: false, now: 0))
+        pregameClock.sent(now: 0, hasOverlay: false, hasSource: false)
+        precondition(!pregameClock.needsFrame(hasSource: false, hasOverlay: false, now: 0.05))
+        precondition(pregameClock.needsFrame(hasSource: false, hasOverlay: false, now: 0.11))
+        pregameClock.sent(now: 0.2, hasOverlay: false, hasSource: true)
+        precondition(!pregameClock.needsFrame(hasSource: false, hasOverlay: false, now: 0.31))
         var clock = LoadingFrameClock()
         precondition(clock.needsFrame(hasSource: false, hasOverlay: true, now: 0))
         clock.sent(now: 0, hasOverlay: true, hasSource: false)
@@ -3058,7 +3068,7 @@ func sendStreamStatsIfDue() {
 }
 
 print("Starting native read loop and UDP transmission on port 9999...")
-var loadingFrameClock = LoadingFrameClock()
+var loadingFrameClock = LoadingFrameClock(awaitingSource: alvrMode)
 var loadingFrames = 0
 var lastEncodedLoadingMap: String?
 
@@ -3091,7 +3101,7 @@ while isEncoding {
         let resumed = hasSource && validSize && gamePrompt.noteFrame(sourceMode: sourceMode, now: pollTime)
         gamePrompt.poll(now: pollTime, force: resumed)
         let hasLoadingOverlay = nativeLoadingMap.active || gamePrompt.text != nil
-        let loadingInterval = nativeLoadingMap.active ? 1.0 / 60 : 0.1
+        let loadingInterval = nativeLoadingMap.visible ? 1.0 / 60 : 0.1
         if readyIndex < 2 || loadingFrameClock.needsFrame(hasSource: false, hasOverlay: hasLoadingOverlay, now: pollTime, interval: loadingInterval) {
             if loadingFrameClock.needsFrame(hasSource: hasSource, hasOverlay: hasLoadingOverlay, now: pollTime, interval: loadingInterval) {
                 var frameHeader = hasSource ? headerPtr.pointee : loadingFrame()
