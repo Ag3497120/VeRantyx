@@ -2162,6 +2162,20 @@ if let alvr {
                     handsMapPtr.advanced(by: 320).storeBytes(of: UInt32(0x4450_4956), as: UInt32.self)
                 }
                 if alvr.connected() { checkHeadsetFrustumAgainstSteamVR() }
+                // ALVR sometimes cannot list the game audio device this process made, and then refuses every handshake
+                // for as long as this process lives ("Cannot find audio device"): a new encoder makes a new device.
+                if !alvr.connected(), let audioName = ProcessInfo.processInfo.environment["VERANTYX_ALVR_AUDIO_DEVICE"],
+                   let log = FileHandle(forReadingAtPath: FileManager.default.homeDirectoryForCurrentUser
+                       .appendingPathComponent("Library/Application Support/VeRantyx/ALVR/session_log.txt").path) {
+                    defer { try? log.close() }
+                    let end = log.seekToEndOfFile()
+                    log.seek(toFileOffset: end > 4096 ? end - 4096 : 0)
+                    if String(decoding: log.readDataToEndOfFile(), as: UTF8.self).contains("Cannot find audio device which name contains \"\(audioName)\"") {
+                        print("ALVR: the game audio device cannot be found: the encoder starts again")
+                        fflush(stdout)
+                        _exit(75)
+                    }
+                }
                 if alvr.restartNeeded() {                               //  encoder again, which connects with them;
                                                                         //  also when ALVR's handshake hung: lib.rs)
                     print("ALVR: the headset brought other display settings (stored), or its handshake hung: the encoder starts again")
@@ -3071,7 +3085,6 @@ print("Starting native read loop and UDP transmission on port 9999...")
 var loadingFrameClock = LoadingFrameClock(awaitingSource: alvrMode)
 var loadingFrames = 0
 var lastEncodedLoadingMap: String?
-
 while isEncoding {
     autoreleasepool {
         reportDiagnosticsIfDue()
