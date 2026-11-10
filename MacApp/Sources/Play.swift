@@ -250,10 +250,8 @@ enum Quality: String, CaseIterable, Identifiable {
         }
         try process.run()
         if !flat {
-            let sharedFrame = backend == .nativeARM64
-                ? nativeSession!.appendingPathComponent("frame.dat")
-                : Paths.drive.appendingPathComponent("SteamVR_Prefix/drive_c/vr_shared_frame.dat")
-            mirrorReader = NativeMirrorReader(file: sharedFrame)
+            let sharedFrame = Play.sharedFrameURL(drive: Paths.drive, backend: backend, viaWindowsSteam: viaWindowsSteam, nativeSession: nativeSession)
+            mirrorReader = NativeMirrorReader(file: sharedFrame, skipExisting: backend != .nativeARM64 && !Play.dryRun)
             if self.mirrorOnMac && !Play.dryRun {
                 let mt = Timer(timeInterval: 1.0 / 24.0, repeats: true) { [weak self] _ in Task { @MainActor in self?.pollMirror() } }
                 RunLoop.main.add(mt, forMode: .common)
@@ -264,6 +262,16 @@ enum Quality: String, CaseIterable, Identifiable {
         RunLoop.main.add(t, forMode: .common)             // (.common: also while a menu is open or the window is resized)
         timer = t
     }
+
+    nonisolated static func sharedFrameURL(drive: URL, backend: GameBackend, viaWindowsSteam: Bool, nativeSession: URL?) -> URL {
+        if backend == .nativeARM64, let nativeSession {
+            return nativeSession.appendingPathComponent("frame.dat")
+        }
+        let root = viaWindowsSteam ? "vxrt_wsteam" : "vxrt_root"
+        return drive.appendingPathComponent("\(root)/drive_c/vr_shared_frame.dat")
+    }
+
+    var mirrorFrameURL: URL? { mirrorReader?.file }
 
     func pollMirror() {
         guard running, mirrorOnMac, let frame = mirrorReader?.poll() else { return }
