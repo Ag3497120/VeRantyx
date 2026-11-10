@@ -413,10 +413,26 @@ enum NativeIPC {
         return NativeViewSnapshot(sequence: first, timestamp: timestamp, ipd: ipd, tangents: tangents)
     }
 
+    static func currentSequence(from map: UnsafeRawPointer) -> UInt32 {
+        func value<T>(_ at: Int, _: T.Type) -> T { map.loadUnaligned(fromByteOffset: at, as: T.self) }
+        let ready = value(0, UInt32.self)
+        guard ready < 2 else { return 0 }
+        return value(64 + Int(ready) * block, UInt32.self)
+    }
+
+    static func currentSequence(_ file: URL) -> UInt32 {
+        let fd = open(file.path, O_RDONLY | O_NOFOLLOW); guard fd >= 0 else { return 0 }; defer { close(fd) }
+        var st = stat(); guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size >= hands else { return 0 }
+        guard let map = mmap(nil, hands, PROT_READ, MAP_SHARED, fd, 0), map != MAP_FAILED else { return 0 }
+        defer { munmap(map, hands) }
+        return currentSequence(from: UnsafeRawPointer(map))
+    }
+
     static func mirrorFrame(from map: UnsafeRawPointer, after lastSequence: UInt32 = 0) -> NativeMirrorFrame? {
         func value<T>(_ at: Int, _: T.Type) -> T { map.loadUnaligned(fromByteOffset: at, as: T.self) }
         let ready = value(0, UInt32.self)
-        let idx = Int(ready & 1)
+        guard ready < 2 else { return nil }
+        let idx = Int(ready)
         let base = 64 + idx * block
         let seq = value(base, UInt32.self)
         guard seq > 0, seq != lastSequence else { return nil }
@@ -425,12 +441,12 @@ enum NativeIPC {
         let h = Int(value(base + 8, UInt32.self))
         let format = value(base + 12, UInt32.self)
         let eyeW = fullW / 2
-        guard fullW >= 2, fullW <= 4096, fullW & 1 == 0, h >= 1, h <= 4096 else { return nil }
+        guard fullW >= 2, fullW <= 8192, fullW & 1 == 0, h >= 1, h <= 4096, fullW * h * 4 <= 4096 * 4096 * 8 else { return nil }
         let bitmapInfo: CGBitmapInfo
         switch format {
-        case 87, 91:
+        case 87, 90, 91:
             bitmapInfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue)
-        case 28, 29:
+        case 27, 28, 29:
             bitmapInfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.noneSkipLast.rawValue)
         default:
             return nil
@@ -480,7 +496,12 @@ final class NativeMirrorReader {
     private var mappedInode: ino_t = 0
     private(set) var lastSequence: UInt32 = 0
 
-    init(file: URL) { self.file = file }
+    init(file: URL, skipExisting: Bool = false) {
+        self.file = file
+        if skipExisting {
+            lastSequence = NativeIPC.currentSequence(file)
+        }
+    }
     deinit { closeMap() }
 
     func closeMap() {
@@ -496,6 +517,7 @@ final class NativeMirrorReader {
             return nil
         }
         if map == nil || st.st_ino != mappedInode {
+            let inodeChanged = mappedInode != 0 && st.st_ino != mappedInode
             closeMap()
             let newFD = open(file.path, O_RDONLY | O_NOFOLLOW)
             guard newFD >= 0 else { return nil }
@@ -506,9 +528,14 @@ final class NativeMirrorReader {
             fd = newFD
             map = m
             mappedInode = st.st_ino
-            lastSequence = 0
+            if inodeChanged { lastSequence = 0 }
         }
-        guard let map, let frame = NativeIPC.mirrorFrame(from: UnsafeRawPointer(map), after: lastSequence) else { return nil }
+        guard let map else { return nil }
+        if NativeIPC.currentSequence(from: UnsafeRawPointer(map)) == 0 {
+            lastSequence = 0
+            return nil
+        }
+        guard let frame = NativeIPC.mirrorFrame(from: UnsafeRawPointer(map), after: lastSequence) else { return nil }
         lastSequence = frame.sequence
         return frame
     }

@@ -308,6 +308,26 @@ import Foundation
         guard liveMirror.mirrorImage?.width == 4, liveMirror.mirrorImage?.height == 4 else {
             throw NativeFailure("pollMirror did not extract the left eye from frame.dat")
         }
+        let vxrtShared = Paths.drive.appendingPathComponent("vxrt_root/drive_c/vr_shared_frame.dat")
+        try fm.createDirectory(at: vxrtShared.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if fm.fileExists(atPath: vxrtShared.path) { try fm.removeItem(at: vxrtShared) }
+        try fm.copyItem(at: frame, to: vxrtShared)
+        let earth = Title.named("348250")!
+        let earthMirror = try Play(title: earth.name, appID: earth.id, exe: URL(fileURLWithPath: "/tmp/Earth.exe"),
+                                   headset: .visionApp, wired: false, quality: .standard, known: earth, backend: .vxrt, mirrorOnMac: true)
+        guard earthMirror.mirrorFrameURL?.standardizedFileURL == vxrtShared.standardizedFileURL else {
+            throw NativeFailure("vxrt mirror did not read from vxrt_root/drive_c/vr_shared_frame.dat")
+        }
+        earthMirror.phase = .playing
+        earthMirror.pollMirror()
+        guard earthMirror.mirrorImage?.width == 4, earthMirror.mirrorImage?.height == 4 else {
+            throw NativeFailure("vxrt pollMirror did not extract the left eye from vxrt_root/drive_c/vr_shared_frame.dat")
+        }
+        let nms = Title.named("275850")!
+        let wsteamShared = Paths.drive.appendingPathComponent("vxrt_wsteam/drive_c/vr_shared_frame.dat")
+        guard Play.sharedFrameURL(drive: Paths.drive, backend: .vxrt, viaWindowsSteam: nms.windowsSteam, nativeSession: nil).standardizedFileURL == wsteamShared.standardizedFileURL else {
+            throw NativeFailure("Windows Steam mirror did not target vxrt_wsteam/drive_c/vr_shared_frame.dat")
+        }
         try frameHandle.close()
         for (phase, notice, timedOut) in [(Play.Phase.steamVR, "Open ALVR and connect", false),
                                          (.stopping, "Waiting for the game to close normally…", false),
