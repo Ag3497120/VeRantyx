@@ -71,6 +71,11 @@ def import_apps(source, ids):
         if r.returncode:
             shutil.rmtree(dest, ignore_errors=True)
             sys.exit(f"{i}: copying failed (another volume? cp -c clones only within one APFS volume)")
+        # Restore panorama/videos if the source installation had it renamed to videos.bak (an old Wine workaround).
+        panorama = os.path.join(dest, "game", "hlvr", "panorama")
+        videos, videos_bak = os.path.join(panorama, "videos"), os.path.join(panorama, "videos.bak")
+        if not os.path.lexists(videos) and os.path.isdir(videos_bak):
+            os.symlink("videos.bak", videos)
         shutil.copyfile(m["path"], os.path.join(STEAM, "steamapps", f"appmanifest_{i}.acf"))
         print(f"{i} {m['name']}: imported into {dest}")
 

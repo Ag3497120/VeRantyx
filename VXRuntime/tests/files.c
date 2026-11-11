@@ -43,6 +43,19 @@ static int overlay_test(const char *tree) {
     CHECK(DeleteFileA(path));
     snprintf(pat, sizeof pat, "%s\\save\\*.hl?", tree);
     CHECK(names(pat, list, sizeof list) == 1 && strstr(list, "same.hl1"));
+    // Overlay directory symlink when the original directory was renamed (e.g. panorama\videos -> videos.bak).
+    snprintf(path, sizeof path, "%s\\panorama\\videos\\intro.webm", tree);
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    CHECK(GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES);
+    CHECK(GetFileAttributesExA(path, GetFileExInfoStandard, &fad) && fad.nFileSizeLow == 5);
+    f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    char vbuf[16] = "";
+    CHECK(f != INVALID_HANDLE_VALUE && ReadFile(f, vbuf, 5, &n, NULL) && n == 5 && !memcmp(vbuf, "webm\n", 5));
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    snprintf(pat, sizeof pat, "%s\\panorama\\videos\\*.webm", tree);
+    CHECK(names(pat, list, sizeof list) == 1 && strstr(list, "intro.webm"));
+    snprintf(pat, sizeof pat, "%s\\panorama\\*", tree);
+    CHECK(names(pat, list, sizeof list) == 2 && strstr(list, "videos") && strstr(list, "videos.bak"));
     printf("files through an overlay: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }
