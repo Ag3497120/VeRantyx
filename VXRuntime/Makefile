@@ -1345,6 +1345,7 @@ check-run:
 	python3 ../tests/vxrt_doctor_pe_test.py
 	bash ../tests/launch_vxrt_windows_steam_test.sh
 	python3 ../tests/launch_vxrt_encoder_test.py
+	python3 ../tests/launch_vxrt_alyx_panorama_test.py
 	build/shader_progress_test
 	python3 tests/shader_cache_check.py
 	$(VXRT) build/controller_hotplug.exe
@@ -1475,9 +1476,9 @@ runtime-tests-run:
 	$(VXRT) build/program_env.exe; s=$$?; rm -f build/root/program_env.txt; exit $$s
 	$(VXRT) build/lowmem.exe
 	$(VXRT) build/files.exe
-	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1
+	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save build/ovtree/panorama/videos.bak build/ovshadow/panorama && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1 && echo webm > build/ovtree/panorama/videos.bak/intro.webm && ln -s $(CURDIR)/build/ovtree/panorama/videos.bak build/ovshadow/panorama/videos
 	VXRT_OVERLAY=$(CURDIR)/build/ovtree:$(CURDIR)/build/ovshadow $(VXRT) build/files.exe overlay 'Z:$(subst /,\,$(CURDIR))\build\ovtree'
-	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1
+	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1 && test ! -e build/ovtree/panorama/videos
 	$(VXRT) build/dbfiles.exe
 	for via in dbov dbovlink; do \
 	  rm -rf build/dbov build/dbovlink build/dbovshadow && mkdir -p build/dbov/keep && ln -s dbov build/dbovlink && \

@@ -97,6 +97,19 @@ if [[ -f "$VALVE_DLL" ]]; then
 else
     echo "Half-Life: Alyx's openvr_api.dll was not found in $ALYX_BIN: verify the game's files in Steam" >&2
 fi
+# An old Wine-era workaround renamed game/hlvr/panorama/videos to videos.bak; without panorama/videos,
+# Panorama's in-game video panels (such as Eli Vance's balcony call) resolve to an empty path and stay black.
+# Expose videos -> videos.bak in the overlay so the Steam library stays untouched.
+ALYX_PANORAMA="$ALYX_STEAM/steamapps/common/Half-Life Alyx/game/hlvr/panorama"
+OVERLAY_PANORAMA="$VXRT_VR_OVERLAY/steamapps/common/Half-Life Alyx/game/hlvr/panorama"
+if [[ ! -e "$ALYX_PANORAMA/videos" && -d "$ALYX_PANORAMA/videos.bak" ]]; then
+    mkdir -p "$OVERLAY_PANORAMA"
+    if [[ ! -e "$OVERLAY_PANORAMA/videos" || -L "$OVERLAY_PANORAMA/videos" ]]; then
+        ln -sfn "$ALYX_PANORAMA/videos.bak" "$OVERLAY_PANORAMA/videos"
+    fi
+elif [[ -d "$ALYX_PANORAMA/videos" && -L "$OVERLAY_PANORAMA/videos" ]]; then
+    rm -f "$OVERLAY_PANORAMA/videos"
+fi
 # Poses at the display's rate from the headset instead of SteamVR's compositor, which handed out the next ones only
 # once the GPU had finished the last frame (a frame took the CPU's time plus the GPU's: 45 fps at 3K, now 60).
 # VERANTYX_DECOUPLED_POSES=0: SteamVR's.
