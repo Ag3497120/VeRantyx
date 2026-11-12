@@ -13,6 +13,7 @@ struct Game: Identifiable, Hashable {
     var antiCheat: [String]
     var bytes: Int64
     var alyx: Bool { id == "546560" }
+    var macNativeBundle: Bool { exe?.lastPathComponent == "Cyberpunk2077" }
     var playable: Bool { antiCheat.isEmpty && (alyx || title?.nativeSupport != nil || exe != nil) }
     var flat: Bool { title?.flat == true }
     /// Started by the player's own Windows Steam (No Man's Sky), not with Mac Steam's bridge.
@@ -187,6 +188,18 @@ struct Job {
         var found = installed.filter { $0.key != Title.steamVR && $0.key != "228980" && Title.named($0.key)?.windowsSteam != true }
         // (the games Windows Steam starts: from its own library, where it keeps them)
         for (id, entry) in Library.windowsSteamGames() { found[id] = entry; variants[id, default: []].insert(.vxrt) }
+        let macCPCandidates = [
+            drive.appendingPathComponent("avp_mac/macstream/Cyberpunk2077MS.app"),
+            drive.appendingPathComponent("mac_vr/Cyberpunk2077MS.app"),
+            URL(fileURLWithPath: "/Applications/Cyberpunk2077.app"),
+            URL(fileURLWithPath: "/Volumes/PREDATOR GM7000 4TB/Applications/Cyberpunk2077.app"),
+        ]
+        if let cpApp = macCPCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.appendingPathComponent("Contents/MacOS/Cyberpunk2077").path) }) {
+            let cpExe = cpApp.appendingPathComponent("Contents/MacOS/Cyberpunk2077")
+            variants["1091500", default: []].insert(.vxrt)
+            variants["1091500", default: []].insert(.nativeARM64)
+            nativeGames.append(Game(id: "1091500", name: "Cyberpunk 2077 (Mac VR)", folder: cpApp, exe: cpExe, title: nil, antiCheat: [], bytes: 92_000_000_000))
+        }
         installedBackends = variants
         nativeInstallProblems = nativeProblems
         let entries = found
@@ -413,6 +426,9 @@ struct Job {
     /// running, for a start that will wait for it).
     func canStart(_ game: Game, flat: Bool, assumingSteam: Bool = false) -> Bool {
         guard game.playable, isInstalled(game.id), play?.running != true, steamWait == nil, job == nil, !setupDownloading, !(flat && !game.flat) else { return false }
+        if game.macNativeBundle {
+            return appleSilicon && macOSOK && elsewhere.isEmpty && !flat
+        }
         let steamRunning = self.steamRunning || assumingSteam
         if backend(forID: game.id) == .nativeARM64 {
             return appleSilicon && macOSOK && steamRunning && game.title.map { nativeReason(for: $0) == nil } == true && elsewhere.isEmpty && !flat
@@ -652,7 +668,7 @@ struct Job {
 
     /// Whether a game's start waits for Steam for Mac to be signed in: the games VXRuntime runs with Mac Steam (not
     /// those Windows Steam starts, not the native ARM64 ones, which have their own bridge).
-    func waitsForSteam(_ game: Game) -> Bool { !Play.dryRun && backend(forID: game.id) == .vxrt && !game.viaWindowsSteam }
+    func waitsForSteam(_ game: Game) -> Bool { !Play.dryRun && !game.macNativeBundle && backend(forID: game.id) == .vxrt && !game.viaWindowsSteam }
 
     /// Play: once Steam for Mac is signed in (online, for a game whose launcher signs in through Steam), the game
     /// starts; meanwhile the Play page says what it waits for (steamWait), and the player can cancel.

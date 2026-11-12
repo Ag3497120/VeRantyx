@@ -29,8 +29,9 @@ IDENTITY="${VERANTYX_SIGN_IDENTITY:--}"
 CARGO="$(command -v cargo || echo "$HOME/.cargo/bin/cargo")"
 step() { printf '\n== %s\n' "$*"; }
 
-step "Runtime: VXRuntime, the encoder, the helper, the SteamVR driver, the capture proxy, the ALVR bridge"
+step "Runtime: VXRuntime, MacVR, the encoder, the helper, the SteamVR driver, the capture proxy, the ALVR bridge"
 make -C "$REPO/VXRuntime" build/vxrt >/dev/null
+make -C "$REPO/MacVR" build/libverantyx_macvr.dylib >/dev/null
 mkdir -p "$OUT/obj"
 swiftc -O -target "$TARGET" "$REPO/MacEncoder/HardwareEncoder.swift" -o "$OUT/obj/HardwareEncoder"
 swiftc -O -target "$TARGET" "$REPO/scripts/vxrt_helper.swift" -o "$OUT/obj/vxrt-helper"
@@ -91,9 +92,11 @@ mkdir -p "$APP/Contents/Resources/Localizations"
 cp "$MACAPP"/Localizations/*.json "$APP/Contents/Resources/Localizations/"
 
 # The runtime, laid out as in the repository: the scripts find everything where they look (REPO_ROOT is runtime/).
-mkdir -p "$RT/scripts" "$RT/VXRuntime/build" "$RT/build" "$RT/VRDriver" "$RT/ALVRBridge/target/release" "$RT/games"
-cp "$REPO"/scripts/{launch_vxrt_steamvr.sh,launch_vxrt_alyx.sh,launch_vxrt_game.sh,vxrt_paths.sh,launch_vxrt_windows_steam.sh,launch_vxrt_nms_vr.sh,vxrt_windows_steam_ask.sh} "$RT/scripts/"
+mkdir -p "$RT/scripts" "$RT/tools" "$RT/VXRuntime/build" "$RT/MacVR/build" "$RT/build" "$RT/VRDriver" "$RT/ALVRBridge/target/release" "$RT/games"
+cp "$REPO"/scripts/{launch_vxrt_steamvr.sh,launch_vxrt_alyx.sh,launch_vxrt_game.sh,vxrt_paths.sh,launch_vxrt_windows_steam.sh,launch_vxrt_nms_vr.sh,vxrt_windows_steam_ask.sh,launch_mac_cyberpunk_vr.sh} "$RT/scripts/"
+cp "$REPO/tools/mac_cyberpunk_vr.py" "$RT/tools/"
 cp "$REPO/VXRuntime/build/vxrt" "$RT/VXRuntime/build/"
+cp "$REPO/MacVR/build/libverantyx_macvr.dylib" "$RT/MacVR/build/"
 cp "$OUT/obj/HardwareEncoder" "$OUT/obj/vxrt-helper" "$REPO/build/openvr_api_capture_proxy.dll" "$RT/build/"
 cp "$REPO/VRDriver/driver_verantyx.dll" "$RT/VRDriver/"
 cp "$REPO/ALVRBridge/target/release/libverantyx_alvr_bridge.dylib" "$RT/ALVRBridge/target/release/"
