@@ -1,5 +1,7 @@
 # VeRantyx（日本語）
 
+**Vision Pro単体で『Cyberpunk 2077』をVRプレイする場合は [VXpro](https://github.com/Ag3497120/VXpro) へ。** Mac App Store版のゲームと実験的なハンドトラッキングに対応しています。
+
 Apple シリコンの Mac で PC VR ゲームを描画し、Apple Vision Pro へ HEVC で配信して遊ぶためのプロジェクトです。
 手の位置は Vision Pro のハンドトラッキング、ボタン・スティック・トリガーはジョイコンから取り、トラッキング付きの
 VR コントローラーは要りません。ゲームの動かし方が違う3つの版があります。

@@ -5,6 +5,9 @@ No gaming PC, no Wine, no CrossOver.</b><br>
 Windows PC VR games run on our own Windows runtime, written from scratch for Apple silicon, and stream to Vision Pro
 or an ALVR headset. Some also play on the Mac's own screen.</p>
 
+<p align="center"><b>Cyberpunk 2077 on Vision Pro itself</b> · <a href="https://github.com/Ag3497120/VXpro">VXpro</a>
+runs the Mac App Store edition in VR on the headset, with experimental hand tracking.</p>
+
 <p align="center">
   <a href="https://github.com/Ag3497120/VeRantyx/releases/latest"><img alt="Download VeRantyx for Mac" src="https://img.shields.io/github/v/release/Ag3497120/VeRantyx?label=VeRantyx%20for%20Mac&logo=apple"></a>
   <img alt="Apple silicon, macOS 14.2+" src="https://img.shields.io/badge/macOS-14.2%2B%20%C2%B7%20Apple%20silicon-black">
@@ -23,9 +26,9 @@ or an ALVR headset. Some also play on the Mac's own screen.</p>
 > Quest players. **[Download VeRantyx for Mac →](https://github.com/Ag3497120/VeRantyx/releases/latest)** (also on
 > [verantyx.ai](https://verantyx.ai))
 >
-> **In progress:** Direct3D 12 — Cyberpunk 2077 plays in game on the Mac (about 20 fps of real frames, more shown with
-> frame prediction) on the [`vr-main`](https://github.com/Ag3497120/VeRantyx/tree/vr-main) branch, not in the app yet;
-> and a first attempt to run it standalone on Vision Pro ([`avp-port`](https://github.com/Ag3497120/VeRantyx/tree/avp-port)).
+> **In progress:** Direct3D 12 — the Windows edition of Cyberpunk 2077 plays on the Mac on the
+> [`vr-main`](https://github.com/Ag3497120/VeRantyx/tree/vr-main) branch (about 20 real frames per second in a test).
+> For standalone Vision Pro gameplay with the Mac App Store edition, see [VXpro](https://github.com/Ag3497120/VXpro).
 
 > **Want your game to run? Ask your AI assistant.** VeRantyx is built to be extended with Claude Code, Codex,
 > Gemini CLI or Cursor: run `/vxrt-support <your game>` in this repository and the agent measures the game, looks for
