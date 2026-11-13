@@ -4,13 +4,17 @@
 #include "vx.h"
 #include <ctype.h>
 #include <errno.h>
+#include <libproc.h>
+#include <limits.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
@@ -637,22 +641,84 @@ static WINAPI DWORD EventWriteString(uint64_t reg, uint8_t level, uint64_t keywo
     return 0;
 }
 
-// ---- this process, as the only one -------------------------------------------------------------------------------------
-static WINAPI BOOL K32EnumProcesses(DWORD *ids, DWORD size, DWORD *got) { if (size >= 4) ids[0] = (DWORD)getpid(); *got = size >= 4 ? 4 : 0; return 1; }
-static DWORD image_name_a(char *out, DWORD cap) {
-    const vx_image *m = vx_image_at((uint64_t)(uintptr_t)vx_proc.image_base);
-    const char *w = m && m->windows_path ? m->windows_path : "C:\\program.exe";
+// ---- processes: this one and the other programs this vxrt runs --------------------------------------------------------
+// Programs look for each other by image name: SteamVR's client (2.18) asks for a headset's USB presence unless it sees
+// vrserver.exe among the processes, and there is no USB headset. So the processes listed are the ones of this same
+// vxrt binary, each named by the program it runs (its argv[1], as main and CreateProcess start it).
+int vx_process_info(HANDLE h, DWORD *code);
+static int vxrt_binary(char *out) {
+    char self[PATH_MAX];
+    uint32_t len = sizeof self;
+    return !_NSGetExecutablePath(self, &len) && realpath(self, out);
+}
+static int runs_vxrt(pid_t pid, const char *binary) {
+    char path[PROC_PIDPATHINFO_MAXSIZE], real[PATH_MAX];
+    return proc_pidpath(pid, path, sizeof path) > 0 && realpath(path, real) && !strcmp(real, binary);
+}
+static WINAPI BOOL K32EnumProcesses(DWORD *ids, DWORD size, DWORD *got) {
+    DWORD cap = size / 4, n = 0;
+    if (n < cap) ids[n++] = (DWORD)getpid();
+    char binary[PATH_MAX];
+    int count = proc_listallpids(NULL, 0);
+    pid_t *pids = count > 0 && vxrt_binary(binary) ? calloc((size_t)count + 64, sizeof *pids) : NULL;
+    if (pids) {
+        count = proc_listallpids(pids, (int)(((size_t)count + 64) * sizeof *pids));
+        for (int i = 0; i < count && n < cap; i++)
+            if (pids[i] > 0 && pids[i] != getpid() && runs_vxrt(pids[i], binary)) ids[n++] = (DWORD)pids[i];
+        free(pids);
+    }
+    *got = n * 4;                                                 // (a full buffer: the caller asks again with a larger one)
+    return 1;
+}
+// The program another vxrt process runs, as a Unix path: argv[1] of its arguments (KERN_PROCARGS2: argc, the
+// executable's path, padding, then argv), against its current directory when relative.
+static int program_of(pid_t pid, char *out, size_t cap) {
+    int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid }, ok = 0;
+    size_t len = 0;
+    if (sysctl(mib, 3, NULL, &len, NULL, 0) || len < sizeof(int)) return 0;
+    char *buf = malloc(len), *end = buf + len, *p = buf + sizeof(int);
+    int argc = 0;
+    if (!sysctl(mib, 3, buf, &len, NULL, 0) && len >= sizeof(int)) {
+        end = buf + len;
+        memcpy(&argc, buf, sizeof argc);
+        while (p < end && *p) p++;                                // the executable's path
+        while (p < end && !*p) p++;                               // its padding
+        while (p < end && *p) p++;                                // argv[0]
+        p++;
+        if (argc >= 2 && p < end && *p && memchr(p, 0, (size_t)(end - p))) {
+            struct proc_vnodepathinfo dirs;
+            if (*p == '/') ok = snprintf(out, cap, "%s", p) < (int)cap;
+            else if (proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &dirs, sizeof dirs) == sizeof dirs)
+                ok = snprintf(out, cap, "%s/%s", dirs.pvi_cdir.vip_path, p) < (int)cap;
+        }
+    }
+    free(buf);
+    return ok;
+}
+static DWORD image_name_a(HANDLE p, char *out, DWORD cap) {
+    char win[1024], unix_path[PATH_MAX];
+    const char *w;
+    int pid = (intptr_t)p == -1 ? getpid() : vx_process_info(p, NULL);
+    if (pid < 0) { vx_set_last_error(6 /* ERROR_INVALID_HANDLE */); return 0; }
+    if (pid == getpid()) {
+        const vx_image *m = vx_image_at((uint64_t)(uintptr_t)vx_proc.image_base);
+        w = m && m->windows_path ? m->windows_path : "C:\\program.exe";
+    } else {
+        if (!program_of((pid_t)pid, unix_path, sizeof unix_path)) { vx_set_last_error(5 /* ERROR_ACCESS_DENIED */); return 0; }
+        vx_windows_path(unix_path, win, sizeof win);
+        w = win;
+    }
     DWORD n = (DWORD)strlen(w);
     if (!out || cap <= n) { vx_set_last_error(122); return 0; }
     memcpy(out, w, n + 1);
     return n;
 }
-static WINAPI DWORD K32GetProcessImageFileNameA(HANDLE p, char *out, DWORD cap) { (void)p; return image_name_a(out, cap); }
-static WINAPI BOOL QueryFullProcessImageNameA(HANDLE p, DWORD flags, char *out, DWORD *size) { (void)p; (void)flags; DWORD n = image_name_a(out, *size); if (!n) return 0; *size = n; return 1; }
+static WINAPI DWORD K32GetProcessImageFileNameA(HANDLE p, char *out, DWORD cap) { return image_name_a(p, out, cap); }
+static WINAPI BOOL QueryFullProcessImageNameA(HANDLE p, DWORD flags, char *out, DWORD *size) { (void)flags; DWORD n = image_name_a(p, out, *size); if (!n) return 0; *size = n; return 1; }
 static WINAPI BOOL QueryFullProcessImageNameW(HANDLE p, DWORD flags, WCHAR *out, DWORD *size) {
-    (void)p; (void)flags;
+    (void)flags;
     char a[1024];
-    if (!image_name_a(a, sizeof a)) return 0;
+    if (!image_name_a(p, a, sizeof a)) return 0;
     size_t n = vx_utf8_to_utf16(a, strlen(a) + 1, out, *size);
     if (!n || n > *size) { vx_set_last_error(122); return 0; }
     *size = (DWORD)n - 1;
