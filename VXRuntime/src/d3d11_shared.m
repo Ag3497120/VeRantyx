@@ -272,8 +272,8 @@ void d3d_shared_note(d3d_texture *t) {
 // VXRT_SHARED_COPY_SNAPSHOT=file.png (VXRT_SHARED_COPY_SNAPSHOT_AT=n, default 600): the n-th time this process
 // copies or resolves into a shared texture, that texture after the copy (debugging what crosses processes).
 void d3d_shared_written(d3d_device *dev, d3d_texture *t) {
-    static int count;
-    const char *snap = getenv("VXRT_SHARED_COPY_SNAPSHOT"), *at = getenv("VXRT_SHARED_COPY_SNAPSHOT_AT");
+    static int count, init; static const char *snap, *at;
+    if (!init) { snap = getenv("VXRT_SHARED_COPY_SNAPSHOT"); at = getenv("VXRT_SHARED_COPY_SNAPSHOT_AT"); init = 1; }
     if (!snap || !t->shared || __sync_add_and_fetch(&count, 1) != (at ? atoi(at) : 600)) return;
     d3d_flush(dev, 1);
     vx_log("shared copy snapshot: slot %d, %ux%u, DXGI format %u", t->shared - 1, t->desc[TD_WIDTH], t->desc[TD_HEIGHT], t->desc[TD_FORMAT]);

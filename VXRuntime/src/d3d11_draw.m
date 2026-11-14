@@ -1936,7 +1936,8 @@ void d3d_flash_frame(d3d_device *dev, d3d_texture *t, d3d_texture *dst, const ui
 static void trace_draw(d3d_context *c, d3d_draw_state *s) {
     static int left = -1;
     static const char *path;
-    if (left < 0) { path = getenv("VXRT_TRACE_DRAWS"); left = path ? 0 : -2; }
+    if (left == -1) {   // (not "< 0": -2 means off and must not run getenv on every draw)
+        path = getenv("VXRT_TRACE_DRAWS"); left = path ? 0 : -2; }
     if (left == -2) return;
     if (!left) { static int polls; if (++polls % 64 || access(path, F_OK)) return; left = 300; }
     left--;
