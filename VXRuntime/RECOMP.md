@@ -130,6 +130,35 @@ Cyberpunk2077.exe (2.3, 66.7 MB):
 - **Memory.** The modules' pages are clean and file-backed. The imap is only read on faults, so it could move to a
   compressed side file.
 
+## FPCR and FPSR at module crossings (2026-11-10)
+
+Every native call leaves a module and enters one again, and the enter and exit stubs (`xlat_prologue` / `xlat_epilogue`,
+emitted once per module part) used to write FPCR twice and read/clear FPSR three times per crossing. Time Profiler on the
+live D3D11 game (M4 Pro, Time Profiler) put 24.6% of the render thread (2.3 ms of an 18 ms frame) and 18% of each worker thread
+on those `msr`/`mrs` instructions. Measured on the M4 Pro: `mrs fpcr` 0.26 ns; `msr fpcr` 2.6 ns with the value it
+already has, 9 ns when it changes; `mrs fpsr` 2.4 ns; `msr fpsr, xzr` 2.9 ns.
+
+What the stubs carry: the host's FPCR (saved in the stub's frame, restored on exit, so imports run with the host's
+rounding and FZ), the guest's FPCR made from MXCSR (RMode from RC, FZ from FTZ|DAZ; modules are made with `XE_AFP=0`, so
+AH is 0 and the NaN fixes are in the code), and FPSR, whose cumulative bits are MXCSR's exception flags.
+
+Now (modules made after this change; `VXRT_AOT_FPCR_ALWAYS=1` restores the old behaviour at run time through
+`ctx->fpcr_always`):
+- FPCR is written only when it differs from the thread's. With the default MXCSR (0x1F80) the guest's FPCR is 0, the
+  host's too, so a crossing writes nothing. A non-default mode (rounding, FTZ/DAZ) still switches on both sides, so host
+  code never runs under the guest's mode. Nothing is cached: the stub compares with `mrs fpcr`, which is free.
+- FPSR is not read or cleared at crossings. The flags stay in the hardware and reach `ctx->mxcsr` when the guest reads
+  MXCSR (STMXCSR, FXSAVE: translated inline, as before) or where the runtime reads `ctx->mxcsr` itself
+  (`xa_mxcsr_flush`: setjmp, SwitchToFiber, a callback into the guest, a fault's CONTEXT). LDMXCSR still clears FPSR.
+  The engine's own blocks (the fallback) skip the clear in their prologue when modules are loaded (`xlat_fpsr_lazy`).
+  Visible difference: flags raised by host code during an import now show in the guest's MXCSR, as on Windows where
+  the import shares MXCSR with its caller (before, FPSR was cleared after the import). A host function that calls
+  `feclearexcept` would drop the guest's pending flags (none known).
+- Modules made before it keep the exact old stubs and work with the new runtime; the new stubs need the new runtime
+  (`ctx->fpcr_always` exists only there). `VXRT_AOT_FPCR_HIST=1` adds to the 10 s `aot:` report the guest MXCSR mode
+  histogram per entry, how often FPCR differs, and whether FPSR held flags. Reproducer: `make aot-fpcr-check`
+  (`tests/aot_fpcr.c`), part of `aot-suite`.
+
 ## Known limits
 
 - In the generated code, writes to code pages are not watched (no SMC).
