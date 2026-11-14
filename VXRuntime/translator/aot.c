@@ -29,6 +29,40 @@ const char *vx_image_name_at(uint64_t pc);            // (src/loader.c: an image
 static int g_strict = -1;
 int xa_any(void) { return g_nmod > 0; }
 
+// FPCR / FPSR at module crossings (RECOMP.md "FPCR"). VXRT_AOT_FPCR_ALWAYS=1: a module's stubs write FPCR and read/clear FPSR
+// at every crossing, as before (ctx->fpcr_always). Otherwise FPCR is written only when it differs, and FPSR's flags stay in
+// the hardware until something reads MXCSR: STMXCSR / FXSAVE in translated code, or xa_mxcsr_flush for the runtime's own readers.
+static int g_fpcr_always = -1;
+static int fpcr_always(void) {
+    if (g_fpcr_always < 0) { const char *v = getenv("VXRT_AOT_FPCR_ALWAYS"); g_fpcr_always = v && atoi(v); }
+    return g_fpcr_always;
+}
+// The flags FPSR holds into c->mxcsr (FPSR's IOC DZC OFC UFC IXC as MXCSR's IE ZE OE UE PE: xlat.c fpsr_to_mxcsr), FPSR cleared.
+void xa_mxcsr_flush(x86_ctx *c) {
+    uint64_t f;
+    __asm__ volatile("mrs %0, fpsr" : "=r"(f));
+    if (!(f & 0x1f)) return;
+    c->mxcsr |= (uint32_t)((f & 1) | (f >> 1 & 0xf) << 2 | (f >> 3 & 1) << 5);
+    __asm__ volatile("msr fpsr, xzr");
+}
+// VXRT_AOT_FPCR_HIST=1: at each entry into a module, the guest's MXCSR control bits (index DAZ | RC << 1 | FTZ << 3), how
+// often the FPCR it needs differs from the thread's current FPCR (the writes the stub makes), whether the thread's FPCR
+// is not zero, and whether FPSR held flags (host code that raised some, or the guest's own).
+static int g_hist;
+static uint64_t g_hist_mode[16], g_hist_total, g_hist_differs, g_hist_hostnz, g_hist_flags;
+static void hist_entry(const x86_ctx *c) {
+    uint32_t m = c->mxcsr; uint64_t cur, fpsr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(cur));
+    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
+    uint64_t want = (uint64_t)(m >> 13 & 1) << 23 | (uint64_t)(m >> 14 & 1) << 22 | (uint64_t)((m >> 15 | m >> 6) & 1) << 24;
+    unsigned k = (m >> 6 & 1) | (m >> 13 & 3) << 1 | (m >> 15 & 1) << 3;
+    __atomic_add_fetch(&g_hist_total, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_hist_mode[k], 1, __ATOMIC_RELAXED);
+    if (want != cur) __atomic_add_fetch(&g_hist_differs, 1, __ATOMIC_RELAXED);
+    if (cur) __atomic_add_fetch(&g_hist_hostnz, 1, __ATOMIC_RELAXED);
+    if (fpsr & 0x9f) __atomic_add_fetch(&g_hist_flags, 1, __ATOMIC_RELAXED);
+}
+#define HIST(c) do { if (__builtin_expect(g_hist, 0)) hist_entry(c); } while (0)
+
 int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { vx_log("aot: %s: %s", path, dlerror()); return -1; }
@@ -41,6 +75,7 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
     }
     // (the code made without FPCR.AH carries the NaN fixes; the engine's own code must agree: XE_AFP before it translates)
     if (!(d->flags & XA_AFP)) setenv("XE_AFP", "0", 1);
+    if (!fpcr_always()) xlat_fpsr_lazy = 1;     // (engine blocks run beside the modules: they leave FPSR's flags to the next MXCSR read too)
     if (d->next >= XA_NABS) {
         d->ext[XA_HELPER] = (uint64_t)(uintptr_t)xlat_helper;
         d->ext[XA_SPLIT_LOCK] = (uint64_t)(uintptr_t)xlat_split_lock_addr();
@@ -259,6 +294,8 @@ static inline void native_return(x86_ctx *c) {
 }
 int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx *)) {
     if (g_strict < 0) g_strict = getenv("VXRT_AOT_STRICT") && atoi(getenv("VXRT_AOT_STRICT"));
+    c->fpcr_always = (uint64_t)fpcr_always();
+    if (!g_hist && getenv("VXRT_AOT_FPCR_HIST") && atoi(getenv("VXRT_AOT_FPCR_HIST"))) g_hist = 1;
     for (;;) {
         if (c->fault) return (int)c->fault;
         uint64_t rip = c->rip;
@@ -269,7 +306,7 @@ int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx
         if (k->rip == rip) {
             if (k->d) {
                 if (!(++g_entries & ((1u << 22) - 1))) xa_tick();
-                c->entry = k->p; c->link = 0; k->d->enter(c);
+                c->entry = k->p; c->link = 0; HIST(c); k->d->enter(c);
                 continue;
             }
             g_native++;
@@ -287,6 +324,7 @@ int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx
                 c->entry = (uint64_t)(uintptr_t)(d->code + b->off);
                 c->link = 0;
                 k->rip = rip; k->p = c->entry; k->d = d;
+                HIST(c);
                 d->enter(c);
                 continue;
             }
@@ -318,5 +356,10 @@ void xa_report(void) {
            (unsigned long long)g_entries, (unsigned long long)g_cfn_calls, (unsigned long long)g_native, (unsigned long long)g_stubs, (unsigned long long)g_fallback,
            (unsigned long long)g_fallback_rips, (unsigned long long)g_splits);
     write_splits();
+    if (g_hist) {
+        vx_log("aot-fpcr: %llu entries: guest FPCR differs from the thread's %llu, thread FPCR not 0 %llu, FPSR held flags %llu; mode (DAZ|RC<<1|FTZ<<3) counts:",
+               (unsigned long long)g_hist_total, (unsigned long long)g_hist_differs, (unsigned long long)g_hist_hostnz, (unsigned long long)g_hist_flags);
+        for (int i = 0; i < 16; i++) if (g_hist_mode[i]) vx_log("aot-fpcr:   mode %2d (DAZ %d RC %d FTZ %d): %llu", i, i & 1, i >> 1 & 3, i >> 3, (unsigned long long)g_hist_mode[i]);
+    }
 }
 #endif
