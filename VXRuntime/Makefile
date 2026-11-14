@@ -1542,6 +1542,7 @@ runtime-tests-run:
 	$(VXRT) build/egl_host.exe
 	$(VXRT) build/gl.exe
 	build/dxbcscan tests/shaders/*.dxbc
+	python3 tests/dxbc_tex1d_check.py build/dxbc2msl
 	$(VXRT) build/draw.exe
 	$(VXRT) build/compute.exe
 	$(VXRT) build/d3d12.exe
