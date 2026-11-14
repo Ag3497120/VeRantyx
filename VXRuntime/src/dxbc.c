@@ -450,15 +450,27 @@ static void sample(gen *g, const instr *in) {
     char tn[16];
     snprintf(tn, sizeof tn, "t%u", t);
     coords(g, addr, dim, K_FLOAT, xy, sizeof xy, slice, sizeof slice, tn);
+    // Metal's texture1d and texture1d_array have one sample(sampler, coord[, array]) and nothing else: no level(), bias(),
+    // gradient or offset argument. The runtime makes every Direct3D 1D texture with a single mip level (d3d11.m,
+    // "Metal's 1D textures have one mip level"), and Direct3D clamps an explicit or biased level, or one from gradients,
+    // to the texture's last mip: that is level 0 here, so the plain sample is what sample_l/sample_b/sample_d select.
+    // A texel offset moves the coordinate by offset / width instead.
+    int one_d = dim == DIM_1D || dim == DIM_1DARRAY;
+    if (one_d && in->offset[0]) {
+        char moved[800];
+        snprintf(moved, sizeof moved, "(%s + float(%d) / float(%s.get_width()))", xy, in->offset[0], tn);
+        snprintf(xy, sizeof xy, "%s", moved);
+    }
     char args[2400];
     snprintf(args, sizeof args, "s%u, %s%s%s", smp ? smp->index[0] : 0, xy, slice[0] ? ", " : "", slice);
     int gn = dim == DIM_3D || dim == DIM_CUBE || dim == DIM_CUBEARRAY ? 3 : 2;
     const char *grad = dim == DIM_3D ? "gradient3d" : dim == DIM_CUBE || dim == DIM_CUBEARRAY ? "gradientcube" : "gradient2d";
     int compare = 0;
     switch (in->op) {
-    case OP_SAMPLE_L: src(g, &in->ops[4], &c0, 1, K_FLOAT, a, sizeof a); snprintf(extra, sizeof extra, ", level(%s)", a); break;
-    case OP_SAMPLE_B: src(g, &in->ops[4], &c0, 1, K_FLOAT, a, sizeof a); snprintf(extra, sizeof extra, ", bias(%s)", a); break;
+    case OP_SAMPLE_L: if (one_d) break; src(g, &in->ops[4], &c0, 1, K_FLOAT, a, sizeof a); snprintf(extra, sizeof extra, ", level(%s)", a); break;
+    case OP_SAMPLE_B: if (one_d) break; src(g, &in->ops[4], &c0, 1, K_FLOAT, a, sizeof a); snprintf(extra, sizeof extra, ", bias(%s)", a); break;
     case OP_SAMPLE_D:
+        if (one_d) break;
         src(g, &in->ops[4], c4, gn, K_FLOAT, a, sizeof a); src(g, &in->ops[5], c4, gn, K_FLOAT, b, sizeof b);
         snprintf(extra, sizeof extra, ", %s(%s, %s)", grad, a, b);
         break;
@@ -468,7 +480,7 @@ static void sample(gen *g, const instr *in) {
         snprintf(extra, sizeof extra, ", %s%s", a, in->op == OP_SAMPLE_C_LZ ? ", level(0)" : "");
         break;
     }
-    if ((in->offset[0] || in->offset[1] || in->offset[2]) && dim != DIM_CUBE && dim != DIM_CUBEARRAY) {
+    if ((in->offset[0] || in->offset[1] || in->offset[2]) && dim != DIM_CUBE && dim != DIM_CUBEARRAY && !one_d) {
         size_t k = strlen(extra);
         if (dim == DIM_3D) snprintf(extra + k, sizeof extra - k, ", int3(%d, %d, %d)", in->offset[0], in->offset[1], in->offset[2]);
         else snprintf(extra + k, sizeof extra - k, ", int2(%d, %d)", in->offset[0], in->offset[1]);
@@ -1245,6 +1257,7 @@ static int first_comp(uint8_t mask) { for (int c = 0; c < 4; c++) if (mask & (1 
 static void resource_params(gen *g, text *t) {
     dxbc_shader *sh = g->sh;
     if (sh->d3d12) { put(t, ", constant VxRoot &vx_root [[buffer(0)]]"); return; }
+    memcpy(sh->tex_dim, g->tex_dim, 128); memcpy(sh->tex_ret, g->tex_ret, 128); memcpy(sh->tex_cmp, g->tex_cmp, 128);   // (for the host's zero stand-ins)
     for (int i = 0; i < 16; i++) if (sh->cbuffers & (1u << i)) put(t, ", constant float4 *cb%d [[buffer(%d)]]", i, i);
     for (int i = 0; i < 128; i++) {
         if (!(sh->textures[i / 64] & (1ull << (i % 64)))) continue;

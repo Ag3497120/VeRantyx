@@ -14,6 +14,7 @@
 #include "shaders/fullscreen_vs.h"
 #include "shaders/math_ps.h"
 #include "shaders/quad_gs.h"
+#include "shaders/unbound_ps.h"
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 static ID3D11Device *dev;
@@ -206,6 +207,48 @@ static void test_math(void) {
     ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
 }
 
+// math_ps with its comparison `b.x < a.x` patched into `a.x != a.x` (the opcode lt -> ne, the first source's row 1 -> 0),
+// and a NaN in a.x. D3D is IEEE: NaN != NaN is true, max(NaN, y) is y, and dot() with a NaN is NaN. Metal's default fast
+// math may assume no NaN occurs and fold the self-comparison to false. (There is no fxc to build a new shader with here.)
+static void test_ieee_math(void) {
+    ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(4, 4, DXGI_FORMAT_R32G32B32A32_FLOAT, &rtv);
+    ID3D11VertexShader *vs; ID3D11PixelShader *ps;
+    unsigned char code[sizeof math_ps];
+    memcpy(code, math_ps, sizeof code);
+    unsigned lt_at = 0;
+    for (unsigned i = 0; i + 36 <= sizeof code; i += 4) {
+        unsigned w; memcpy(&w, code + i, 4);
+        if (w == 0x9000031 && code[i + 12] == 0x0a && code[i + 16] == 0 && code[i + 20] == 1) { lt_at = i; break; }
+    }
+    CHECK(lt_at != 0);
+    if (!lt_at) return;
+    code[lt_at] = 0x39;                                    // ne
+    code[lt_at + 20] = 0;                                  // cb0[0].x != cb0[0].x
+    CHECK(SUCCEEDED(ID3D11Device_CreateVertexShader(dev, fullscreen_vs, sizeof fullscreen_vs, NULL, &vs)));
+    CHECK(SUCCEEDED(ID3D11Device_CreatePixelShader(dev, code, sizeof code, NULL, &ps)));
+    volatile float zero = 0.0f;
+    float nan = zero / zero;
+    struct { float a[4], b[4]; int n[4]; } in = { { nan, -2, 3, 4 }, { 0.5f, 3, 2.25f, 9 }, { 5, 3, 2, 7 } };
+    ID3D11Buffer *cb = buffer(D3D11_BIND_CONSTANT_BUFFER, &in, sizeof in);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &cb);
+    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    float px[16 * 4];
+    readback(t, px, 16);
+    float *o = &px[(1 * 4 + 1) * 4];
+    printf("  IEEE math: (%g, %g, %g, %g), expected (nan, 3.5, 4.75, 388)\n", o[0], o[1], o[2], o[3]);
+    CHECK(isnan(o[0]));                                    // dot with a NaN
+    CHECK(o[1] == 3.5f);
+    CHECK(o[2] == 4.75f);                                  // max(NaN, 3) - min(3, 0.5) + frac(2.25) + abs(2)
+    CHECK(o[3] == 388.0f);                                 // NaN != NaN took the 100 arm (fast math: 488)
+    ID3D11Buffer_Release(cb); ID3D11VertexShader_Release(vs); ID3D11PixelShader_Release(ps);
+    ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
+}
+
 static void test_depth_and_blend(void) {
     ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, &rtv);
     D3D11_TEXTURE2D_DESC dd = { 32, 32, 1, 1, DXGI_FORMAT_D32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0 };
@@ -245,6 +288,51 @@ static void test_depth_and_blend(void) {
     printf("  blend: %06x (half red over blue)\n", p & 0xffffff);
     ID3D11DeviceContext_OMSetBlendState(ctx, NULL, NULL, 0xffffffffu);
     ID3D11BlendState_Release(blend); ID3D11DepthStencilView_Release(dsv); ID3D11Texture2D_Release(depth);
+    ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
+}
+
+// A depth-stencil texture made without initial data starts as zeros, as on Windows (new video memory is zeroed).
+// A full-screen pass gated by stencil NOT_EQUAL 255 on such a texture, never cleared, must pass everywhere. First a
+// texture is filled with stencil 255 and released, so that its memory is likely to come back for the next one.
+static void test_fresh_stencil(void) {
+    ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, &rtv);
+    D3D11_TEXTURE2D_DESC dd = { 64, 64, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0 };
+    static UINT px[64 * 64];
+    int wrong = 0;
+    for (int round = 0; round < 4; round++) {
+        ID3D11Texture2D *old, *fresh; ID3D11DepthStencilView *odsv, *dsv;
+        CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &dd, NULL, &old)));
+        CHECK(SUCCEEDED(ID3D11Device_CreateDepthStencilView(dev, (ID3D11Resource *)old, NULL, &odsv)));
+        ID3D11DeviceContext_ClearDepthStencilView(ctx, odsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 255);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, odsv);
+        color_vertex none[3] = { { -1, 1, 0.5f, 0, 0, 0, 1 }, { -1, 1, 0.5f, 0, 0, 0, 1 }, { -1, 1, 0.5f, 0, 0, 0, 1 } };
+        draw_colored(none, 3);                                                // (makes the clear happen)
+        readback(t, px, 4);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+        ID3D11DepthStencilView_Release(odsv); ID3D11Texture2D_Release(old);
+        CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &dd, NULL, &fresh)));
+        CHECK(SUCCEEDED(ID3D11Device_CreateDepthStencilView(dev, (ID3D11Resource *)fresh, NULL, &dsv)));
+        D3D11_DEPTH_STENCIL_DESC sd = { 0 };
+        sd.DepthEnable = FALSE; sd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; sd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        sd.StencilEnable = TRUE; sd.StencilReadMask = 0xff; sd.StencilWriteMask = 0xff;
+        sd.FrontFace.StencilFailOp = sd.FrontFace.StencilDepthFailOp = sd.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+        sd.FrontFace.StencilFunc = D3D11_COMPARISON_NOT_EQUAL; sd.BackFace = sd.FrontFace;
+        ID3D11DepthStencilState *ds;
+        CHECK(SUCCEEDED(ID3D11Device_CreateDepthStencilState(dev, &sd, &ds)));
+        float black[4] = { 0, 0, 0, 1 };
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, black);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, dsv);
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, ds, 255);
+        color_vertex red[3] = { { -1, 1, 0.5f, 1, 0, 0, 1 }, { 3, 1, 0.5f, 1, 0, 0, 1 }, { -1, -3, 0.5f, 1, 0, 0, 1 } };
+        draw_colored(red, 3);                                                 // passes where stencil != 255: everywhere
+        readback(t, px, 4);
+        for (int i = 0; i < 64 * 64; i++) wrong += px[i] != 0xff0000ffu;
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, NULL, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+        ID3D11DepthStencilState_Release(ds); ID3D11DepthStencilView_Release(dsv); ID3D11Texture2D_Release(fresh);
+    }
+    CHECK(wrong == 0);
+    printf("  fresh stencil: a new depth-stencil texture reads stencil 0 (NOT_EQUAL 255 passes), %d wrong pixels of 4 x 4096\n", wrong);
     ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
 }
 
@@ -409,6 +497,65 @@ static void test_stream_output(void) {
     if (gs) ID3D11GeometryShader_Release(gs);
 }
 
+// Direct3D reads 0 from everything nothing is bound to: shader resource views of every dimension, constant buffers,
+// and the part of a constant buffer beyond a bound one that is smaller than the shader declares (b1: 300 float4s
+// declared, 2 bound). Metal leaves all of those undefined, so memory is dirtied first.
+static void test_unbound(void) {
+    enum { N = 9 };
+    ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(N, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, &rtv);
+    ID3D11VertexShader *vs; ID3D11PixelShader *ps; ID3D11SamplerState *smp;
+    CHECK(SUCCEEDED(ID3D11Device_CreateVertexShader(dev, fullscreen_vs, sizeof fullscreen_vs, NULL, &vs)));
+    CHECK(SUCCEEDED(ID3D11Device_CreatePixelShader(dev, unbound_ps, sizeof unbound_ps, NULL, &ps)));
+    D3D11_SAMPLER_DESC sd = { D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0, 1, D3D11_COMPARISON_NEVER, { 0 }, 0, D3D11_FLOAT32_MAX };
+    CHECK(SUCCEEDED(ID3D11Device_CreateSamplerState(dev, &sd, &smp)));
+    // The small buffer is dynamic (the runtime hands those out of shared chunks), with dynamic buffers full of 1.0f
+    // mapped after it: what follows it in memory is not zero.
+    float small[8] = { 7, 7, 7, 7, 0, 0, 0, 0 };            // 2 float4s; b[0] = 7
+    D3D11_BUFFER_DESC dyn = { sizeof small, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+    ID3D11Buffer *cb = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateBuffer(dev, &dyn, NULL, &cb)));
+    D3D11_MAPPED_SUBRESOURCE m;
+    CHECK(SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)));
+    memcpy(m.pData, small, sizeof small);
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)cb, 0);
+    static float dirt[2048];
+    for (int i = 0; i < 2048; i++) dirt[i] = 1.0f;
+    D3D11_BUFFER_DESC dd = { sizeof dirt, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+    for (int i = 0; i < 8; i++) {
+        ID3D11Buffer *d = NULL;
+        ID3D11Device_CreateBuffer(dev, &dd, NULL, &d);
+        for (int k = 0; k < 4; k++) {
+            if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)d, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { memcpy(m.pData, dirt, sizeof dirt); ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)d, 0); }
+        }
+        ID3D11Buffer_Release(d);
+    }
+    float clear[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, clear);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    ID3D11Buffer *none = NULL;
+    ID3D11ShaderResourceView *no_srv[8] = { 0 };
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 8, no_srv);   // (earlier tests left theirs bound)
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &none);
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 1, 1, &cb);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &smp);
+    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    static float px[N * 4];
+    readback(t, px, 16);
+    for (int i = 0; i < N; i++) {
+        float want = i == 2 ? 7.0f : 0.0f;                  // (b[0] + b[1] + b[150])
+        int ok = px[i * 4] == want && px[i * 4 + 1] == want && px[i * 4 + 2] == want && px[i * 4 + 3] == want;
+        if (!ok) printf("  unbound case %d: %g %g %g %g (want %g)\n", i, px[i * 4], px[i * 4 + 1], px[i * 4 + 2], px[i * 4 + 3], want);
+        CHECK(ok);
+    }
+    ID3D11Buffer_Release(cb); ID3D11SamplerState_Release(smp);
+    ID3D11VertexShader_Release(vs); ID3D11PixelShader_Release(ps);
+    ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
+}
+
 int main(int argc, char **argv) {
     D3D_FEATURE_LEVEL level;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) { printf("draw: no device -> FAILED\n"); return 1; }
@@ -417,10 +564,13 @@ int main(int argc, char **argv) {
     test_triangle();
     test_textured();
     test_math();
+    test_ieee_math();
     test_depth_and_blend();
+    test_fresh_stencil();
     test_generate_mips();
     test_geometry_shader();
     test_stream_output();
-    printf("draw: triangle, textured quad, shader math, depth, blending, per-draw constants, mips, geometry shader, stream output: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    test_unbound();
+    printf("draw: triangle, textured quad, shader math, IEEE math, depth, blending, fresh stencil, per-draw constants, mips, geometry shader, stream output, unbound resources: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }
