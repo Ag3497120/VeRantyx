@@ -1617,6 +1617,84 @@ static d3d_view *readable_srv(d3d_context *c, d3d_shader *sh, int slot, d3d_view
     if (logged < 20) { logged++; vx_log("Direct3D: shader %08x reads t%d, which is bound as a render target: it reads 0, as in Direct3D", sh->hash, slot); }
     return NULL;
 }
+
+// What a slot nothing is bound to reads: 0, for every dimension (sample, load, gather), and for a constant buffer
+// 0 in all of its range. Metal leaves a nil texture or buffer undefined, so each device has one tiny zeroed texture
+// per type the shaders declare (dxbc.c's DIM_*, return type, depth compare) and one zeroed buffer, made on first use.
+// (resinfo reads the stand-in's 1x1, where Direct3D says 0: the shader would need the view's existence.)
+#define ZERO_CB_BYTES 65536                                     // 4096 float4s: the most a constant buffer can declare
+typedef struct { void *dev, *tex[11][3][2], *buf; } zero_set;
+static zero_set g_zero[4];
+static zero_set *zero_for(id<MTLDevice> dev) {
+    for (int i = 0; i < 4; i++) {
+        if (g_zero[i].dev == (__bridge void *)dev) return &g_zero[i];
+        if (!g_zero[i].dev) {
+            g_zero[i].dev = (__bridge void *)dev;
+            id<MTLBuffer> b = [dev newBufferWithLength:ZERO_CB_BYTES options:MTLResourceStorageModeShared];
+            memset(b.contents, 0, ZERO_CB_BYTES);
+            g_zero[i].buf = (void *)CFBridgingRetain(b);
+            return &g_zero[i];
+        }
+    }
+    return NULL;
+}
+static id<MTLBuffer> zero_buffer(d3d_context *c) {
+    zero_set *z = zero_for((__bridge id<MTLDevice>)c->base.dev->mtl);
+    return z ? (__bridge id<MTLBuffer>)z->buf : nil;
+}
+static id<MTLTexture> zero_texture(d3d_context *c, unsigned dim, unsigned ret, unsigned cmp) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)c->base.dev->mtl;
+    zero_set *z = zero_for(dev);
+    if (!z || dim < 1 || dim > 10) return nil;
+    unsigned r = ret == 3 ? 1 : ret == 4 ? 2 : 0;
+    cmp = cmp ? 1 : 0;
+    if (dim == 1 || dim == 2 || dim == 7 || dim == 5) cmp = 0;                 // (no depth buffers, 1D or 3D textures)
+    if (z->tex[dim][r][cmp]) return (__bridge id<MTLTexture>)z->tex[dim][r][cmp];
+    MTLPixelFormat f = cmp ? MTLPixelFormatDepth32Float : r == 1 ? MTLPixelFormatRGBA32Sint : r == 2 ? MTLPixelFormatRGBA32Uint : MTLPixelFormatRGBA8Unorm;
+    MTLTextureDescriptor *td = [[MTLTextureDescriptor alloc] init];
+    td.pixelFormat = f; td.width = 1; td.height = 1; td.depth = 1; td.mipmapLevelCount = 1;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    NSUInteger slices = 1;
+    int ms = 0;
+    switch (dim) {
+    case 1: break;
+    case 2: td.textureType = MTLTextureType1D; break;
+    case 3: td.textureType = MTLTextureType2D; break;
+    case 4: td.textureType = MTLTextureType2DMultisample; td.sampleCount = 4; ms = 1; break;
+    case 5: td.textureType = MTLTextureType3D; break;
+    case 6: td.textureType = MTLTextureTypeCube; slices = 6; break;
+    case 7: td.textureType = MTLTextureType1DArray; td.arrayLength = 1; break;
+    case 8: td.textureType = MTLTextureType2DArray; td.arrayLength = 1; break;
+    case 9: td.textureType = MTLTextureType2DMultisampleArray; td.sampleCount = 4; td.arrayLength = 1; ms = 1; break;
+    default: td.textureType = MTLTextureTypeCubeArray; td.arrayLength = 1; slices = 6; break;
+    }
+    id<MTLTexture> t = nil;
+    if (dim == 1) {                                             // a typed buffer: a texture over the zero buffer
+        td = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:f == MTLPixelFormatRGBA8Unorm ? MTLPixelFormatRGBA32Float : f width:1
+                                                           resourceOptions:MTLResourceStorageModeShared usage:MTLTextureUsageShaderRead];
+        t = [(__bridge id<MTLBuffer>)z->buf newTextureWithDescriptor:td offset:0 bytesPerRow:ZERO_CB_BYTES];
+    } else if (ms || cmp) {                                     // cleared by a pass (multisampled and depth textures have no replaceRegion)
+        td.storageMode = MTLStorageModePrivate;
+        t = [dev newTextureWithDescriptor:td];
+        id<MTLCommandBuffer> cb = [[(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) commandQueue] commandBuffer];
+        for (NSUInteger sl = 0; t && sl < slices; sl++) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            if (cmp) { rp.depthAttachment.texture = t; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 0; rp.depthAttachment.slice = sl; }
+            else { rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); rp.colorAttachments[0].slice = sl; }
+            [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+        }
+        [cb commit]; [cb waitUntilCompleted];
+    } else {
+        td.storageMode = MTLStorageModeShared;
+        t = [dev newTextureWithDescriptor:td];
+        static const uint8_t zeros[16] = { 0 };
+        for (NSUInteger sl = 0; t && sl < slices; sl++)
+            [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:sl withBytes:zeros bytesPerRow:16 bytesPerImage:16];
+    }
+    if (!t) { vx_log("Direct3D: no zero stand-in for texture dimension %u (return %u, compare %u): an unbound slot reads undefined", dim, ret, cmp); return nil; }
+    z->tex[dim][r][cmp] = (void *)CFBridgingRetain(t);
+    return t;
+}
 static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCommandEncoder> renc, id<MTLComputeCommandEncoder> cenc) {
     d3d_shader *sh = s->shader[st];
     if (!sh) return;
@@ -1634,22 +1712,34 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
         // 37): Direct3D reads 0 beyond it, Metal the constants of other draws after it in the same chunk, which
         // change every frame. Such a one goes as a copy of the declared size, the rest 0 (setBytes: up to 4 KB).
         uint32_t want = sh->info.cb_size[i];
-        if (cb && bound < want && want * 16 <= 4096 && ((__bridge id<MTLBuffer>)cb->mtl).storageMode == MTLStorageModeShared) {
-            uint8_t padded[4096] = { 0 };
-            memcpy(padded, (const uint8_t *)((__bridge id<MTLBuffer>)cb->mtl).contents + cb->off + s->cb_offset[st][i], (size_t)bound * 16);
-            if (cenc) [cenc setBytes:padded length:want * 16 atIndex:i];
-            else {
-                if (st == STAGE_VS) [renc setVertexBytes:padded length:want * 16 atIndex:i];
-                else [renc setFragmentBytes:padded length:want * 16 atIndex:i];
-                s->bound.buf[st][i] = (void *)-1;                // (no longer a buffer of ours)
-            }
+        if (cb && bound < want && ((__bridge id<MTLBuffer>)cb->mtl).storageMode == MTLStorageModeShared) {
+            // Up to 4 KB the copy goes by setBytes; a larger declaration gets a temporary buffer (zeroed beyond the
+            // copied part; this only happens for a buffer smaller than its declaration, which is rare and cheap
+            // next to a draw). Nothing else is correct: Metal would read other draws' constants after the buffer.
+            const uint8_t *src = (const uint8_t *)((__bridge id<MTLBuffer>)cb->mtl).contents + cb->off + s->cb_offset[st][i];
+            uint8_t small_copy[4096] = { 0 };
+            id<MTLBuffer> big = nil;
+            uint8_t *dst = small_copy;
+            if (want * 16 > 4096) { big = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:(NSUInteger)want * 16 options:MTLResourceStorageModeShared]; dst = big.contents; memset(dst, 0, (size_t)want * 16); }
+            memcpy(dst, src, (size_t)bound * 16);
+            if (big) { if (cenc) [cenc setBuffer:big offset:0 atIndex:i]; else if (st == STAGE_VS) [renc setVertexBuffer:big offset:0 atIndex:i]; else [renc setFragmentBuffer:big offset:0 atIndex:i]; }
+            else if (cenc) [cenc setBytes:small_copy length:want * 16 atIndex:i];
+            else if (st == STAGE_VS) [renc setVertexBytes:small_copy length:want * 16 atIndex:i];
+            else [renc setFragmentBytes:small_copy length:want * 16 atIndex:i];
+            if (!cenc) s->bound.buf[st][i] = (void *)-1;        // (no longer a buffer of ours)
             continue;
         }
-        SET_BUFFER(cb ? (__bridge id<MTLBuffer>)cb->mtl : nil, cb ? cb->off + s->cb_offset[st][i] : 0, i);
+        if (!cb || bound == 0) {                                // nothing bound: 0 everywhere, as in Direct3D
+            SET_BUFFER(zero_buffer(c), 0, i);
+            continue;
+        }
+        SET_BUFFER((__bridge id<MTLBuffer>)cb->mtl, cb->off + s->cb_offset[st][i], i);
     }
     for (int i = 0; i < 64; i++) {                              // texture SRVs t0..t63 (the shader may declare up to t127)
         if (!(sh->info.textures[0] & (1ull << i))) continue;
-        SET_TEXTURE(shader_texture(readable_srv(c, sh, i, s->srv[st][i])), i);
+        id<MTLTexture> tex = shader_texture(readable_srv(c, sh, i, s->srv[st][i]));
+        if (!tex) tex = zero_texture(c, sh->info.tex_dim[i], sh->info.tex_ret[i], sh->info.tex_cmp[i]);   // (reads 0, as Direct3D)
+        SET_TEXTURE(tex, i);
     }
     for (int i = 0; i < 16; i++) {
         if (!(sh->info.samplers & (1u << i))) continue;
@@ -1659,7 +1749,7 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
         if (!(sh->info.srv_buffers & (1ull << i))) continue;
         uint32_t rank = sh->info.srv_rank[i] ? sh->info.srv_rank[i] - 1u : (uint32_t)i;
         d3d_view *v = s->srv[st][i];
-        if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(nil, 0, DXBC_SRV_BUFFER_BASE + rank); continue; }
+        if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(zero_buffer(c), 0, DXBC_SRV_BUFFER_BASE + rank); continue; }
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)((d3d_buffer *)v->resource)->mtl;
         uint32_t stride = sh->info.srv_stride[i] ? sh->info.srv_stride[i] : 4;
         NSUInteger off = (NSUInteger)v->first * stride;

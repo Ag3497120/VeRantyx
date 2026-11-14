@@ -1257,6 +1257,7 @@ static int first_comp(uint8_t mask) { for (int c = 0; c < 4; c++) if (mask & (1 
 static void resource_params(gen *g, text *t) {
     dxbc_shader *sh = g->sh;
     if (sh->d3d12) { put(t, ", constant VxRoot &vx_root [[buffer(0)]]"); return; }
+    memcpy(sh->tex_dim, g->tex_dim, 128); memcpy(sh->tex_ret, g->tex_ret, 128); memcpy(sh->tex_cmp, g->tex_cmp, 128);   // (for the host's zero stand-ins)
     for (int i = 0; i < 16; i++) if (sh->cbuffers & (1u << i)) put(t, ", constant float4 *cb%d [[buffer(%d)]]", i, i);
     for (int i = 0; i < 128; i++) {
         if (!(sh->textures[i / 64] & (1ull << (i % 64)))) continue;
