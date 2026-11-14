@@ -55,4 +55,5 @@ int xa_owns(uint64_t pc);                          // host pc in a module's code
 uint64_t xa_rip_sp_at(uint64_t pc, int64_t *sp);   // the x86 instruction there (0: none), RSP's offset from x4
 int xa_fix_split(void *uc);                        // an ordered access across 16 bytes in a module's code: done here
 void xa_report(void);
+void xa_mxcsr_flush(x86_ctx *c);                   // FPSR's flags into c->mxcsr (they stay in FPSR between a module's entries)
 #endif

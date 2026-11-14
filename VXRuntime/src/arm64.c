@@ -137,6 +137,7 @@ static void write_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v));
 
 // The program's code stopped at an exception the engine found (ctx->fault, RIP at the instruction).
 static void __attribute__((noreturn)) engine_fault(x86_ctx *c, int r) {
+    xa_mxcsr_flush(c);                                                    // (the CONTEXT built from c has MXCSR's flags)
     if (r < 0) {
         const uint8_t *p = (const uint8_t *)(uintptr_t)c->rip;
         vx_log("arm64: an instruction the translator does not know at %#llx: %02x %02x %02x %02x %02x %02x", (unsigned long long)c->rip, p[0], p[1], p[2], p[3], p[4], p[5]);
@@ -163,6 +164,7 @@ static void __attribute__((noreturn)) engine_fault(x86_ctx *c, int r) {
 
 uint64_t vx_x86_call(uint64_t fn, int n, const uint64_t *args) {
     x86_ctx *c = vx_x86_ctx();
+    xa_mxcsr_flush(c);                                        // (the interrupted code's flags go with it: the callee's LDMXCSR clears FPSR)
     x86_ctx saved = *c;                                       // (the x86 code this call interrupts, if any)
     int nstack = n > 4 ? n - 4 : 0;
     nstack += nstack & 1;
@@ -222,6 +224,7 @@ void vx_longjmp(void *buf, int v) { (void)buf; (void)v; abort(); }
 static void th_setjmp(x86_ctx *c) {
     uint8_t *b = (uint8_t *)(uintptr_t)c->gpr[1];
     uint64_t rsp = c->gpr[4];
+    xa_mxcsr_flush(c);
     *(uint64_t *)(b + 0x00) = c->gpr[2];
     *(uint64_t *)(b + 0x08) = c->gpr[3];
     *(uint64_t *)(b + 0x10) = rsp + 8;
