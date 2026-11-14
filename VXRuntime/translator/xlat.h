@@ -42,10 +42,13 @@ typedef struct x86_ctx_s {
     uint64_t batch_base, batch_ptr, batch_end;   // vcpu.c: calls recorded in the guest, run at its next exit
     uint64_t pend_a, pend_b, pend_r;   // flags not computed yet (x27 bit 3, TRANSLATOR.md "Rules"): the operands and the
     uint64_t pend_info;                //   result of the instruction that set them, its kind * 4 + log2(size)
+    uint64_t fpcr_always;              // aot.c sets it from VXRT_AOT_FPCR_ALWAYS: a module's enter/exit stubs write FPCR and
+                                       //   save/clear FPSR on every crossing (0: only when FPCR differs; FPSR flags stay lazy)
 } x86_ctx;
 enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176,
        CTX_XMM = 192, CTX_YMMH = 448, CTX_MXCSR = 704, CTX_FCW = 712,
-       CTX_LINK = 848, CTX_ENTRY = 856, CTX_FAULT_INFO = 864, CTX_RAS = 872, CTX_JUMP = 880, CTX_STALE = 888, CTX_SINGLE = 896, CTX_PEND = 928 };
+       CTX_LINK = 848, CTX_ENTRY = 856, CTX_FAULT_INFO = 864, CTX_RAS = 872, CTX_JUMP = 880, CTX_STALE = 888, CTX_SINGLE = 896, CTX_PEND = 928, CTX_FPCR_ALWAYS = 960 };
+_Static_assert(__builtin_offsetof(x86_ctx, fpcr_always) == CTX_FPCR_ALWAYS, "CTX_FPCR_ALWAYS");
 _Static_assert(__builtin_offsetof(x86_ctx, pend_a) == CTX_PEND, "CTX_PEND");
 // Flags pending (x27 bit 3, reserved in EFLAGS): the six arithmetic flags in EFLAGS form, from the record (any other x27
 // bits as they are).
@@ -132,6 +135,9 @@ void xlat_block_native_defer(xlat_buf *b, void (*fn)(x86_ctx *), uint64_t desc, 
 // RIP) stores the state and leaves with HVC #1.
 void xlat_guest_enter(xlat_buf *b);
 extern const uint8_t *xlat_guest_parity;
+// Engine blocks (not a module's stubs) leave FPSR's flags alone on entry instead of clearing them when modules that keep
+// them lazily are loaded (aot.c): the flags then reach ctx->mxcsr at the next STMXCSR / FXSAVE or xa_mxcsr_flush.
+extern int xlat_fpsr_lazy;
 void xlat_guest_exit(xlat_buf *b);
 enum { XV_HVC_EXIT = 1, XV_HVC_HELPER, XV_HVC_NATIVE, XV_HVC_TLBI, XV_HVC_VECTOR = 0x10 };
 // Helpers translated code calls for rare or intricate instructions (one-operand MUL/IMUL/DIV/IDIV, RCL/RCR).

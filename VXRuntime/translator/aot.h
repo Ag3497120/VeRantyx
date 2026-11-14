@@ -7,7 +7,9 @@
 #include "xlat.h"
 #include "engine.h"
 
-enum { XA_MAGIC = 0x52435856u /* "VXCR" */, XA_VERSION = 2 };
+// Version 3: the enter/exit stubs write FPCR only when it differs and keep FPSR's flags lazily (RECOMP.md "FPCR"); they
+// read ctx->fpcr_always, which a version-2 runtime does not have. Version 2 (the stubs before) still loads.
+enum { XA_MAGIC = 0x52435856u /* "VXCR" */, XA_VERSION = 3, XA_VERSION_EAGER_FPSR = 2 };
 enum { XA_ORDERED = 1, XA_AFP = 2, XA_ROUTE_A = 4 };
 typedef struct { uint64_t rip; int64_t off; } xa_block;               // a block's x86 address and its code (from code)
 typedef struct { uint32_t off; int32_t sp; uint64_t rip; } xa_imap;   // host code offset -> x86 instruction (rip 0: none)
@@ -55,4 +57,5 @@ int xa_owns(uint64_t pc);                          // host pc in a module's code
 uint64_t xa_rip_sp_at(uint64_t pc, int64_t *sp);   // the x86 instruction there (0: none), RSP's offset from x4
 int xa_fix_split(void *uc);                        // an ordered access across 16 bytes in a module's code: done here
 void xa_report(void);
+void xa_mxcsr_flush(x86_ctx *c);                   // FPSR's flags into c->mxcsr (they stay in FPSR between a module's entries)
 #endif
