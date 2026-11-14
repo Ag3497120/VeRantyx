@@ -290,6 +290,51 @@ static void test_depth_and_blend(void) {
     ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
 }
 
+// A depth-stencil texture made without initial data starts as zeros, as on Windows (new video memory is zeroed).
+// A full-screen pass gated by stencil NOT_EQUAL 255 on such a texture, never cleared, must pass everywhere. First a
+// texture is filled with stencil 255 and released, so that its memory is likely to come back for the next one.
+static void test_fresh_stencil(void) {
+    ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, &rtv);
+    D3D11_TEXTURE2D_DESC dd = { 64, 64, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0 };
+    static UINT px[64 * 64];
+    int wrong = 0;
+    for (int round = 0; round < 4; round++) {
+        ID3D11Texture2D *old, *fresh; ID3D11DepthStencilView *odsv, *dsv;
+        CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &dd, NULL, &old)));
+        CHECK(SUCCEEDED(ID3D11Device_CreateDepthStencilView(dev, (ID3D11Resource *)old, NULL, &odsv)));
+        ID3D11DeviceContext_ClearDepthStencilView(ctx, odsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 255);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, odsv);
+        color_vertex none[3] = { { -1, 1, 0.5f, 0, 0, 0, 1 }, { -1, 1, 0.5f, 0, 0, 0, 1 }, { -1, 1, 0.5f, 0, 0, 0, 1 } };
+        draw_colored(none, 3);                                                // (makes the clear happen)
+        readback(t, px, 4);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+        ID3D11DepthStencilView_Release(odsv); ID3D11Texture2D_Release(old);
+        CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &dd, NULL, &fresh)));
+        CHECK(SUCCEEDED(ID3D11Device_CreateDepthStencilView(dev, (ID3D11Resource *)fresh, NULL, &dsv)));
+        D3D11_DEPTH_STENCIL_DESC sd = { 0 };
+        sd.DepthEnable = FALSE; sd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; sd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        sd.StencilEnable = TRUE; sd.StencilReadMask = 0xff; sd.StencilWriteMask = 0xff;
+        sd.FrontFace.StencilFailOp = sd.FrontFace.StencilDepthFailOp = sd.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+        sd.FrontFace.StencilFunc = D3D11_COMPARISON_NOT_EQUAL; sd.BackFace = sd.FrontFace;
+        ID3D11DepthStencilState *ds;
+        CHECK(SUCCEEDED(ID3D11Device_CreateDepthStencilState(dev, &sd, &ds)));
+        float black[4] = { 0, 0, 0, 1 };
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, black);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, dsv);
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, ds, 255);
+        color_vertex red[3] = { { -1, 1, 0.5f, 1, 0, 0, 1 }, { 3, 1, 0.5f, 1, 0, 0, 1 }, { -1, -3, 0.5f, 1, 0, 0, 1 } };
+        draw_colored(red, 3);                                                 // passes where stencil != 255: everywhere
+        readback(t, px, 4);
+        for (int i = 0; i < 64 * 64; i++) wrong += px[i] != 0xff0000ffu;
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, NULL, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+        ID3D11DepthStencilState_Release(ds); ID3D11DepthStencilView_Release(dsv); ID3D11Texture2D_Release(fresh);
+    }
+    CHECK(wrong == 0);
+    printf("  fresh stencil: a new depth-stencil texture reads stencil 0 (NOT_EQUAL 255 passes), %d wrong pixels of 4 x 4096\n", wrong);
+    ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
+}
+
 static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) { if (m == WM_DESTROY) PostQuitMessage(0); return DefWindowProcA(h, m, w, l); }
 static void interactive(void) {
     WNDCLASSA wc = { 0, proc, 0, 0, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "VXDraw" };
@@ -461,9 +506,10 @@ int main(int argc, char **argv) {
     test_math();
     test_ieee_math();
     test_depth_and_blend();
+    test_fresh_stencil();
     test_generate_mips();
     test_geometry_shader();
     test_stream_output();
-    printf("draw: triangle, textured quad, shader math, IEEE math, depth, blending, per-draw constants, mips, geometry shader, stream output: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    printf("draw: triangle, textured quad, shader math, IEEE math, depth, blending, fresh stencil, per-draw constants, mips, geometry shader, stream output: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }
