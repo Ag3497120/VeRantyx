@@ -206,6 +206,48 @@ static void test_math(void) {
     ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
 }
 
+// math_ps with its comparison `b.x < a.x` patched into `a.x != a.x` (the opcode lt -> ne, the first source's row 1 -> 0),
+// and a NaN in a.x. D3D is IEEE: NaN != NaN is true, max(NaN, y) is y, and dot() with a NaN is NaN. Metal's default fast
+// math may assume no NaN occurs and fold the self-comparison to false. (There is no fxc to build a new shader with here.)
+static void test_ieee_math(void) {
+    ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(4, 4, DXGI_FORMAT_R32G32B32A32_FLOAT, &rtv);
+    ID3D11VertexShader *vs; ID3D11PixelShader *ps;
+    unsigned char code[sizeof math_ps];
+    memcpy(code, math_ps, sizeof code);
+    unsigned lt_at = 0;
+    for (unsigned i = 0; i + 36 <= sizeof code; i += 4) {
+        unsigned w; memcpy(&w, code + i, 4);
+        if (w == 0x9000031 && code[i + 12] == 0x0a && code[i + 16] == 0 && code[i + 20] == 1) { lt_at = i; break; }
+    }
+    CHECK(lt_at != 0);
+    if (!lt_at) return;
+    code[lt_at] = 0x39;                                    // ne
+    code[lt_at + 20] = 0;                                  // cb0[0].x != cb0[0].x
+    CHECK(SUCCEEDED(ID3D11Device_CreateVertexShader(dev, fullscreen_vs, sizeof fullscreen_vs, NULL, &vs)));
+    CHECK(SUCCEEDED(ID3D11Device_CreatePixelShader(dev, code, sizeof code, NULL, &ps)));
+    volatile float zero = 0.0f;
+    float nan = zero / zero;
+    struct { float a[4], b[4]; int n[4]; } in = { { nan, -2, 3, 4 }, { 0.5f, 3, 2.25f, 9 }, { 5, 3, 2, 7 } };
+    ID3D11Buffer *cb = buffer(D3D11_BIND_CONSTANT_BUFFER, &in, sizeof in);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &cb);
+    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    float px[16 * 4];
+    readback(t, px, 16);
+    float *o = &px[(1 * 4 + 1) * 4];
+    printf("  IEEE math: (%g, %g, %g, %g), expected (nan, 3.5, 4.75, 388)\n", o[0], o[1], o[2], o[3]);
+    CHECK(isnan(o[0]));                                    // dot with a NaN
+    CHECK(o[1] == 3.5f);
+    CHECK(o[2] == 4.75f);                                  // max(NaN, 3) - min(3, 0.5) + frac(2.25) + abs(2)
+    CHECK(o[3] == 388.0f);                                 // NaN != NaN took the 100 arm (fast math: 488)
+    ID3D11Buffer_Release(cb); ID3D11VertexShader_Release(vs); ID3D11PixelShader_Release(ps);
+    ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
+}
+
 static void test_depth_and_blend(void) {
     ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(32, 32, DXGI_FORMAT_R8G8B8A8_UNORM, &rtv);
     D3D11_TEXTURE2D_DESC dd = { 32, 32, 1, 1, DXGI_FORMAT_D32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL, 0, 0 };
@@ -417,10 +459,11 @@ int main(int argc, char **argv) {
     test_triangle();
     test_textured();
     test_math();
+    test_ieee_math();
     test_depth_and_blend();
     test_generate_mips();
     test_geometry_shader();
     test_stream_output();
-    printf("draw: triangle, textured quad, shader math, depth, blending, per-draw constants, mips, geometry shader, stream output: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    printf("draw: triangle, textured quad, shader math, IEEE math, depth, blending, per-draw constants, mips, geometry shader, stream output: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }
