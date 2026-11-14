@@ -912,9 +912,10 @@ static void clear_later(d3d_context *c, d3d_view *v, const float *color, int dep
     p->clear_depth = (uint8_t)(depth != 0); p->depth = depth_value;
     p->clear_stencil = (uint8_t)(stencil != 0); p->stencil = stencil_value;
 }
+static int clear_trace_draws(void) { static int on = -1; if (on < 0) on = getenv("VXRT_TRACE_DRAWS") != NULL; return on; }   // (not a getenv per clear)
 static WINAPI void ctx_clear_rtv(void *this, d3d_view *v, const float color[4]) {
     static int traced;
-    if (getenv("VXRT_TRACE_DRAWS") && v && v->resource->kind == K_TEXTURE && ((d3d_texture *)v->resource)->desc[TD_WIDTH] != 2048 && traced++ < 40)
+    if (clear_trace_draws() && v && v->resource->kind == K_TEXTURE && ((d3d_texture *)v->resource)->desc[TD_WIDTH] != 2048 && traced++ < 40)
         vx_log("ClearRenderTargetView %ux%u to (%g, %g, %g, %g)", ((d3d_texture *)v->resource)->desc[TD_WIDTH], ((d3d_texture *)v->resource)->desc[TD_HEIGHT], color[0], color[1], color[2], color[3]);
     if (v && v->resource->kind == K_TEXTURE) clear_later(this, v, color, 0, 0, 0, 0);
 }
