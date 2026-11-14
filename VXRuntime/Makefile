@@ -118,7 +118,7 @@ build/recomp/suite.exe: tests/recomp/suite.cpp tests/recomp/suite_d3d.c tests/re
 	clang --target=x86_64-w64-mingw32 -O2 -isystem $(shell $(MINGW) -print-sysroot)/x86_64-w64-mingw32/include -c tests/recomp/suite_d3d.c -o build/recomp/suite_d3d.o
 	clang -target x86_64-pc-windows-msvc -O1 -c tests/msvc/start.c -o build/recomp/start.obj
 	$(MINGW) -nostdlib -e mainCRTStartup -o $@ build/recomp/suite.obj build/recomp/suite_d3d.o build/recomp/start.obj -Lbuild/recomp -lvcruntime140 -lkernel32 -lucrtbase -ld3d11
-aot-suite: build/vxrt build/vxrt-arm64 build/vxrt-aot build/recomp/suite.exe
+aot-suite: build/vxrt build/vxrt-arm64 build/vxrt-aot build/recomp/suite.exe aot-fpcr-check
 	@mkdir -p build/aot
 	build/vxrt-aot gen build/recomp/suite.exe build/recomp/suite_b.s
 	clang -arch arm64 -dynamiclib -o build/aot/$$(build/vxrt-aot name build/recomp/suite.exe) build/recomp/suite_b.s
@@ -126,6 +126,15 @@ aot-suite: build/vxrt build/vxrt-arm64 build/vxrt-aot build/recomp/suite.exe
 	@# the same split into parts of 20 KB (a large image's dylibs, branching to each other through veneers)
 	VXRT_AOT_PART_MB=0.02 tools/aot_build.sh build/recomp/suite.exe build/aotp > /dev/null
 	AOT_DIR=build/aotp tools/aot_compare.sh build/recomp/suite.exe
+# A module's FPCR/FPSR handling at native calls (RECOMP.md "FPCR"): guest MXCSR modes and flags around an import, lazy and
+# with VXRT_AOT_FPCR_ALWAYS=1.
+build/recomp/aot_fpcr.exe: tests/aot_fpcr.c
+	@mkdir -p build/recomp
+	$(MINGW) -O1 -nostdlib -e mainCRTStartup -o $@ $< -lkernel32 -lucrtbase
+aot-fpcr-check: build/vxrt-arm64 build/vxrt-aot build/recomp/aot_fpcr.exe
+	tools/aot_build.sh build/recomp/aot_fpcr.exe build/aot-fpcr
+	python3 tests/aot_fpcr_check.py --runtime build/vxrt-arm64 --exe build/recomp/aot_fpcr.exe --aot-dir build/aot-fpcr
+.PHONY: aot-fpcr-check
 # Code that runs inside the vCPU guest (translator/guest.c): no calls, no globals, no stack protector.
 GUEST_CFLAGS = -arch arm64 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-stack-check -mmacosx-version-min=14.0 -Itranslator
 build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator/xvheap.h
