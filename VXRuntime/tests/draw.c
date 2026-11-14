@@ -14,6 +14,7 @@
 #include "shaders/fullscreen_vs.h"
 #include "shaders/math_ps.h"
 #include "shaders/quad_gs.h"
+#include "shaders/unbound_ps.h"
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 static ID3D11Device *dev;
@@ -496,6 +497,65 @@ static void test_stream_output(void) {
     if (gs) ID3D11GeometryShader_Release(gs);
 }
 
+// Direct3D reads 0 from everything nothing is bound to: shader resource views of every dimension, constant buffers,
+// and the part of a constant buffer beyond a bound one that is smaller than the shader declares (b1: 300 float4s
+// declared, 2 bound). Metal leaves all of those undefined, so memory is dirtied first.
+static void test_unbound(void) {
+    enum { N = 9 };
+    ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(N, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, &rtv);
+    ID3D11VertexShader *vs; ID3D11PixelShader *ps; ID3D11SamplerState *smp;
+    CHECK(SUCCEEDED(ID3D11Device_CreateVertexShader(dev, fullscreen_vs, sizeof fullscreen_vs, NULL, &vs)));
+    CHECK(SUCCEEDED(ID3D11Device_CreatePixelShader(dev, unbound_ps, sizeof unbound_ps, NULL, &ps)));
+    D3D11_SAMPLER_DESC sd = { D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0, 1, D3D11_COMPARISON_NEVER, { 0 }, 0, D3D11_FLOAT32_MAX };
+    CHECK(SUCCEEDED(ID3D11Device_CreateSamplerState(dev, &sd, &smp)));
+    // The small buffer is dynamic (the runtime hands those out of shared chunks), with dynamic buffers full of 1.0f
+    // mapped after it: what follows it in memory is not zero.
+    float small[8] = { 7, 7, 7, 7, 0, 0, 0, 0 };            // 2 float4s; b[0] = 7
+    D3D11_BUFFER_DESC dyn = { sizeof small, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+    ID3D11Buffer *cb = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateBuffer(dev, &dyn, NULL, &cb)));
+    D3D11_MAPPED_SUBRESOURCE m;
+    CHECK(SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)));
+    memcpy(m.pData, small, sizeof small);
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)cb, 0);
+    static float dirt[2048];
+    for (int i = 0; i < 2048; i++) dirt[i] = 1.0f;
+    D3D11_BUFFER_DESC dd = { sizeof dirt, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+    for (int i = 0; i < 8; i++) {
+        ID3D11Buffer *d = NULL;
+        ID3D11Device_CreateBuffer(dev, &dd, NULL, &d);
+        for (int k = 0; k < 4; k++) {
+            if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)d, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { memcpy(m.pData, dirt, sizeof dirt); ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)d, 0); }
+        }
+        ID3D11Buffer_Release(d);
+    }
+    float clear[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, clear);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    ID3D11Buffer *none = NULL;
+    ID3D11ShaderResourceView *no_srv[8] = { 0 };
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 8, no_srv);   // (earlier tests left theirs bound)
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &none);
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 1, 1, &cb);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &smp);
+    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    static float px[N * 4];
+    readback(t, px, 16);
+    for (int i = 0; i < N; i++) {
+        float want = i == 2 ? 7.0f : 0.0f;                  // (b[0] + b[1] + b[150])
+        int ok = px[i * 4] == want && px[i * 4 + 1] == want && px[i * 4 + 2] == want && px[i * 4 + 3] == want;
+        if (!ok) printf("  unbound case %d: %g %g %g %g (want %g)\n", i, px[i * 4], px[i * 4 + 1], px[i * 4 + 2], px[i * 4 + 3], want);
+        CHECK(ok);
+    }
+    ID3D11Buffer_Release(cb); ID3D11SamplerState_Release(smp);
+    ID3D11VertexShader_Release(vs); ID3D11PixelShader_Release(ps);
+    ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
+}
+
 int main(int argc, char **argv) {
     D3D_FEATURE_LEVEL level;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) { printf("draw: no device -> FAILED\n"); return 1; }
@@ -510,6 +570,7 @@ int main(int argc, char **argv) {
     test_generate_mips();
     test_geometry_shader();
     test_stream_output();
-    printf("draw: triangle, textured quad, shader math, IEEE math, depth, blending, fresh stencil, per-draw constants, mips, geometry shader, stream output: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    test_unbound();
+    printf("draw: triangle, textured quad, shader math, IEEE math, depth, blending, fresh stencil, per-draw constants, mips, geometry shader, stream output, unbound resources: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }
