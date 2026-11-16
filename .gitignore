@@ -28,3 +28,8 @@ build/steamvr-d3d11-proxy/.build-*
 __pycache__/
 runs/
 VXRuntime/tests/shaders12/*.h
+
+# missing-functions-pr workflow scratch
+.vxrt-request/
+.vxrt-out/
+.vxrt-checked/

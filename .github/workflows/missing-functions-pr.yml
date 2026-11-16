@@ -1,0 +1,237 @@
+name: Missing functions -> draft PR
+
+# A player picks the game in VeRantyx for Mac and presses "Report missing functions": the app opens a
+# `missing-functions` issue with the game and the DLL!function names (nothing from the game itself). This workflow turns
+# that report into a draft pull request: Codex implements the functions in VXRuntime and adds tests, a checker with no
+# AI and no secrets rejects anything outside the allowed paths or anything that looks like Wine/LGPL code, and the full
+# CI runs on the branch. A maintainer reviews and the reporter tries the build before anything is merged.
+#
+# Repository settings (names only):
+#   secret   OPENAI_API_KEY           without it, nothing runs past "parse"
+#   variable VXRT_AUTO_PR             "off" stops it; "label" waits for a maintainer to add the `auto-pr` label;
+#                                     anything else (default) starts on every new report
+#   variable VXRT_AUTO_PR_DAILY       most runs per day (default 5)
+#
+# Trust boundaries: only `parse` reads the issue, and it passes on a filtered game name, the app id and names matching
+# DLL!function. Codex has the API key but no GitHub write token. `verify` has no secrets. Only `open-pr` can write.
+
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number of a missing-functions report
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: missing-pr-${{ github.event.issue.number || inputs.issue }}
+  cancel-in-progress: false
+
+jobs:
+  parse:
+    if: >-
+      vars.VXRT_AUTO_PR != 'off' && (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event.action == 'opened' && vars.VXRT_AUTO_PR != 'label' &&
+          contains(github.event.issue.labels.*.name, 'missing-functions')) ||
+        (github.event.action == 'labeled' && github.event.label.name == 'auto-pr' &&
+          contains(github.event.issue.labels.*.name, 'missing-functions')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      actions: read
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+      issue: ${{ steps.gate.outputs.issue }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools
+      - name: Read the report and keep only game, app id and function names
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number || inputs.issue }}
+          DAILY: ${{ vars.VXRT_AUTO_PR_DAILY || '5' }}
+          HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          case "$ISSUE" in ''|*[!0-9]*) echo "not an issue number"; exit 1;; esac
+          echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_KEY" != "true" ]; then echo "OPENAI_API_KEY is not set: skipping"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          today=$(date -u +%Y-%m-%d)
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/missing-functions-pr.yml/runs?created=>=$today&per_page=100" --jq '[.workflow_runs[] | select(.conclusion != "skipped")] | length')
+          if [ "$runs" -gt "$DAILY" ]; then echo "daily limit ($DAILY) reached: skipping"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if gh api "repos/$GITHUB_REPOSITORY/pulls?head=${GITHUB_REPOSITORY_OWNER}:auto/missing-$ISSUE&state=open" --jq 'length' | grep -qv '^0$'; then
+            echo "a draft PR for this issue is already open"; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          mkdir -p .vxrt-request
+          gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE" > issue.json
+          python3 tools/vxrt_missing_pr.py parse issue.json .vxrt-request/request.json
+          echo "go=true" >> "$GITHUB_OUTPUT"
+      - if: steps.gate.outputs.go == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: request
+          path: .vxrt-request/request.json
+          include-hidden-files: true
+
+  implement:
+    needs: parse
+    if: needs.parse.outputs.go == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select Xcode 26, Rosetta 2 and MinGW (as in ci.yml)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          arch -x86_64 /usr/bin/true >/dev/null 2>&1 || sudo softwareupdate --install-rosetta --agree-to-license
+          brew install mingw-w64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: request
+          path: .vxrt-request
+      - name: Codex implements the functions (no GitHub write token, no web search)
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-version: '0.169.0'
+          prompt-file: .github/ai/missing-functions.md
+          output-file: .vxrt-out/result.md
+          permission-profile: ':workspace'
+          safety-strategy: drop-sudo
+          # Reports come from players without write access; what reaches Codex is limited by `parse`.
+          allow-users: '*'
+          codex-args: '["--config","web_search=\"disabled\""]'
+      - name: Keep the change as a patch
+        run: |
+          mkdir -p .vxrt-out
+          git diff -- VXRuntime > .vxrt-out/patch.diff
+          test -f .vxrt-out/result.md || echo "(Codex wrote no summary)" > .vxrt-out/result.md
+          wc -l .vxrt-out/patch.diff
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: change
+          path: .vxrt-out
+          include-hidden-files: true
+
+  verify:
+    needs: [parse, implement]
+    runs-on: macos-15
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      ok: ${{ steps.test.outputs.ok }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: change
+          path: .vxrt-out
+      - name: Allowed paths only, no Wine/LGPL text, a test included
+        run: |
+          set -o pipefail
+          python3 tools/vxrt_missing_pr.py check .vxrt-out/patch.diff | tee .vxrt-out/check.txt
+          git apply --check .vxrt-out/patch.diff && git apply .vxrt-out/patch.diff
+      - name: Select Xcode 26, Rosetta 2 and MinGW
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          arch -x86_64 /usr/bin/true >/dev/null 2>&1 || sudo softwareupdate --install-rosetta --agree-to-license
+          brew install mingw-w64
+      - name: Build and run the import test (the full suite runs on the PR afterwards)
+        id: test
+        run: |
+          set -o pipefail
+          make -C VXRuntime build/vxrt build/game_imports.exe 2>&1 | tail -20
+          cd VXRuntime
+          if VXRT_ROOT=build/root VXRT_NO_ACTIVATE=1 build/vxrt build/game_imports.exe 2>&1 | tee ../.vxrt-out/test.txt | tail -1 | grep -q ' ok$'; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+          { echo; echo '`build/vxrt build/game_imports.exe`:'; echo '```'; tail -3 ../.vxrt-out/test.txt; echo '```'; } >> ../.vxrt-out/check.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: checked
+          path: .vxrt-out/check.txt
+
+  open-pr:
+    needs: [parse, implement, verify]
+    if: needs.verify.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: change
+          path: .vxrt-out
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: checked
+          path: .vxrt-checked
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: request
+          path: .vxrt-request
+      - name: Branch, draft PR, full CI, note on the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ needs.parse.outputs.issue }}
+        run: |
+          set -euo pipefail
+          python3 tools/vxrt_missing_pr.py check .vxrt-out/patch.diff > /dev/null
+          branch="auto/missing-$ISSUE"
+          git switch -c "$branch"
+          git apply .vxrt-out/patch.diff
+          git add VXRuntime
+          game=$(python3 -c "import json;print(json.load(open('.vxrt-request/request.json'))['game'])")
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "VXRuntime: functions $game asked for (issue #$ISSUE, draft by Codex)"
+          git push -q origin "$branch"
+          python3 tools/vxrt_missing_pr.py body .vxrt-request/request.json .vxrt-out/result.md .vxrt-checked/check.txt > pr.md
+          url=$(gh pr create --draft --base "${{ github.event.repository.default_branch }}" --head "$branch" \
+            --title "[auto] $game: missing Windows functions (#$ISSUE)" --body-file pr.md)
+          # A push with GITHUB_TOKEN does not start pull_request workflows: start the full suite explicitly.
+          gh workflow run ci.yml --ref "$branch"
+          gh issue comment "$ISSUE" --body "A draft fix is ready for review: $url. It was written by an AI agent from the function names in this report and passed the import test; it has not been tried with the game. If you can, build that branch and tell us whether the game gets further."
+
+  report-failure:
+    needs: [parse, implement, verify]
+    if: always() && needs.parse.outputs.go == 'true' && needs.verify.outputs.ok != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Note on the issue that the automatic route did not finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ needs.parse.outputs.issue }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "The automatic attempt to add these functions did not pass its checks ($RUN). A maintainer will look at the report by hand."
