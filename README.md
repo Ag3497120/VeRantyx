@@ -1,5 +1,25 @@
 <h1 align="center">VeRantyx</h1>
 
+> [!NOTE]
+> **Archived on November 18, 2026. VeRantyx is no longer developed.**
+> Thank you to everyone who tried it, reported issues and sent pull requests.
+>
+> **Why:** VeRantyx is a one-person project, and most of the work was not writing code but testing every change
+> on a headset, game by game. That no longer fits the time I have. Only a small number of people have the right mix
+> of Mac, headset and games to use it, and that doesn't justify the amount of testing each change needs. The field
+> has also grown a lot since May, and there are now good projects for each part of what VeRantyx set out to do.
+>
+> **Where to go instead:**
+> - Windows Steam games on a Mac: [NotProton](https://github.com/NotProtonNot/NotProton), [Bridgeplay](https://github.com/raymondchins/Bridgeplay)
+> - Windows PC VR games from a Mac to Vision Pro: [MacVapoR](https://github.com/fayep/MacVapoR)
+> - Streaming from a PC to Vision Pro: Valve's Steam Link, [OpenVRLink](https://github.com/shinyquagsire23/OpenVRLink), [ALVR](https://github.com/alvr-org/ALVR)
+> - Cyberpunk 2077 standalone on Vision Pro: [VXpro](https://github.com/Ag3497120/VXpro) (my project, still open, updated now and then)
+>
+> The code, history and releases stay here under the MIT license. Releases are no longer updated and may stop
+> working after future macOS or SteamVR updates. Forks are welcome, and if you carry the work on, I'm happy to link
+> your fork here.
+
+
 <p align="center"><b>Half-Life: Alyx, Elite Dangerous and No Man's Sky on Apple Vision Pro, from just a Mac.<br>
 No gaming PC, no Wine, no CrossOver.</b><br>
 Windows PC VR games run on our own Windows runtime, written from scratch for Apple silicon, and stream to Vision Pro
