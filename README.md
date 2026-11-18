@@ -6,7 +6,9 @@
 >
 > **Why:** VeRantyx is a one-person project, and most of the work was not writing code but testing every change
 > on a headset, game by game. That no longer fits the time I have. Only a small number of people have the right mix
-> of Mac, headset and games to use it, and that doesn't justify the amount of testing each change needs. The field
+> of Mac, headset and games to use it, and that doesn't justify the amount of testing each change needs.
+> Early on, the NotProton developer told me this was reinventing the wheel. Looking back, they were right: projects
+> built on Wine, such as [NotProton](https://github.com/NotProtonNot/NotProton), reached far more games, much faster. The field
 > has also grown a lot since May, and there are now good projects for each part of what VeRantyx set out to do.
 >
 > **Where to go instead:**
