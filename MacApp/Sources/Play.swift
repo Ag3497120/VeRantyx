@@ -224,6 +224,12 @@ enum Quality: String, CaseIterable, Identifiable {
             process.arguments = [scripts.appendingPathComponent("launch_vxrt_nms_vr.sh").path]
             gameLog = Paths.logs.appendingPathComponent("vxrt-windows-steam.log")
             gameLogStart = (try? FileManager.default.attributesOfItem(atPath: gameLog.path)[.size] as? UInt64) ?? 0
+        } else if let exe, exe.lastPathComponent == "Cyberpunk2077" {
+            let logFile = Paths.logs.appendingPathComponent("macvr-cyberpunk2077.log")
+            env["VERANTYX_MACVR_LOG"] = logFile.path
+            env["VERANTYX_CP_RESOLUTION"] = quality == .sharp || quality == .k3 || quality == .k25 || quality == .max ? "1600x900" : "1280x720"
+            process.arguments = [scripts.appendingPathComponent("launch_mac_cyberpunk_vr.sh").path]
+            gameLog = logFile
         } else if let exe {
             process.arguments = [scripts.appendingPathComponent("launch_vxrt_game.sh").path, exe.path] + (known?.args ?? []) + (flat ? [] : known?.vrArgs ?? [])
             process.currentDirectoryURL = exe.deletingLastPathComponent()
