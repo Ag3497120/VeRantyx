@@ -53,6 +53,24 @@ static NSString *hash_data(NSData *data) {
 static NSString *hash_object(id object) {
     return hash_data([NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingSortedKeys error:nil]);
 }
+// Direct3D shaders are compiled with Metal's safe math, as d3d12.m and gpu_ir_metal.m do, so NaN, infinity and signed
+// zero follow D3D's IEEE rules (isnan, min/max with NaN, x/0); Metal's default fast math may assume they never occur.
+// VXRT_D3D11_FAST_MATH=1 restores the default. The math mode is part of every library's key, so switching it never
+// reuses a library made the other way.
+static BOOL fast_math(void) {
+    static BOOL fast;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("VXRT_D3D11_FAST_MATH"); fast = e && *e == '1'; });
+    return fast;
+}
+static void set_math(MTLCompileOptions *options) {
+    if (fast_math()) return;
+    if (@available(macOS 15.0, *)) options.mathMode = MTLMathModeSafe;
+    else options.fastMathEnabled = NO;
+}
+static NSString *library_key(NSString *source, NSArray<NSString *> *entries) {
+    return hash_object(@[source, entries, fast_math() ? @"fast-math" : @"safe-math"]);
+}
 
 // Bound disk use at startup. A dangling library index is just a miss; Metal's own cache is never touched.
 static void prune(NSString *root) {
@@ -106,6 +124,7 @@ static MTLCompileOptions *compile_options(VXShaderInfo *info) {
     // distinguishable when the archived IR is loaded as an MTLLibrary on the next launch.
     for (NSString *name in info.entries) macros[name] = symbol(info, name);
     options.preprocessorMacros = macros;
+    set_math(options);
     return options;
 }
 static NSString *index_path(VXShaderInfo *info) {
@@ -127,13 +146,13 @@ static id<MTLLibrary> load_library(id<MTLDevice> device, VXShaderInfo *info) {
 BOOL vx_shader_cache_known(id<MTLDevice> device, NSString *source, NSArray<NSString *> *entries) {
     NSString *root = entries.count ? cache_root(device) : nil;
     if (!root) return NO;
-    NSString *index = [root stringByAppendingPathComponent:[hash_object(@[source, entries]) stringByAppendingString:@".index"]];
+    NSString *index = [root stringByAppendingPathComponent:[library_key(source, entries) stringByAppendingString:@".index"]];
     return [NSFileManager.defaultManager fileExistsAtPath:index];
 }
 static VXShaderRequest *request(id<MTLDevice> device, NSString *source, NSArray<NSString *> *entries, BOOL *owner) {
     NSString *root = entries.count ? cache_root(device) : nil;
     if (!root) return nil;
-    NSString *key = hash_object(@[source, entries]);
+    NSString *key = library_key(source, entries);
     NSString *memory_key = [NSString stringWithFormat:@"%@/%@/%p", root, key, device];
     pthread_mutex_lock(&g_lock);
     VXShaderRequest *r = [g_libraries objectForKey:memory_key] ?: g_pending[memory_key];
@@ -160,7 +179,7 @@ static void complete(VXShaderRequest *r, id<MTLLibrary> lib, NSError *error) {
 id<MTLLibrary> vx_shader_cache_library(id<MTLDevice> device, NSString *source, NSArray<NSString *> *entries, NSError **error) {
     BOOL owner;
     VXShaderRequest *r = request(device, source, entries, &owner);
-    if (!r) { count(&g_source_compiles); return [device newLibraryWithSource:source options:nil error:error]; }
+    if (!r) { count(&g_source_compiles); MTLCompileOptions *plain = [MTLCompileOptions new]; set_math(plain); return [device newLibraryWithSource:source options:plain error:error]; }
     if (owner) {
         NSError *e = nil;
         id<MTLLibrary> lib = load_library(device, r.info);
@@ -175,7 +194,8 @@ void vx_shader_cache_library_async(id<MTLDevice> device, NSString *source, NSArr
     VXShaderRequest *r = request(device, source, entries, &owner);
     if (!r) {
         count(&g_source_compiles);
-        [device newLibraryWithSource:source options:nil completionHandler:done];
+        MTLCompileOptions *plain = [MTLCompileOptions new]; set_math(plain);
+        [device newLibraryWithSource:source options:plain completionHandler:done];
         return;
     }
     dispatch_group_notify(r.group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ done(r.library, r.error); });

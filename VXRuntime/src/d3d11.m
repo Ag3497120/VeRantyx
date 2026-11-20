@@ -912,9 +912,10 @@ static void clear_later(d3d_context *c, d3d_view *v, const float *color, int dep
     p->clear_depth = (uint8_t)(depth != 0); p->depth = depth_value;
     p->clear_stencil = (uint8_t)(stencil != 0); p->stencil = stencil_value;
 }
+static int clear_trace_draws(void) { static int on = -1; if (on < 0) on = getenv("VXRT_TRACE_DRAWS") != NULL; return on; }   // (not a getenv per clear)
 static WINAPI void ctx_clear_rtv(void *this, d3d_view *v, const float color[4]) {
     static int traced;
-    if (getenv("VXRT_TRACE_DRAWS") && v && v->resource->kind == K_TEXTURE && ((d3d_texture *)v->resource)->desc[TD_WIDTH] != 2048 && traced++ < 40)
+    if (clear_trace_draws() && v && v->resource->kind == K_TEXTURE && ((d3d_texture *)v->resource)->desc[TD_WIDTH] != 2048 && traced++ < 40)
         vx_log("ClearRenderTargetView %ux%u to (%g, %g, %g, %g)", ((d3d_texture *)v->resource)->desc[TD_WIDTH], ((d3d_texture *)v->resource)->desc[TD_HEIGHT], color[0], color[1], color[2], color[3]);
     if (v && v->resource->kind == K_TEXTURE) clear_later(this, v, color, 0, 0, 0, 0);
 }
@@ -1617,6 +1618,33 @@ static WINAPI uint32_t device_release(void *this) { return d3d_release(this); }
 
 // D3D11_SUBRESOURCE_DATA: pointer, row pitch, slice pitch.
 typedef struct { const void *data; uint32_t pitch, slice_pitch; } SUBRESOURCE_DATA;
+// A new depth-stencil texture made without initial data starts as zeros (depth 0, stencil 0), as new video memory does
+// on Windows (the OS hands out zeroed allocations); a new Metal texture's contents are undefined. A program that gates a pass
+// with a stencil test on a depth-stencil texture it never clears (NOT_EQUAL 255, say) otherwise sees whatever the
+// previous owner of the memory left.
+static void zero_depth_texture(d3d_device *d, d3d_texture *t) {
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)t->mtl;
+    MTLPixelFormat f = tex.pixelFormat;
+    BOOL has_depth = f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth16Unorm;
+    BOOL has_stencil = f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatStencil8;
+    if (!tex || (!has_depth && !has_stencil) || tex.textureType == MTLTextureType3D) return;
+    id<MTLCommandBuffer> cb = [(__bridge id<MTLCommandQueue>)d->queue commandBuffer];
+    NSUInteger slices = tex.textureType == MTLTextureTypeCube ? 6 : tex.textureType == MTLTextureTypeCubeArray ? 6 * tex.arrayLength : tex.arrayLength;
+    for (NSUInteger mip = 0; mip < tex.mipmapLevelCount; mip++)
+        for (NSUInteger slice = 0; slice < slices; slice++) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            if (has_depth) {
+                rp.depthAttachment.texture = tex; rp.depthAttachment.level = mip; rp.depthAttachment.slice = slice;
+                rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.clearDepth = 0; rp.depthAttachment.storeAction = MTLStoreActionStore;
+            }
+            if (has_stencil) {
+                rp.stencilAttachment.texture = tex; rp.stencilAttachment.level = mip; rp.stencilAttachment.slice = slice;
+                rp.stencilAttachment.loadAction = MTLLoadActionClear; rp.stencilAttachment.clearStencil = 0; rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
+            [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+        }
+    [cb commit];
+}
 static HRESULT create_texture(void *this, const uint32_t *desc, uint32_t dim, uint32_t depth, const SUBRESOURCE_DATA *init, void **out) {
     d3d_device *d = dev_of(this);
     HRESULT hr;
@@ -1627,6 +1655,7 @@ static HRESULT create_texture(void *this, const uint32_t *desc, uint32_t dim, ui
         vx_log("Direct3D: texture %ux%u (%ud) x%u mips %u format %u samples %u usage %u bind %#x cpu %#x misc %#x -> %#x", desc[TD_WIDTH], desc[TD_HEIGHT],
                dim, desc[TD_ARRAY], desc[TD_MIPS], desc[TD_FORMAT], desc[TD_SAMPLES], desc[TD_USAGE], desc[TD_BIND], desc[TD_CPU], desc[TD_MISC], (unsigned)hr);
     if (!t) { if (out) *out = NULL; return hr; }
+    if (!init && (desc[TD_BIND] & 0x40)) zero_depth_texture(d, t);   // (D3D11_BIND_DEPTH_STENCIL)
     if (init) {
         uint32_t subs = t->desc[TD_MIPS] * t->desc[TD_ARRAY];
         for (uint32_t s = 0; s < subs; s++)

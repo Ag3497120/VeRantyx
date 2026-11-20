@@ -23,6 +23,7 @@ typedef struct {
     uint32_t cbuffers;              // slots used (bit per slot)
     uint32_t cb_size[16];           // float4s each declares
     uint64_t textures[2];           // t0..t127
+    uint8_t tex_dim[128], tex_ret[128], tex_cmp[128];   // per declared t#: dimension (DIM_* of dxbc.c), return type (3 sint, 4 uint), depth compare
     uint32_t samplers;
     // Compute (and UAV) resources: unordered access views u0..u7, raw/structured buffer SRVs, the group size.
     uint32_t uavs;
