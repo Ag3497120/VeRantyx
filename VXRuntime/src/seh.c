@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 #ifdef __aarch64__
 #include "arm64.h"
+#include "../translator/aot.h"
 #endif
 
 // ---- structures --------------------------------------------------------------------------------------------------
@@ -871,8 +872,10 @@ static void context_from(CONTEXT *c, const x86_ctx *x, uint64_t rip, uint64_t rs
     memcpy(c->fltsave_head + 24, &x->mxcsr, 4);
     memcpy(c->xmm, x->xmm, sizeof c->xmm);
 }
-// As the program's caller of the runtime function now running sees it: just returned from the call.
+// As the program's caller of the runtime function now running sees it: just returned from the call. (Always this
+// thread's state, whose MXCSR flags may still be in FPSR.)
 static void context_at_return(CONTEXT *c, const x86_ctx *x) {
+    xa_mxcsr_flush((x86_ctx *)x);
     uint64_t rsp = x->gpr[4];
     context_from(c, x, *(uint64_t *)(uintptr_t)rsp, rsp + 8);
 }
@@ -932,6 +935,7 @@ void __attribute__((noreturn)) vx_seh_fault(DWORD code, DWORD n, const uint64_t 
     // int3 (STATUS_BREAKPOINT) is a trap: the context resumes after the 0xCC (where the engine left Rip at it), so a
     // handler that continues without touching Rip runs on past the breakpoint; only the reported address is the int3.
     uint64_t rip = code == 0x80000003 ? x->rip + 1 : x->rip;
+    xa_mxcsr_flush(x);
     CONTEXT c; context_from(&c, x, rip, x->gpr[4]);
     EXCEPTION_RECORD rec = { code, 0, NULL, (void *)(uintptr_t)x->rip, n, 0, {0} };
     if (params) memcpy(rec.info, params, n * 8);

@@ -1797,6 +1797,7 @@ static WINAPI void *CreateFiber(uint64_t size, void (WINAPI *start)(void *), voi
 // ARM64: a fiber is the program's registers (src/arm64.c), switched by a thunk of its own. A new fiber starts in its
 // start routine as if called, returning to fiber_returned (which ends the thread, as on Windows).
 #include "arm64.h"
+#include "../translator/aot.h"
 static WINAPI void SwitchToFiber(void *to);
 void fiber_returned(void) { ExitThread(0); }
 static void th_fiber_returned(x86_ctx *c) { (void)c; ExitThread(0); }
@@ -1814,6 +1815,7 @@ static void th_SwitchToFiber(x86_ctx *c) {
     if (!f || f == from) return;
     if (!from) { vx_log("SwitchToFiber from a thread that is not a fiber"); abort(); }
     uint64_t rsp = c->gpr[4];
+    xa_mxcsr_flush(c);                                                           // (this fiber's MXCSR flags go with it)
     memcpy(from->x86.gpr, c->gpr, sizeof c->gpr);
     from->x86.gpr[4] = rsp + 8; from->x86.rip = *(uint64_t *)(uintptr_t)rsp;     // (as returned from the call)
     from->x86.flags = c->flags; from->x86.mxcsr = c->mxcsr; from->x86.fcw = c->fcw;

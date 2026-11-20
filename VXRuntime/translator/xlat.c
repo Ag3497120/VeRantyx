@@ -771,6 +771,7 @@ static void cmpxchg8_16(xlat_buf *b, const x86_insn *d, uint64_t next) {
 // SNaN or not; the indefinite NaN with its sign bit set), so arithmetic needs no NaN fix-up; with it FZ flushes
 // results and FIZ inputs, which are x86's FTZ and DAZ exactly.
 int xlat_afp = -1;
+int xlat_fpsr_lazy;
 static int afp(const xlat_buf *b) {
     if (xlat_afp < 0) {
         int v = 0; size_t n = sizeof v;
@@ -2017,7 +2018,25 @@ void xlat_prologue(xlat_buf *b) {
     for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
     E(b, a64_ldr(8, XS, XC, CTX_RAS));
     E(b, a64_mrs_fpcr(T_A)); E(b, a64_str(8, T_A, SP, 160));             // (the host's FPCR, back in the epilogue)
-    E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); mxcsr_to_fpcr(b, T_B, T_A); E(b, a64_msr_fpcr(T_B)); E(b, a64_msr_fpsr(XZR));
+    if (b->aot) {
+        // A module's stub (RECOMP.md "FPCR"): MSR FPCR / FPSR serialise (about 2.6 ns when the value is the same, 9 when it
+        // changes; MRS FPCR is free), and 5 M native calls a second cross it twice. Guest code made without FPCR.AH has the
+        // host's FPCR whenever MXCSR is the default, so FPCR is written only when it differs; FPSR is not touched (its flags
+        // are the guest's MXCSR flags, read at STMXCSR / FXSAVE / xa_mxcsr_flush; LDMXCSR still clears it).
+        // ctx->fpcr_always (VXRT_AOT_FPCR_ALWAYS=1): the previous behaviour, the same on both sides.
+        E(b, a64_ldr(8, T_A, XC, CTX_FPCR_ALWAYS));
+        size_t lazy = here(b); E(b, 0);
+        E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); mxcsr_to_fpcr(b, T_B, T_A); E(b, a64_msr_fpcr(T_B)); E(b, a64_msr_fpsr(XZR));
+        size_t done = here(b); E(b, 0);
+        patch_cbz(b, lazy, 0, T_A);
+        E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); mxcsr_to_fpcr(b, T_B, T_A);
+        E(b, a64_ldr(8, T_A, SP, 160)); E(b, a64_cmp(T_B, T_A));
+        E(b, a64_bcond(EQ, 2)); E(b, a64_msr_fpcr(T_B));
+        patch_b(b, done);
+        return;
+    }
+    E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); mxcsr_to_fpcr(b, T_B, T_A); E(b, a64_msr_fpcr(T_B));
+    if (!xlat_fpsr_lazy) E(b, a64_msr_fpsr(XZR));
 }
 const uint8_t *xlat_guest_parity = xlat_parity;   // (vcpu.c: a copy in memory the guest may have)
 void xlat_guest_enter(xlat_buf *b) {
@@ -2046,8 +2065,20 @@ void xlat_epilogue(xlat_buf *b) {
     for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     E(b, a64_str(8, XS, XC, CTX_RAS));
-    mxcsr_sync(b);
-    E(b, a64_ldr(8, T_A, SP, 160)); E(b, a64_msr_fpcr(T_A));
+    if (b->aot) {                                                         // (see xlat_prologue)
+        E(b, a64_ldr(8, T_A, XC, CTX_FPCR_ALWAYS));
+        size_t lazy = here(b); E(b, 0);
+        mxcsr_sync(b);
+        E(b, a64_ldr(8, T_A, SP, 160)); E(b, a64_msr_fpcr(T_A));
+        size_t done = here(b); E(b, 0);
+        patch_cbz(b, lazy, 0, T_A);
+        E(b, a64_ldr(8, T_A, SP, 160)); E(b, a64_mrs_fpcr(T_B)); E(b, a64_cmp(T_A, T_B));
+        E(b, a64_bcond(EQ, 2)); E(b, a64_msr_fpcr(T_A));
+        patch_b(b, done);
+    } else {
+        mxcsr_sync(b);
+        E(b, a64_ldr(8, T_A, SP, 160)); E(b, a64_msr_fpcr(T_A));
+    }
     E(b, a64_ldp(19, 20, SP, 16)); E(b, a64_ldp(21, 22, SP, 32)); E(b, a64_ldp(23, 24, SP, 48));
     E(b, a64_ldp(25, 26, SP, 64)); E(b, a64_ldp(27, 28, SP, 80));
     E(b, a64_ldpd(8, 9, SP, 96)); E(b, a64_ldpd(10, 11, SP, 112)); E(b, a64_ldpd(12, 13, SP, 128)); E(b, a64_ldpd(14, 15, SP, 144));
